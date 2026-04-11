@@ -336,7 +336,7 @@ class ChooserPanel:
         pw = self._panel.frame().size.width
         ph = self._panel.frame().size.height
         x = sf.origin.x + (sf.size.width - pw) / 2
-        y = sf.origin.y + sf.size.height - ph - 200
+        y = sf.origin.y + sf.size.height - ph - 80
         self._panel.setFrameOrigin_((x, y))
 
     # ------------------------------------------------------------------

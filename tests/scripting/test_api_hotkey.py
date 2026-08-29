@@ -114,6 +114,25 @@ class TestHotkeyAPI:
         mock_sp.run.assert_called_once()
 
     @patch("PyObjCTools.AppHelper.callAfter")
+    def test_start_is_idempotent_stops_previous_listener(self, mock_call_after):
+        """Repeated start() (script reload, chooser enable) must stop the
+        previous leader listener instead of overwriting it — an
+        overwritten listener leaks a live EventTap thread that can never
+        be stopped again."""
+        reg = ScriptingRegistry()
+        api = HotkeyAPI(reg)
+        old_listener = MagicMock()
+        api._started = True
+        api._listener = old_listener
+
+        api.start()
+
+        old_listener.stop.assert_called_once()
+        # No leaders registered → no new listener created after restart
+        assert api._listener is None
+        assert api._started is True
+
+    @patch("PyObjCTools.AppHelper.callAfter")
     def test_stop_closes_leader_alert(self, mock_call_after):
         """stop() should close the leader alert panel to prevent orphaned panels."""
         _, api = self._make_api()

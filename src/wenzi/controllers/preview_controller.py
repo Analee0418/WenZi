@@ -41,12 +41,34 @@ from wenzi.ui_helpers import (
 logger = logging.getLogger(__name__)
 
 
+class _PreviewSttSession:
+    """Lifecycle of one background preview-STT run.
+
+    Carries the panel generation it belongs to, its own cancel/done
+    events, and the transcriber instance captured at spawn time — the
+    worker must never pick up a swapped global transcriber mid-run.
+    """
+
+    __slots__ = ("generation", "transcriber", "cancel_event", "done_event")
+
+    def __init__(self, generation: int, transcriber) -> None:
+        self.generation = generation
+        self.transcriber = transcriber
+        self.cancel_event = threading.Event()
+        self.done_event = threading.Event()
+
+
 class PreviewController:
     """Handles preview panel interactions and clipboard enhance flow."""
 
     _CLIPBOARD_MAX_CHARS = 2000
 
     _ENHANCE_DEBOUNCE_SECONDS = 0.3
+    # Max seconds to wait for the main thread to apply a Universal-Action
+    # mode change before aborting the preview.
+    _MODE_APPLY_TIMEOUT = 2.0
+    # Logging cadence while waiting for the preview STT worker to finish.
+    _STT_FINISH_WAIT_INTERVAL = 10.0
 
     def __init__(self, app: WenZiApp) -> None:
         self._app = app
@@ -56,6 +78,12 @@ class PreviewController:
         self._viewing_history_index: int | None = None
         self._result_holder: dict | None = None
         self._input_context = None
+        # Re-entrancy guard for the preview-panel STT popup: it runs while
+        # the preview session already owns the app-wide op slot, so it
+        # needs its own flag against overlapping switches.
+        self._stt_switching = False
+        # Lifecycle of the current preview's background STT worker.
+        self._stt_session: _PreviewSttSession | None = None
 
     def _fire_scripting_event(self, event_name: str, **kwargs) -> None:
         fire_scripting_event(self._app, event_name, **kwargs)
@@ -203,11 +231,10 @@ class PreviewController:
             return
 
         app = self._app
-        if app._busy:
+        op_token = app._try_begin_op("preview-history")
+        if op_token is None:
             logger.info("Preview history ignored: busy")
             return
-
-        app._busy = True
 
         def _run():
             try:
@@ -220,9 +247,16 @@ class PreviewController:
                 )
             except Exception as e:
                 logger.error("Show last preview failed: %s", e)
-                app._busy = False
+            finally:
+                app._end_op(op_token)
 
-        threading.Thread(target=_run, daemon=True).start()
+        history_thread = threading.Thread(target=_run, daemon=True)
+        try:
+            history_thread.start()
+        except Exception:
+            # The worker never ran — release the claim or it leaks forever
+            app._end_op(op_token)
+            raise
 
     def on_select_history(self, index: int) -> None:
         """Handle history item selection from the preview panel dropdown."""
@@ -565,7 +599,12 @@ class PreviewController:
 
         # Wait for user decision
         result_event.wait()
-        app._busy = False
+        # The panel is closing: cancel a still-running STT worker and wait
+        # for it — the op slot (released by our caller right after this
+        # returns) and the transcriber the worker uses must outlive it.
+        self._finish_stt_session()
+        # The exclusive-op slot is released by whoever started this preview
+        # (recording flow / history preview / clipboard enhance), not here.
 
         # Reactivate the previous app's focused window, then restore accessory
         # mode.  Order matters: activate first (without AllWindows) so macOS
@@ -741,93 +780,6 @@ class PreviewController:
         def _voice_show(result_holder, result_event, on_confirm, on_cancel, panel_kwargs):
             """Schedule voice-specific panel show on main thread."""
 
-            def _do_stt():
-                try:
-                    from wenzi.transcription.base import BaseTranscriber
-
-                    audio_dur = BaseTranscriber.wav_duration_seconds(wav_data)
-                    app._preview_audio_duration = audio_dur
-                    app._transcriber.skip_punc = bool(
-                        app._enhancer and app._enhancer.is_active
-                    )
-                    hotwords, hotwords_detail = app._build_dynamic_hotwords()
-                    text = app._transcriber.transcribe(
-                        wav_data, hotwords=hotwords,
-                    )
-                    if text and text.strip():
-                        stt_text = text.strip()
-                    else:
-                        stt_text = "(empty)"
-                        logger.warning("Transcription returned empty text")
-
-                    app._current_preview_asr_text = stt_text
-                    app._enhance_controller.clear_cache()
-
-                    self._fire_scripting_event(
-                        "transcription_done", asr_text=stt_text,
-                    )
-
-                    # Build ASR info
-                    parts = []
-                    if not stt_models:
-                        try:
-                            parts.insert(
-                                0, app._transcriber.model_display_name,
-                            )
-                        except Exception:
-                            pass
-                    if audio_dur > 0:
-                        parts.append(f"{audio_dur:.1f}s")
-                    new_asr_info = "  ".join(parts)
-
-                    def _on_stt_done():
-                        app._preview_panel.set_hotwords(hotwords_detail)
-                        app._preview_panel.set_asr_result(
-                            stt_text,
-                            asr_info=new_asr_info,
-                            request_id=0,
-                        )
-                        # Start enhancement now that ASR is ready
-                        if use_enhance and stt_text != "(empty)":
-                            app._preview_panel.enhance_request_id += 1
-                            app._enhance_controller.run(
-                                stt_text,
-                                app._preview_panel.enhance_request_id,
-                                result_holder,
-                                input_context=self._input_context,
-                            )
-                        elif use_enhance:
-                            # Empty text -- clear enhance loading
-                            app._preview_panel.set_enhance_off()
-
-                    AppHelper.callAfter(_on_stt_done)
-                except Exception as e:
-                    logger.error("Background STT failed: %s", e)
-
-                    preset_id = app._current_preset_id
-                    preset = (
-                        PRESET_BY_ID.get(preset_id) if preset_id else None
-                    )
-                    has_cache = (
-                        preset is not None
-                        and preset.backend not in ("apple", "whisper-api")
-                    )
-                    if has_cache:
-                        hint = (
-                            "This may be caused by corrupted cache files"
-                            " from an interrupted download. Try clearing"
-                            " cache via the model load error alert, or"
-                            " switch to a different model from the menu."
-                        )
-                    else:
-                        hint = (
-                            "Please try switching to a different model"
-                            " from the menu."
-                        )
-                    app._preview_panel.set_asr_result(
-                        f"(error: {e})\n\n{hint}", request_id=0,
-                    )
-
             def _show():
                 activate_for_dialog()
 
@@ -862,9 +814,33 @@ class PreviewController:
                         # Start STT thread AFTER panel is built to
                         # avoid race condition where fast models (e.g.
                         # FunASR) complete before panel exists
-                        threading.Thread(
-                            target=_do_stt, daemon=True,
-                        ).start()
+                        session = _PreviewSttSession(
+                            generation=app._preview_panel.asr_request_id,
+                            transcriber=app._transcriber,
+                        )
+                        self._stt_session = session
+                        stt_thread = threading.Thread(
+                            target=self._run_preview_stt,
+                            args=(
+                                session, wav_data, stt_models,
+                                use_enhance, result_holder,
+                            ),
+                            daemon=True,
+                        )
+                        try:
+                            stt_thread.start()
+                        except Exception:
+                            logger.exception("STT worker failed to start")
+                            session.done_event.set()
+                            self._stt_session = None
+                            app._preview_panel.set_asr_result(
+                                "(error: transcription worker failed"
+                                " to start)",
+                                request_id=session.generation,
+                                is_error=True,
+                            )
+                            if use_enhance:
+                                app._preview_panel.set_enhance_off()
                     elif use_enhance:
                         # ASR already available, start enhancement
                         # immediately
@@ -919,6 +895,117 @@ class PreviewController:
             target=self._on_clipboard_enhance_worker, daemon=True
         ).start()
 
+    def run_clipboard_preview(
+        self, text: str, mode_id: str | None = None,
+    ) -> None:
+        """Run the clipboard-enhance preview for *text* under the app-wide
+        exclusive-op guard (entry point for Universal Action).
+
+        *mode_id*, when given, is applied only AFTER the claim succeeds —
+        a refused request must not change the global enhance mode.
+        """
+        app = self._app
+        op_token = app._try_begin_op("clipboard-enhance")
+        if op_token is None:
+            logger.info("Clipboard preview ignored: busy")
+            return
+        try:
+            if mode_id is not None:
+                from PyObjCTools import AppHelper
+
+                # Mode-apply transaction:
+                #   queued -> applying -> completed
+                #   queued -> abandoned          (worker timed out first)
+                # The timeout may only claim "abandoned" while the state
+                # is still "queued" — once the callback entered
+                # "applying", the worker waits for completion so the op
+                # slot outlives the apply.
+                state_lock = threading.Lock()
+                state = {"phase": "queued"}
+                applied = threading.Event()
+                apply_error: list[Exception] = []
+
+                def _set_mode():
+                    with state_lock:
+                        if state["phase"] != "queued":
+                            applied.set()
+                            return
+                        state["phase"] = "applying"
+                    old_app_mode = app._enhance_mode
+                    old_ctrl_mode = app._enhance_controller.enhance_mode
+                    old_enabled = (
+                        app._enhancer._enabled if app._enhancer else None
+                    )
+                    old_enh_mode = (
+                        app._enhancer.mode if app._enhancer else None
+                    )
+                    try:
+                        app._enhance_mode = mode_id
+                        # The controller's mode drives the chain/single
+                        # split and the cache key — it must move together
+                        # with the app-level mode.
+                        app._enhance_controller.enhance_mode = mode_id
+                        if app._enhancer:
+                            if mode_id == MODE_OFF:
+                                app._enhancer._enabled = False
+                            else:
+                                # The current mode may be Off — without
+                                # enabling, the preview below computes
+                                # use_enhance from the stale state and
+                                # shows a plain, unenhanced preview.
+                                app._enhancer._enabled = True
+                                app._enhancer.mode = mode_id
+                    except Exception as exc:
+                        # Roll back EVERYTHING on the main thread before
+                        # the worker aborts the preview.
+                        try:
+                            app._enhance_mode = old_app_mode
+                            app._enhance_controller.enhance_mode = (
+                                old_ctrl_mode
+                            )
+                            if app._enhancer:
+                                if old_enabled is not None:
+                                    app._enhancer._enabled = old_enabled
+                                if old_enh_mode is not None:
+                                    app._enhancer.mode = old_enh_mode
+                        except Exception:
+                            logger.exception("Mode rollback failed")
+                        apply_error.append(exc)
+                    finally:
+                        with state_lock:
+                            state["phase"] = "completed"
+                        applied.set()
+
+                AppHelper.callAfter(_set_mode)
+                # The preview reads the mode synchronously — wait until
+                # the main thread actually applied it.
+                if not applied.wait(self._MODE_APPLY_TIMEOUT):
+                    with state_lock:
+                        timed_out = state["phase"] == "queued"
+                        if timed_out:
+                            state["phase"] = "abandoned"
+                    if timed_out:
+                        logger.warning(
+                            "Enhance mode apply timed out; aborting preview"
+                        )
+                        return
+                    # The callback entered "applying" right at the
+                    # deadline: the op slot must outlive the apply — wait
+                    # for it to finish before proceeding or aborting.
+                    applied.wait()
+                if apply_error:
+                    logger.error(
+                        "Enhance mode apply failed; preview aborted: %s",
+                        apply_error[0],
+                    )
+                    return
+            self._do_clipboard_with_preview(text)
+        except Exception:
+            logger.exception("Clipboard preview failed")
+            app._set_status("statusbar.status.error")
+        finally:
+            app._end_op(op_token)
+
     def _on_clipboard_enhance_worker(self) -> None:
         """Worker-thread implementation of clipboard enhance."""
         from PyObjCTools import AppHelper
@@ -957,7 +1044,10 @@ class PreviewController:
             )
             return
 
-        app._busy = True
+        op_token = app._try_begin_op("clipboard-enhance")
+        if op_token is None:
+            logger.info("Clipboard enhance ignored: busy")
+            return
         app._set_status("statusbar.status.enhancing")
 
         try:
@@ -966,7 +1056,7 @@ class PreviewController:
             logger.error("Clipboard enhance failed: %s", e)
             app._set_status("statusbar.status.error")
         finally:
-            app._busy = False
+            app._end_op(op_token)
 
     def _clipboard_enhance_show_error(self, title: str, message: str) -> None:
         """Show an error alert on the main thread for clipboard enhance."""
@@ -1151,6 +1241,169 @@ class PreviewController:
             self._ENHANCE_DEBOUNCE_SECONDS, _fire_enhance,
         )
 
+    def _run_preview_stt(
+        self, session, wav_data, stt_models, use_enhance, result_holder,
+    ) -> None:
+        """Background worker for the preview's initial transcription.
+
+        Stage checks against *session*: superseded or cancelled work is
+        skipped before transcription, after transcription, and once more
+        on the main thread before ANYTHING global (scripting event, app
+        state, panel) is committed.  Uses the transcriber captured at
+        spawn time — a swapped global transcriber never leaks in.
+        """
+        app = self._app
+        try:
+            if (
+                session.cancel_event.is_set()
+                or session.generation != app._preview_panel.asr_request_id
+            ):
+                logger.info("Background STT skipped (stale session)")
+                return
+            from wenzi.transcription.base import BaseTranscriber
+
+            audio_dur = BaseTranscriber.wav_duration_seconds(wav_data)
+            transcriber = session.transcriber
+            transcriber.skip_punc = bool(
+                app._enhancer and app._enhancer.is_active
+            )
+            hotwords, hotwords_detail = app._build_dynamic_hotwords()
+            text = transcriber.transcribe(wav_data, hotwords=hotwords)
+            if text and text.strip():
+                stt_text = text.strip()
+            else:
+                stt_text = "(empty)"
+                logger.warning("Transcription returned empty text")
+
+            if (
+                session.cancel_event.is_set()
+                or session.generation != app._preview_panel.asr_request_id
+            ):
+                logger.info("Background STT result discarded (stale)")
+                return
+
+            # Build ASR info
+            parts = []
+            if not stt_models:
+                try:
+                    parts.insert(0, transcriber.model_display_name)
+                except Exception:
+                    pass
+            if audio_dur > 0:
+                parts.append(f"{audio_dur:.1f}s")
+            new_asr_info = "  ".join(parts)
+
+            def _on_stt_done():
+                if (
+                    session.cancel_event.is_set()
+                    or not app._preview_panel.is_visible
+                    or session.generation != app._preview_panel.asr_request_id
+                ):
+                    logger.info(
+                        "Background STT result discarded before commit"
+                    )
+                    return
+                # Valid commit: the scripting event, global state and
+                # panel updates all happen here on the main thread — or
+                # not at all.
+                app._preview_audio_duration = audio_dur
+                app._current_preview_asr_text = stt_text
+                app._enhance_controller.clear_cache()
+                self._fire_scripting_event(
+                    "transcription_done", asr_text=stt_text,
+                )
+                app._preview_panel.set_hotwords(hotwords_detail)
+                app._preview_panel.set_asr_result(
+                    stt_text,
+                    asr_info=new_asr_info,
+                    request_id=session.generation,
+                )
+                # Start enhancement now that ASR is ready
+                if use_enhance and stt_text != "(empty)":
+                    app._preview_panel.enhance_request_id += 1
+                    app._enhance_controller.run(
+                        stt_text,
+                        app._preview_panel.enhance_request_id,
+                        result_holder,
+                        input_context=self._input_context,
+                    )
+                elif use_enhance:
+                    # Empty text — clear enhance loading
+                    app._preview_panel.set_enhance_off()
+
+            from PyObjCTools import AppHelper
+
+            AppHelper.callAfter(_on_stt_done)
+        except Exception as e:
+            logger.error("Background STT failed: %s", e)
+
+            preset_id = app._current_preset_id
+            preset = PRESET_BY_ID.get(preset_id) if preset_id else None
+            has_cache = (
+                preset is not None
+                and preset.backend not in ("apple", "whisper-api")
+            )
+            if has_cache:
+                hint = (
+                    "This may be caused by corrupted cache files"
+                    " from an interrupted download. Try clearing"
+                    " cache via the model load error alert, or"
+                    " switch to a different model from the menu."
+                )
+            else:
+                hint = (
+                    "Please try switching to a different model"
+                    " from the menu."
+                )
+            err_msg = str(e)
+
+            def _on_stt_failed():
+                if (
+                    session.cancel_event.is_set()
+                    or not app._preview_panel.is_visible
+                    or session.generation != app._preview_panel.asr_request_id
+                ):
+                    return
+                app._preview_panel.set_asr_result(
+                    f"(error: {err_msg})\n\n{hint}",
+                    request_id=session.generation,
+                    is_error=True,
+                )
+                if use_enhance:
+                    # Stop the enhance loading spinner — no enhancement
+                    # will run without ASR text.
+                    app._preview_panel.set_enhance_off()
+
+            from PyObjCTools import AppHelper
+
+            AppHelper.callAfter(_on_stt_failed)
+        finally:
+            session.done_event.set()
+
+    def _finish_stt_session(self) -> None:
+        """Cancel and join the preview's STT worker (if any).
+
+        Runs when the preview closes, BEFORE the initiator releases the
+        exclusive-op slot: a next operation could otherwise cleanup or
+        swap the transcriber the worker is still using.
+        """
+        session = self._stt_session
+        if session is None:
+            return
+        session.cancel_event.set()
+        # NEVER release on a timeout: clearing the session (and letting
+        # the caller release the op slot) while the worker still runs
+        # would allow the next operation to cleanup/swap the transcriber
+        # under it.  Keep waiting and log periodically instead.
+        waited = 0.0
+        while not session.done_event.wait(self._STT_FINISH_WAIT_INTERVAL):
+            waited += self._STT_FINISH_WAIT_INTERVAL
+            logger.error(
+                "Preview STT worker still running after %.0fs; holding the "
+                "op slot until it finishes", waited,
+            )
+        self._stt_session = None
+
     def on_preview_stt_change(self, index: int) -> None:
         """Handle STT model popup change from the preview panel."""
         from PyObjCTools import AppHelper
@@ -1178,6 +1431,27 @@ class PreviewController:
             else ("remote", app._current_remote_asr)
         ) in app._preview_stt_keys else 0
 
+        if self._stt_switching:
+            logger.info("Preview STT switch ignored: switch in progress")
+            AppHelper.callAfter(
+                app._preview_panel.set_stt_popup_index, old_index,
+                app._preview_panel.asr_request_id,
+            )
+            return
+        stt_session = self._stt_session
+        if stt_session is not None and not stt_session.done_event.is_set():
+            # The initial transcription still uses its captured
+            # transcriber — switching now would cleanup an in-use model.
+            logger.info(
+                "Preview STT switch ignored: initial transcription running"
+            )
+            AppHelper.callAfter(
+                app._preview_panel.set_stt_popup_index, old_index,
+                app._preview_panel.asr_request_id,
+            )
+            return
+        self._stt_switching = True
+
         # Show loading state
         app._preview_panel.set_asr_loading()
         request_id = app._preview_panel.asr_request_id
@@ -1186,9 +1460,8 @@ class PreviewController:
         wav_data = app._preview_panel._asr_wav_data
 
         def _do_switch():
+            new_transcriber = None
             try:
-                old_transcriber.cleanup()
-
                 asr_cfg = app._config.get("asr", {})
                 if key_type == "preset":
                     preset = PRESET_BY_ID[key_value]
@@ -1227,41 +1500,100 @@ class PreviewController:
                 new_asr_info = f"{audio_duration:.1f}s" if audio_duration > 0 else ""
 
                 def _on_success():
+                    # Late-commit guard: if the preview closed or another
+                    # re-transcription superseded this switch while the
+                    # worker ran, discard the result instead of replacing
+                    # the app-wide transcriber (a new recording or model
+                    # switch may already be using it).
+                    if (
+                        not app._preview_panel.is_visible
+                        or request_id != app._preview_panel.asr_request_id
+                    ):
+                        logger.info(
+                            "Preview STT switch discarded "
+                            "(panel closed or superseded)"
+                        )
+                        try:
+                            new_transcriber.cleanup()
+                        except Exception:
+                            logger.debug(
+                                "Discarded transcriber cleanup failed",
+                                exc_info=True,
+                            )
+                        return
+
+                    # Swap first, then dispose of the old model — a failed
+                    # switch leaves the old transcriber untouched and active.
                     app._transcriber = new_transcriber
-                    if key_type == "preset":
-                        app._current_preset_id = key_value
-                        app._current_remote_asr = None
-                        app._config["asr"]["preset"] = key_value
-                        preset = PRESET_BY_ID[key_value]
-                        app._config["asr"]["backend"] = preset.backend
-                        app._config["asr"]["model"] = preset.model
-                        app._config["asr"]["language"] = preset.language
-                        app._config["asr"]["default_provider"] = None
-                        app._config["asr"]["default_model"] = None
-                    else:
-                        prov, mod = key_value
-                        app._current_remote_asr = key_value
-                        app._current_preset_id = None
-                        app._config["asr"]["default_provider"] = prov
-                        app._config["asr"]["default_model"] = mod
+                    try:
+                        old_transcriber.cleanup()
+                    except Exception:
+                        logger.warning(
+                            "Old transcriber cleanup failed", exc_info=True
+                        )
+                    # Live state FIRST: panel, in-memory identity, cache
+                    # and enhancement must agree with the new transcriber
+                    # no matter what persistence does afterwards.
+                    try:
+                        if key_type == "preset":
+                            app._current_preset_id = key_value
+                            app._current_remote_asr = None
+                        else:
+                            app._current_remote_asr = key_value
+                            app._current_preset_id = None
+                        app._preview_panel.set_asr_result(
+                            new_text, asr_info=new_asr_info,
+                            request_id=request_id,
+                        )
+                        app._current_preview_asr_text = new_text
+                        app._enhance_controller.clear_cache()
 
-                    app._menu_builder.update_model_checkmarks()
-                    save_config(app._config, app._config_path)
+                        # Re-run enhance if mode is not Off
+                        if app._enhance_mode != MODE_OFF and app._enhancer:
+                            app._preview_panel.set_enhance_loading()
+                            app._preview_panel.enhance_request_id += 1
+                            app._enhance_controller.run(
+                                new_text,
+                                app._preview_panel.enhance_request_id,
+                                self._result_holder,
+                                input_context=self._input_context,
+                            )
+                    except Exception:
+                        logger.exception("Live-state update failed")
+                        # Whatever failed, the panel must never hang on
+                        # the loading spinner.
+                        try:
+                            app._preview_panel.set_asr_result(
+                                new_text, asr_info=new_asr_info,
+                                request_id=request_id,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Panel restore failed", exc_info=True
+                            )
 
-                    app._preview_panel.set_asr_result(
-                        new_text, asr_info=new_asr_info, request_id=request_id,
-                    )
-                    app._current_preview_asr_text = new_text
-                    app._enhance_controller.clear_cache()
-
-                    # Re-run enhance if mode is not Off
-                    if app._enhance_mode != MODE_OFF and app._enhancer:
-                        app._preview_panel.set_enhance_loading()
-                        app._preview_panel.enhance_request_id += 1
-                        app._enhance_controller.run(
-                            new_text, app._preview_panel.enhance_request_id,
-                            self._result_holder,
-                            input_context=self._input_context,
+                    # Persistence SECOND: a failure here is reported but
+                    # can no longer leave the panel or the internal ASR
+                    # state pointing at the old model.
+                    try:
+                        if key_type == "preset":
+                            preset = PRESET_BY_ID[key_value]
+                            app._config["asr"]["preset"] = key_value
+                            app._config["asr"]["backend"] = preset.backend
+                            app._config["asr"]["model"] = preset.model
+                            app._config["asr"]["language"] = preset.language
+                            app._config["asr"]["default_provider"] = None
+                            app._config["asr"]["default_model"] = None
+                        else:
+                            prov, mod = key_value
+                            app._config["asr"]["default_provider"] = prov
+                            app._config["asr"]["default_model"] = mod
+                        app._menu_builder.update_model_checkmarks()
+                        save_config(app._config, app._config_path)
+                    except Exception:
+                        logger.exception(
+                            "Post-switch persistence failed "
+                            "(live state already updated)"
                         )
 
                 AppHelper.callAfter(_on_success)
@@ -1270,23 +1602,59 @@ class PreviewController:
             except Exception as e:
                 logger.error("Preview STT switch failed: %s", e)
                 err_msg = str(e)
+                # The old transcriber was never touched; discard the failed
+                # new one and keep the current model active.
+                if new_transcriber is not None:
+                    try:
+                        new_transcriber.cleanup()
+                    except Exception:
+                        logger.debug(
+                            "Failed transcriber cleanup", exc_info=True
+                        )
 
                 def _on_failure():
-                    # Try to restore old transcriber
-                    app._model_controller._try_restore_previous_model(
-                        app._current_preset_id if not app._current_remote_asr else None
+                    # Same late guard as success: a failure for a closed
+                    # or superseded panel must not touch it.
+                    if (
+                        not app._preview_panel.is_visible
+                        or request_id != app._preview_panel.asr_request_id
+                    ):
+                        return
+                    app._preview_panel.set_stt_popup_index(
+                        old_index, request_id,
                     )
-                    app._preview_panel.set_stt_popup_index(old_index)
-                    # Restore ASR text
+                    # Restore the ASR text (resolves the loading spinner);
+                    # with no text to restore, show the error display-only.
                     asr_text = getattr(app, "_current_preview_asr_text", "")
-                    if app._preview_panel._asr_text_view is not None:
-                        app._preview_panel._asr_text_view.setString_(
-                            asr_text or f"(STT switch error: {err_msg})"
+                    if asr_text:
+                        app._preview_panel.set_asr_result(
+                            asr_text, request_id=request_id,
+                        )
+                    else:
+                        app._preview_panel.set_asr_result(
+                            f"(STT switch error: {err_msg})",
+                            request_id=request_id, is_error=True,
                         )
 
                 AppHelper.callAfter(_on_failure)
+            finally:
+                self._stt_switching = False
 
-        threading.Thread(target=_do_switch, daemon=True).start()
+        switch_thread = threading.Thread(target=_do_switch, daemon=True)
+        try:
+            switch_thread.start()
+        except Exception:
+            # The worker never ran — clear the guard and restore the panel.
+            # Use OUR request id, never 0: a forced write could clobber a
+            # newer panel session.
+            self._stt_switching = False
+            app._preview_panel.set_stt_popup_index(old_index, request_id)
+            asr_text = getattr(app, "_current_preview_asr_text", "")
+            if asr_text:
+                app._preview_panel.set_asr_result(
+                    asr_text, request_id=request_id,
+                )
+            raise
 
     def on_preview_llm_change(self, index: int) -> None:
         """Handle LLM model popup change from the preview panel."""
@@ -1362,6 +1730,14 @@ class PreviewController:
                 new_asr_info = f"{audio_duration:.1f}s" if audio_duration > 0 else ""
 
                 def _on_done():
+                    if (
+                        not app._preview_panel.is_visible
+                        or request_id != app._preview_panel.asr_request_id
+                    ):
+                        logger.info(
+                            "Punc re-transcribe result discarded (stale)"
+                        )
+                        return
                     app._preview_panel.set_asr_result(
                         new_text, asr_info=new_asr_info, request_id=request_id,
                     )
@@ -1390,7 +1766,14 @@ class PreviewController:
 
                 AppHelper.callAfter(_on_fail)
 
-        threading.Thread(target=_do_retranscribe, daemon=True).start()
+        retr_thread = threading.Thread(target=_do_retranscribe, daemon=True)
+        try:
+            retr_thread.start()
+        except Exception:
+            logger.exception("Punc re-transcribe worker failed to start")
+            # Resolve the loading state back to the current ASR text
+            asr_text = getattr(app, "_current_preview_asr_text", "")
+            app._preview_panel.set_asr_result(asr_text, request_id=request_id)
 
     def on_preview_thinking_toggle(self, enabled: bool) -> None:
         """Handle Thinking checkbox toggle from preview panel."""

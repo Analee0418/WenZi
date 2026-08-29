@@ -1,6 +1,7 @@
 """Tests for the hotkey module."""
 
 import threading
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -518,7 +519,213 @@ class TestSharedHotkeyTap:
         assert tap._runner is None
 
 
+class TestKeyRemapListenerLifecycle:
+    def _stub_runner_cls(self, start_gate=None):
+        instances = []
+
+        class _StubRunner:
+            def __init__(self):
+                self.started = False
+                self.stopped = False
+                self.cb = None
+                instances.append(self)
+
+            def start(self, mask, cb):
+                self.cb = cb
+                self.started = True
+                if start_gate is not None:
+                    start_gate.wait(5)
+
+            def stop(self):
+                self.stopped = True
+
+            @property
+            def running(self):
+                return self.started and not self.stopped
+
+        return _StubRunner, instances
+
+    def test_concurrent_starts_leave_exactly_one_runner(self, monkeypatch):
+        """Barrier: two threads inside start() concurrently — exactly one
+        runner may survive; the loser must be stopped, never leaked."""
+        from wenzi import _cgeventtap as cg
+        from wenzi.hotkey import KeyRemapListener
+
+        gate = threading.Event()
+        stub_cls, instances = self._stub_runner_cls(start_gate=gate)
+        monkeypatch.setattr(cg, "CGEventTapRunner", stub_cls)
+
+        listener = KeyRemapListener()
+        t1 = threading.Thread(target=listener.start, daemon=True)
+        t2 = threading.Thread(target=listener.start, daemon=True)
+        t1.start()
+        t2.start()
+        time.sleep(0.1)  # both threads are inside runner.start()
+        gate.set()
+        t1.join(5)
+        t2.join(5)
+
+        assert len(instances) == 2
+        alive = [r for r in instances if not r.stopped]
+        assert len(alive) == 1          # no lost runner, no double-live
+        assert listener._runner is alive[0]
+        listener.stop()
+        assert all(r.stopped for r in instances)
+
+    def test_start_stop_interleaved_discards_in_flight_runner(
+        self, monkeypatch
+    ):
+        """stop() arriving while a start() is mid-flight invalidates its
+        token: the in-flight runner must be stopped, not committed."""
+        from wenzi import _cgeventtap as cg
+        from wenzi.hotkey import KeyRemapListener
+
+        gate = threading.Event()
+        stub_cls, instances = self._stub_runner_cls(start_gate=gate)
+        monkeypatch.setattr(cg, "CGEventTapRunner", stub_cls)
+
+        listener = KeyRemapListener()
+        starter = threading.Thread(target=listener.start, daemon=True)
+        starter.start()
+        time.sleep(0.1)     # starter is blocked inside runner.start()
+        listener.stop()     # bumps the generation
+        gate.set()
+        starter.join(5)
+
+        assert len(instances) == 1
+        assert instances[0].stopped is True  # discarded, not leaked
+        assert listener._runner is None
+
+    def test_stale_callback_dispatch_linearized_with_commit(
+        self, monkeypatch
+    ):
+        """Barrier: an old-generation callback that already passed the
+        entry check and is mid-dispatch blocks the new generation's
+        commit; its side effect lands strictly BEFORE the commit, and
+        after the commit it can never produce another one."""
+        from wenzi import _cgeventtap as cg
+        from wenzi.hotkey import KeyRemapListener
+
+        stub_cls, instances = self._stub_runner_cls()
+        monkeypatch.setattr(cg, "CGEventTapRunner", stub_cls)
+
+        listener = KeyRemapListener()
+        in_dispatch = threading.Event()
+        dispatch_gate = threading.Event()
+        side_effects: list[str] = []
+
+        def _slow_dispatch(proxy, event_type, event, refcon):
+            in_dispatch.set()
+            dispatch_gate.wait(5)
+            side_effects.append("old-posted")
+            return None  # swallows the original event
+
+        listener._callback = _slow_dispatch
+        listener.start()
+        old_cb = instances[0].cb
+
+        results: list = []
+        cb_thread = threading.Thread(
+            target=lambda: results.append(old_cb(None, 10, 0xAA, None)),
+            daemon=True,
+        )
+        cb_thread.start()
+        assert in_dispatch.wait(5)  # old callback is past the check
+
+        committed = threading.Event()
+
+        def _restart():
+            listener.start()
+            side_effects.append("new-committed")
+            committed.set()
+
+        restarter = threading.Thread(target=_restart, daemon=True)
+        restarter.start()
+        time.sleep(0.15)
+        # The new generation must NOT get past the linearization point
+        # while the old dispatch is still inside it
+        assert not committed.is_set()
+
+        dispatch_gate.set()
+        cb_thread.join(5)
+        restarter.join(5)
+        assert committed.is_set()
+
+        # Strict ordering: the in-flight old side effect happened before
+        # the new generation committed
+        assert side_effects == ["old-posted", "new-committed"]
+        assert results == [None]  # the in-flight dispatch completed
+
+        # After the commit the old callback is inert: pure passthrough
+        listener._callback = MagicMock(
+            side_effect=AssertionError("stale callback must not dispatch")
+        )
+        sentinel = 0xBB
+        assert old_cb(None, 10, sentinel, None) == sentinel
+        listener.stop()
+
+    def test_old_generation_callback_passes_events_through(
+        self, monkeypatch
+    ):
+        """A superseded generation's callback must pass events through
+        untouched — never executing the current remaps."""
+        from wenzi import _cgeventtap as cg
+        from wenzi.hotkey import KeyRemapListener
+
+        stub_cls, instances = self._stub_runner_cls()
+        monkeypatch.setattr(cg, "CGEventTapRunner", stub_cls)
+
+        listener = KeyRemapListener()
+        listener._callback = MagicMock(
+            side_effect=AssertionError("stale callback must not dispatch")
+        )
+        listener.start()
+        old_cb = instances[0].cb
+
+        listener.start()  # supersedes generation 1
+        sentinel = 0xCAFE
+        assert old_cb(None, 10, sentinel, None) == sentinel
+        listener._callback.assert_not_called()
+
+        # The current generation still dispatches
+        listener._callback = MagicMock(return_value=sentinel)
+        new_cb = instances[1].cb
+        assert new_cb(None, 10, sentinel, None) == sentinel
+        listener._callback.assert_called_once()
+        listener.stop()
+
+
 class TestMultiHotkeyListener:
+    def test_release_dispatched_via_executor_after_press(self):
+        """Release must flow through the same single-worker executor as
+        press so press/release ordering is preserved end-to-end — a
+        release invoked inline from the tap thread could reach the
+        asyncio loop before its own press."""
+        order = []
+        listener = MultiHotkeyListener(
+            ["f2"],
+            lambda name: order.append("press"),
+            lambda name: order.append("release"),
+        )
+        listener._handle_press("f2")
+        listener._handle_release("f2")
+        _flush()
+        assert order == ["press", "release"]
+
+    def test_release_not_invoked_inline_on_tap_thread(self):
+        call_threads = []
+        listener = MultiHotkeyListener(
+            ["f2"],
+            MagicMock(),
+            lambda name: call_threads.append(threading.current_thread().ident),
+        )
+        listener._handle_press("f2")
+        _flush()
+        listener._handle_release("f2")
+        _flush()
+        assert call_threads
+        assert call_threads[0] != threading.get_ident()
+
     def test_creation_with_fn(self):
         listener = MultiHotkeyListener(["fn", "f2"], MagicMock(), MagicMock())
         assert "fn" in listener._enabled_names
@@ -563,6 +770,7 @@ class TestMultiHotkeyListener:
         assert "f2" in listener._held
 
         listener._handle_release("f2")
+        _flush()  # release is dispatched via the hotkey executor
         on_release.assert_called_once()
         assert "f2" not in listener._held
 
@@ -637,6 +845,7 @@ class TestMultiHotkeyListener:
         on_press.assert_called_once()
 
         listener._handle_release("fn")
+        _flush()  # release is dispatched via the hotkey executor
         on_release.assert_called_once()
 
 
@@ -865,6 +1074,7 @@ class TestMultiHotkeyCancelKey:
         listener._handle_press("fn")
         listener._handle_press("space")
         listener._handle_release("fn")
+        _flush()  # release is dispatched via the hotkey executor
         on_release.assert_not_called()
 
         # Wait for cancel thread
@@ -876,6 +1086,7 @@ class TestMultiHotkeyCancelKey:
         # Second cycle: normal press and release should work
         listener._handle_press("fn")
         listener._handle_release("fn")
+        _flush()  # release is dispatched via the hotkey executor
         on_release.assert_called_once()
 
     def test_restart_and_cancel_coexist(self):

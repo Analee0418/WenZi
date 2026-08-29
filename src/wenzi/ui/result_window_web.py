@@ -608,8 +608,12 @@ class ResultPreviewPanel:
         self._asr_info = asr_info
         self._asr_wav_data = asr_wav_data
         self._enhance_info = enhance_info
-        self._enhance_request_id = 0
-        self._asr_request_id = 0
+        # Every show() advances the request generations (panel-lifetime
+        # monotonic, never reset): a stale late result captured against a
+        # previous preview session can never match the new session's id —
+        # even when the new session issues no request of its own.
+        self._enhance_request_id += 1
+        self._asr_request_id += 1
         self._stt_models = stt_models or []
         self._stt_current_index = stt_current_index
         self._llm_models = llm_models or []
@@ -673,6 +677,9 @@ class ResultPreviewPanel:
         """Append a thinking/reasoning text chunk."""
         if self._webview is None:
             return
+        if request_id != 0 and request_id != self._enhance_request_id:
+            # Stale request — don't pollute this session's thinking text
+            return
 
         self._thinking_text += chunk
 
@@ -730,14 +737,23 @@ class ResultPreviewPanel:
 
         AppHelper.callAfter(_update)
 
-    def update_system_prompt(self, system_prompt: str) -> None:
-        """Update the stored system prompt and enable the prompt button."""
+    def update_system_prompt(
+        self, system_prompt: str, request_id: int = 0,
+    ) -> None:
+        """Update the stored system prompt and enable the prompt button.
+
+        With a non-zero *request_id*, only applies while that enhance
+        request is current — a stale stream must not overwrite the new
+        session's prompt metadata.
+        """
         if not system_prompt:
             return
 
         from PyObjCTools import AppHelper
 
         def _update():
+            if request_id != 0 and request_id != self._enhance_request_id:
+                return
             self._system_prompt = system_prompt
             if self._webview is not None:
                 self._eval_js("enablePromptButton()")
@@ -867,8 +883,16 @@ class ResultPreviewPanel:
         """
         self._input_context_text = text
 
-    def set_llm_vocab(self, entries: list[ManualVocabEntry]) -> None:
-        """Cache LLM vocabulary entries for display in the context panel."""
+    def set_llm_vocab(
+        self, entries: list[ManualVocabEntry], request_id: int = 0,
+    ) -> None:
+        """Cache LLM vocabulary entries for display in the context panel.
+
+        With a non-zero *request_id*, only applies while that enhance
+        request is current.
+        """
+        if request_id != 0 and request_id != self._enhance_request_id:
+            return
         self._llm_vocab_detail = list(entries)
 
     def set_enhance_label(self, suffix: str, request_id: int = 0) -> None:
@@ -911,11 +935,20 @@ class ResultPreviewPanel:
         if self._webview is not None:
             self._eval_js(f"updateLoadingTimer({self._loading_seconds})")
 
-    def set_enhance_step_info(self, step: int, total: int, label: str) -> None:
-        """Update enhance label to show chain step progress."""
+    def set_enhance_step_info(
+        self, step: int, total: int, label: str, request_id: int = 0,
+    ) -> None:
+        """Update enhance label to show chain step progress.
+
+        With a non-zero *request_id*, the update only applies while that
+        enhance request is still current \u2014 validated inside the
+        main-thread callback.
+        """
         from PyObjCTools import AppHelper
 
         def _update():
+            if request_id != 0 and request_id != self._enhance_request_id:
+                return
             if self._webview is not None:
                 text = f"\u23f3 Step {step}/{total}: {label}"
                 self._eval_js(f"setStepInfo({json.dumps(text)})")
@@ -938,6 +971,25 @@ class ResultPreviewPanel:
 
         AppHelper.callAfter(_update)
 
+    def reset_final_text_to_asr(self, request_id: int = 0) -> None:
+        """Restore the editable final text to the cached ASR text.
+
+        Used when an enhancement falls back after an error: the final
+        text may still hold a previous request's output.  No-op when the
+        user already edited the text.  With a non-zero *request_id* the
+        reset only applies while that enhance request is still current —
+        a stale fallback must not clobber a newer request's output.
+        """
+        from PyObjCTools import AppHelper
+
+        def _update():
+            if request_id != 0 and request_id != self._enhance_request_id:
+                return
+            if self._webview is not None and not self._user_edited:
+                self._eval_js(f"setFinalText({json.dumps(self._asr_text)})")
+
+        AppHelper.callAfter(_update)
+
     def set_asr_loading(self) -> None:
         """Show loading state in the ASR section for re-transcription."""
         from PyObjCTools import AppHelper
@@ -950,8 +1002,16 @@ class ResultPreviewPanel:
 
         AppHelper.callAfter(_update)
 
-    def set_asr_result(self, text: str, asr_info: str = "", request_id: int = 0) -> None:
-        """Update ASR result after re-transcription."""
+    def set_asr_result(
+        self, text: str, asr_info: str = "", request_id: int = 0,
+        is_error: bool = False,
+    ) -> None:
+        """Update ASR result after re-transcription.
+
+        With ``is_error`` the text is only displayed in the ASR section:
+        it is not cached as ASR text and never fills the editable final
+        text, which gets typed into the target application on confirm.
+        """
         from PyObjCTools import AppHelper
 
         def _update():
@@ -959,10 +1019,12 @@ class ResultPreviewPanel:
                 return
             if request_id != 0 and request_id != self._asr_request_id:
                 return
-            self._asr_text = text
-            self._asr_info = asr_info
+            if not is_error:
+                self._asr_text = text
+                self._asr_info = asr_info
             self._eval_js(
-                f"setAsrResult({json.dumps(text)},{json.dumps(asr_info)})"
+                f"setAsrResult({json.dumps(text)},{json.dumps(asr_info)},"
+                f"{json.dumps(is_error)})"
             )
 
         AppHelper.callAfter(_update)
@@ -979,11 +1041,19 @@ class ResultPreviewPanel:
 
         AppHelper.callAfter(_update)
 
-    def set_stt_popup_index(self, index: int) -> None:
-        """Set the STT popup selection (for rollback on failure)."""
+    def set_stt_popup_index(self, index: int, request_id: int = 0) -> None:
+        """Set the STT popup selection (for rollback on failure).
+
+        With a non-zero *request_id*, the update only applies while that
+        ASR request is still current — validated inside the main-thread
+        callback, so a stale rollback queued earlier cannot clobber a
+        newer panel session.
+        """
         from PyObjCTools import AppHelper
 
         def _update():
+            if request_id != 0 and request_id != self._asr_request_id:
+                return
             if self._webview is not None:
                 self._eval_js(f"setSttPopupIndex({index})")
 

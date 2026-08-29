@@ -635,6 +635,148 @@ class TestSetAsrResult:
         panel._webview.evaluateJavaScript_completionHandler_.assert_not_called()
         assert panel._asr_text == "old"
 
+    def test_error_asr_result_is_display_only(self):
+        """Error text must not become cached ASR text nor fill final-text."""
+        from wenzi.ui.result_window_web import ResultPreviewPanel
+
+        panel = _build_panel(ResultPreviewPanel())
+        panel.show(
+            asr_text="old", show_enhance=False,
+            on_confirm=MagicMock(), on_cancel=MagicMock(),
+        )
+
+        panel._webview.evaluateJavaScript_completionHandler_.reset_mock()
+        panel.set_asr_result("(error: boom)", request_id=0, is_error=True)
+
+        # Cached ASR text unchanged — set_enhance_off() must not restore
+        # the error string into the final text later.
+        assert panel._asr_text == "old"
+        calls = [
+            c[0][0]
+            for c in panel._webview.evaluateJavaScript_completionHandler_.call_args_list
+        ]
+        assert any("setAsrResult" in c and c.rstrip().endswith("true)") for c in calls)
+
+    def test_asr_request_id_advances_on_every_show(self):
+        """Every show() must advance the session generation (never reset,
+        never stay put) — a stale late result from a previous panel
+        session must never collide with the new session's id, even when
+        the new session issues no STT request of its own."""
+        from wenzi.ui.result_window_web import ResultPreviewPanel
+
+        panel = _build_panel(ResultPreviewPanel())
+        panel.show(
+            asr_text="a", show_enhance=False,
+            on_confirm=MagicMock(), on_cancel=MagicMock(),
+        )
+        panel.set_asr_loading()
+        first = panel.asr_request_id
+        assert first > 0
+
+        panel.show(
+            asr_text="b", show_enhance=False,
+            on_confirm=MagicMock(), on_cancel=MagicMock(),
+        )
+        assert panel.asr_request_id > first  # new session = new generation
+        second = panel.asr_request_id
+        panel.set_asr_loading()
+        assert panel.asr_request_id > second
+
+    def test_stt_popup_index_stale_request_ignored(self):
+        """set_stt_popup_index validates the request id INSIDE the
+        main-thread callback — a stale rollback cannot touch a newer
+        panel session."""
+        from wenzi.ui.result_window_web import ResultPreviewPanel
+
+        panel = _build_panel(ResultPreviewPanel())
+        panel.show(
+            asr_text="a", show_enhance=False,
+            on_confirm=MagicMock(), on_cancel=MagicMock(),
+        )
+        panel.set_asr_loading()  # advance past the request_id=0 sentinel
+        current = panel.asr_request_id
+        assert current >= 2
+
+        panel._webview.evaluateJavaScript_completionHandler_.reset_mock()
+        panel.set_stt_popup_index(3, request_id=current - 1)  # stale
+        calls = [
+            c[0][0]
+            for c in panel._webview.evaluateJavaScript_completionHandler_.call_args_list
+        ]
+        assert not any("setSttPopupIndex" in c for c in calls)
+
+        panel.set_stt_popup_index(3, request_id=current)  # current
+        calls = [
+            c[0][0]
+            for c in panel._webview.evaluateJavaScript_completionHandler_.call_args_list
+        ]
+        assert any("setSttPopupIndex(3)" in c for c in calls)
+
+    def test_enhance_step_info_stale_request_ignored(self):
+        from wenzi.ui.result_window_web import ResultPreviewPanel
+
+        panel = _build_panel(ResultPreviewPanel())
+        panel.show(
+            asr_text="a", show_enhance=True,
+            on_confirm=MagicMock(), on_cancel=MagicMock(),
+        )
+        panel.enhance_request_id += 1  # advance past the 0 sentinel
+        current = panel.enhance_request_id
+        assert current >= 2
+
+        panel._webview.evaluateJavaScript_completionHandler_.reset_mock()
+        panel.set_enhance_step_info(1, 2, "Step", request_id=current - 1)
+        calls = [
+            c[0][0]
+            for c in panel._webview.evaluateJavaScript_completionHandler_.call_args_list
+        ]
+        assert not any("setStepInfo" in c for c in calls)
+
+        panel.set_enhance_step_info(1, 2, "Step", request_id=current)
+        calls = [
+            c[0][0]
+            for c in panel._webview.evaluateJavaScript_completionHandler_.call_args_list
+        ]
+        assert any("setStepInfo" in c for c in calls)
+
+    def test_reset_final_text_to_asr(self):
+        """Restores the editable final text to the cached ASR text."""
+        from wenzi.ui.result_window_web import ResultPreviewPanel
+
+        panel = _build_panel(ResultPreviewPanel())
+        panel.show(
+            asr_text="orig", show_enhance=False,
+            on_confirm=MagicMock(), on_cancel=MagicMock(),
+        )
+
+        panel._webview.evaluateJavaScript_completionHandler_.reset_mock()
+        panel.reset_final_text_to_asr()
+
+        calls = [
+            c[0][0]
+            for c in panel._webview.evaluateJavaScript_completionHandler_.call_args_list
+        ]
+        assert any("setFinalText" in c and "orig" in c for c in calls)
+
+    def test_reset_final_text_respects_user_edit(self):
+        from wenzi.ui.result_window_web import ResultPreviewPanel
+
+        panel = _build_panel(ResultPreviewPanel())
+        panel.show(
+            asr_text="orig", show_enhance=False,
+            on_confirm=MagicMock(), on_cancel=MagicMock(),
+        )
+        panel._user_edited = True
+
+        panel._webview.evaluateJavaScript_completionHandler_.reset_mock()
+        panel.reset_final_text_to_asr()
+
+        calls = [
+            c[0][0]
+            for c in panel._webview.evaluateJavaScript_completionHandler_.call_args_list
+        ]
+        assert not any("setFinalText" in c for c in calls)
+
 
 class TestProperties:
     """Test properties and visibility."""
@@ -720,6 +862,40 @@ class TestHtmlTemplate:
         html = self._template()
         assert "Escape" in html
         assert "metaKey" in html
+        # Plain Enter inside the final text inserts a newline;
+        # Cmd+Enter confirms; Cmd+Shift+Enter copies.
+        assert "e.target.id === 'final-text'" in html
+        assert "e.metaKey && e.shiftKey && e.key === 'Enter'" in html
+        # The confirm button must honor the held modifiers (label swaps
+        # to Copy while ⌘⇧ are held, so the click must copy too)
+        assert 'onclick="doConfirm(cmdHeld)"' in html
+
+    def test_html_uses_small_state_animation_only(self):
+        html = self._template()
+
+        assert 'data-state="idle"' in html
+        assert "status-breathe" in html
+        assert "prefers-reduced-motion: reduce" in html
+        assert "setInterval(" not in html
+        assert "requestAnimationFrame(" not in html
+        assert "backdrop-filter" not in html
+        assert "will-change" not in html
+        assert "0 0 12px" not in html
+        assert "section.dataset.state !== state" in html
+
+    def test_html_has_accessible_focus_and_confirm_tokens(self):
+        html = self._template()
+
+        assert "--confirm-bg: #217a49" in html
+        assert "color-scheme: dark" in html
+        assert "select:focus-visible" in html
+        assert "i18n('btn.thinking')" in html
+
+    def test_html_updates_visual_error_state(self):
+        html = self._template()
+
+        assert "setSectionState('asr-section', isError ? 'error' : 'ready')" in html
+        assert "setSectionState('enhance-section', 'loading')" in html
 
 
 class TestEnhanceLabelText:

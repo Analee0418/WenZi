@@ -165,6 +165,17 @@ class TestClipboardEnhanceValidation:
 
         app = MagicMock(spec=[])
         app._busy = False
+
+        def _try_begin(name):
+            if app._busy:
+                return None
+            app._busy = True
+            return object()
+
+        app._try_begin_op = MagicMock(side_effect=_try_begin)
+        app._end_op = MagicMock(
+            side_effect=lambda owner: setattr(app, "_busy", False)
+        )
         ctrl = PreviewController(app)
         return app, ctrl
 
@@ -260,6 +271,176 @@ class TestClipboardEnhanceValidation:
             "PyObjCTools.AppHelper": mock_helper,
         }):
             ctrl._on_clipboard_enhance_worker()
+
+    def test_run_clipboard_preview_refused_keeps_mode(self):
+        """A refused Universal-Action preview must not change the global
+        enhance mode — the mode switch happens only after the claim."""
+        app, ctrl = self._make_app_and_ctrl()
+        app._busy = True
+        app._enhance_mode = "proofread"
+
+        ctrl.run_clipboard_preview("some text", mode_id="translate")
+
+        assert app._enhance_mode == "proofread"
+
+    def test_run_clipboard_preview_applies_mode_before_preview(self):
+        """The mode (incl. enabling the enhancer when it was Off) must be
+        applied before the preview computes use_enhance."""
+        app, ctrl = self._make_app_and_ctrl()
+        app._enhance_mode = "off"
+        app._enhancer = MagicMock()
+        app._enhancer._enabled = False
+        app._enhance_controller = MagicMock()
+        seen: dict = {}
+        ctrl._do_clipboard_with_preview = MagicMock(
+            side_effect=lambda text: seen.update(
+                mode=app._enhance_mode,
+                controller_mode=app._enhance_controller.enhance_mode,
+                enabled=app._enhancer._enabled,
+                enhancer_mode=app._enhancer.mode,
+            )
+        )
+
+        mock_helper = MagicMock()
+        mock_helper.callAfter = lambda fn, *a, **kw: fn(*a, **kw)
+        with patch.dict("sys.modules", {
+            "PyObjCTools": MagicMock(AppHelper=mock_helper),
+            "PyObjCTools.AppHelper": mock_helper,
+        }):
+            ctrl.run_clipboard_preview("some text", mode_id="translate")
+
+        assert seen["mode"] == "translate"
+        # EnhanceController.enhance_mode drives the chain/single split
+        # and the cache key — it must move together with the app mode
+        assert seen["controller_mode"] == "translate"
+        assert seen["enabled"] is True
+        assert seen["enhancer_mode"] == "translate"
+
+    def test_ua_mode_apply_timeout_aborts_and_late_apply_is_noop(self):
+        """When the main thread is too slow, the preview must abort AND
+        the already-queued mode callback must not fire late — it would
+        mutate the global mode under a newer, unrelated operation."""
+        app, ctrl = self._make_app_and_ctrl()
+        app._enhance_mode = "proofread"
+        app._enhancer = MagicMock()
+        app._enhance_controller = MagicMock()
+        ctrl._do_clipboard_with_preview = MagicMock()
+        ctrl._MODE_APPLY_TIMEOUT = 0.05
+
+        captured: list = []
+        mock_helper = MagicMock()
+        mock_helper.callAfter = lambda fn, *a, **kw: captured.append(fn)
+        with patch.dict("sys.modules", {
+            "PyObjCTools": MagicMock(AppHelper=mock_helper),
+            "PyObjCTools.AppHelper": mock_helper,
+        }):
+            ctrl.run_clipboard_preview("some text", mode_id="translate")
+
+        ctrl._do_clipboard_with_preview.assert_not_called()
+        assert app._busy is False  # op slot released on abort
+
+        # The queued callback fires late — it must be a no-op
+        assert captured
+        captured[0]()
+        assert app._enhance_mode == "proofread"
+
+    def test_ua_opguard_held_while_apply_in_progress(self):
+        """Once the callback entered 'applying', the worker must wait for
+        it — the OpGuard cannot be released mid-apply."""
+        import threading
+        import time
+
+        app, ctrl = self._make_app_and_ctrl()
+        app._enhance_mode = "proofread"
+        app._enhancer = MagicMock()
+        ctrl._do_clipboard_with_preview = MagicMock()
+        ctrl._MODE_APPLY_TIMEOUT = 0.05
+
+        gate = threading.Event()
+        entered = threading.Event()
+
+        class _BlockyCtrl:
+            def __init__(self):
+                self._mode = "proofread"
+
+            @property
+            def enhance_mode(self):
+                return self._mode
+
+            @enhance_mode.setter
+            def enhance_mode(self, value):
+                entered.set()
+                gate.wait(5)
+                self._mode = value
+
+        app._enhance_controller = _BlockyCtrl()
+
+        mock_helper = MagicMock()
+        mock_helper.callAfter = lambda fn, *a, **kw: threading.Thread(
+            target=fn, daemon=True
+        ).start()
+
+        with patch.dict("sys.modules", {
+            "PyObjCTools": MagicMock(AppHelper=mock_helper),
+            "PyObjCTools.AppHelper": mock_helper,
+        }):
+            worker = threading.Thread(
+                target=lambda: ctrl.run_clipboard_preview(
+                    "text", mode_id="translate"
+                ),
+                daemon=True,
+            )
+            worker.start()
+            assert entered.wait(5)
+            time.sleep(0.2)  # well past the 0.05s timeout
+            # Applying in progress → the op slot must still be held
+            assert app._busy is True
+            gate.set()
+            worker.join(5)
+
+        assert not worker.is_alive()
+        assert app._busy is False
+        assert app._enhance_controller.enhance_mode == "translate"
+        ctrl._do_clipboard_with_preview.assert_called_once()
+
+    def test_ua_apply_failure_rolls_back_everything(self):
+        """A setter raising mid-apply must restore app, controller and
+        enhancer state on the main thread, then abort the preview."""
+        app, ctrl = self._make_app_and_ctrl()
+        app._enhance_mode = "proofread"
+        app._enhancer = MagicMock()
+        app._enhancer._enabled = False
+        app._enhancer.mode = "old-mode"
+        ctrl._do_clipboard_with_preview = MagicMock()
+
+        class _RaisingCtrl:
+            def __init__(self):
+                self._mode = "ctrl-old"
+
+            @property
+            def enhance_mode(self):
+                return self._mode
+
+            @enhance_mode.setter
+            def enhance_mode(self, value):
+                raise RuntimeError("setter blew up")
+
+        app._enhance_controller = _RaisingCtrl()
+
+        mock_helper = MagicMock()
+        mock_helper.callAfter = lambda fn, *a, **kw: fn(*a, **kw)
+        with patch.dict("sys.modules", {
+            "PyObjCTools": MagicMock(AppHelper=mock_helper),
+            "PyObjCTools.AppHelper": mock_helper,
+        }):
+            ctrl.run_clipboard_preview("text", mode_id="translate")
+
+        ctrl._do_clipboard_with_preview.assert_not_called()
+        assert app._busy is False
+        # Full rollback: app mode, enhancer enabled + mode
+        assert app._enhance_mode == "proofread"
+        assert app._enhancer._enabled is False
+        assert app._enhancer.mode == "old-mode"
 
     def test_dispatches_to_worker_thread(self):
         """Verify on_clipboard_enhance starts a worker thread."""

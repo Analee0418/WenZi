@@ -56,6 +56,21 @@ class WhisperAPITranscriber(BaseTranscriber):
             self._model,
         )
 
+    def verify(self, timeout: float = 10.0) -> None:
+        """Probe the endpoint with one real transcription of a 0.5s
+        silent clip (may incur a tiny provider cost).
+
+        *timeout* is a real socket timeout on the probe connection, so a
+        hung endpoint aborts at the network layer instead of lingering.
+        Raises RuntimeError when the endpoint / key / model combination
+        is unusable, so switch flows can keep the previous transcriber.
+        """
+        err = self.verify_provider(
+            self._base_url, self._api_key, self._model, timeout=timeout,
+        )
+        if err:
+            raise RuntimeError(f"ASR endpoint verification failed: {err}")
+
     def cleanup(self) -> None:
         if self._client is not None:
             self._client.close()
@@ -90,10 +105,14 @@ class WhisperAPITranscriber(BaseTranscriber):
         return text
 
     @staticmethod
-    def verify_provider(base_url: str, api_key: str, model: str) -> str | None:
+    def verify_provider(
+        base_url: str, api_key: str, model: str,
+        timeout: float | None = None,
+    ) -> str | None:
         """Test an ASR provider connection with a silent WAV file.
 
         Returns None on success or an error message string on failure.
+        *timeout* (seconds) applies as a socket timeout when given.
         """
         import struct
         import wave
@@ -112,7 +131,10 @@ class WhisperAPITranscriber(BaseTranscriber):
         client = None
         try:
             from wenzi.llm_http import TranscriptionClient
-            client = TranscriptionClient(base_url=base_url, api_key=api_key)
+            kwargs = {"base_url": base_url, "api_key": api_key}
+            if timeout is not None:
+                kwargs["timeout"] = timeout
+            client = TranscriptionClient(**kwargs)
             audio_file = io.BytesIO(wav_data)
             audio_file.name = "test.wav"
             client.create(model=model, file=audio_file)

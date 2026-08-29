@@ -109,7 +109,7 @@
 |-----|---------|-------------|
 | `audio.sample_rate` | `16000` | 音频采样率（Hz） |
 | `audio.block_ms` | `20` | 录音块大小（毫秒） |
-| `audio.device` | `null` | 音频输入设备（null 表示使用系统默认设备） |
+| `audio.device` | `null` | 音频输入设备 UID。`null` 表示自动选择：系统默认输入是蓝牙设备时，闻字优先使用 Mac 内建麦克风以避免播放音质和音量变化；其他情况继续使用系统默认。显式 UID 始终会被尊重。 |
 | `audio.max_session_bytes` | `20971520` | 单次录音最大字节数（约 20 MB） |
 | `audio.silence_rms` | `20` | 静音判定的 RMS 阈值，低于此值视为静音 |
 
@@ -187,7 +187,7 @@
 |-----|---------|-------------|
 | `feedback.sound_enabled` | `true` | 启用录音开始/停止的声音反馈 |
 | `feedback.sound_volume` | `0.4` | 声音音量（0.0 -- 1.0） |
-| `feedback.visual_indicator` | `true` | 显示浮动录音指示器及音频电平条 |
+| `feedback.visual_indicator` | `true` | 显示随音量变化的录音光球 |
 | `feedback.restart_key` | `"cmd"` | 按住触发热键时重新开始录音的按键。可选值：`space`、`cmd`、`ctrl`、`alt`、`shift`、`esc` |
 | `feedback.cancel_key` | `"space"` | 按住触发热键时取消录音的按键。可选值：`space`、`cmd`、`ctrl`、`alt`、`shift`、`esc` |
 

@@ -830,19 +830,10 @@ textarea.provider-form-textarea.error {
         <div class="setting-row">
           <div class="setting-left">
             <div class="setting-label" data-i18n="general_tab.visual_indicator">Visual Indicator</div>
-            <div class="setting-desc" data-i18n="general_tab.visual_indicator_desc">Show floating indicator while recording</div>
+            <div class="setting-desc" data-i18n="general_tab.visual_indicator_desc">Show an audio-reactive orb while recording</div>
           </div>
           <div class="setting-right">
             <div id="ctl-visual" class="toggle" onclick="toggleClick(this, 'on_visual_toggle')"></div>
-          </div>
-        </div>
-        <div class="setting-row">
-          <div class="setting-left">
-            <div class="setting-label" data-i18n="general_tab.show_device_name">Show Device Name</div>
-            <div class="setting-desc" data-i18n="general_tab.show_device_name_desc">Show the input device name on the recording indicator</div>
-          </div>
-          <div class="setting-right">
-            <div id="ctl-device-name" class="toggle" onclick="toggleClick(this, 'on_device_name_toggle')"></div>
           </div>
         </div>
         <div class="setting-row">
@@ -1861,7 +1852,7 @@ var LLM_PROVIDER_PRESETS = {
   'deepseek': {
     name: 'DeepSeek',
     base_url: 'https://api.deepseek.com/v1',
-    models: ['deepseek-chat', 'deepseek-reasoner']
+    models: ['deepseek-v4-flash', 'deepseek-v4-pro']
   },
   'minimax': {
     name: 'MiniMax',
@@ -2569,18 +2560,20 @@ function renderPermissions() {
 /* Microphone tab                                                      */
 /* ------------------------------------------------------------------ */
 
-function renderMicrophoneList(devices, selectedUid, defaultName) {
+function renderMicrophoneList(devices, selectedUid, automaticName) {
   var container = document.getElementById('mic-device-list');
   if (!container) return;
   var html = '';
-  // "System Default" row
+  // Automatic routing keeps Bluetooth playback out of its call profile.
   var defSel = (!selectedUid) ? ' selected' : '';
-  var defLabel = _esc(_t('microphone_tab.system_default', 'System Default'));
-  if (defaultName) defLabel += ' (' + _esc(defaultName) + ')';
+  var defLabel = _esc(_t('microphone_tab.automatic', 'Automatic'));
+  if (automaticName) defLabel += ' (' + _esc(automaticName) + ')';
+  var defDesc = _esc(_t('microphone_tab.automatic_desc', 'Prefers the Mac built-in microphone when the system default is Bluetooth'));
   html += '<div class="model-row' + defSel + '" data-action="mic-select" data-uid="">';
   html += '  <div class="model-radio"></div>';
   html += '  <div class="model-info">';
   html += '    <div class="model-name">' + defLabel + '</div>';
+  html += '    <div class="model-detail">' + defDesc + '</div>';
   html += '  </div>';
   html += '</div>';
   // Device rows
@@ -2625,13 +2618,12 @@ function _initState(config) {
 
   // Microphone
   if (config.audio_devices !== undefined) {
-    renderMicrophoneList(config.audio_devices, config.audio_device || '', config.default_device_name || '');
+    renderMicrophoneList(config.audio_devices, config.audio_device || '', config.automatic_device_name || '');
   }
 
   // Feedback
   setToggle('ctl-sound', config.sound_enabled);
   setToggle('ctl-visual', config.visual_indicator);
-  setToggle('ctl-device-name', config.show_device_name);
   setToggle('ctl-hide-status-icon', config.hide_status_icon);
 
   // Output
@@ -3042,11 +3034,10 @@ function updatePluginProgress(info) {
 
 function _updateState(state) {
   if (state.audio_devices !== undefined) {
-    renderMicrophoneList(state.audio_devices, state.audio_device || '', state.default_device_name || '');
+    renderMicrophoneList(state.audio_devices, state.audio_device || '', state.automatic_device_name || '');
   }
   if (state.sound_enabled !== undefined) setToggle('ctl-sound', state.sound_enabled);
   if (state.visual_indicator !== undefined) setToggle('ctl-visual', state.visual_indicator);
-  if (state.show_device_name !== undefined) setToggle('ctl-device-name', state.show_device_name);
   if (state.hide_status_icon !== undefined) setToggle('ctl-hide-status-icon', state.hide_status_icon);
   if (state.preview !== undefined) setToggle('ctl-preview', state.preview);
   if (state.keychain_enabled !== undefined) {

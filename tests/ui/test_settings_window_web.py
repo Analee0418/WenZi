@@ -40,6 +40,12 @@ def _make_state():
         "sound_enabled": True,
         "visual_indicator": True,
         "show_device_name": False,
+        "audio_devices": [
+            {"uid": "builtin", "name": "MacBook Pro Microphone"},
+            {"uid": "airpods", "name": "AirPods Max"},
+        ],
+        "audio_device": None,
+        "automatic_device_name": "MacBook Pro Microphone",
         "preview": True,
         "current_preset_id": "funasr-paraformer",
         "current_remote_asr": None,
@@ -101,7 +107,8 @@ def _make_callbacks():
         "on_hotkey_toggle", "on_hotkey_mode_select", "on_hotkey_delete",
         "on_record_hotkey", "on_restart_key_select", "on_cancel_key_select",
         "on_scripting_toggle", "on_sound_toggle", "on_visual_toggle",
-        "on_device_name_toggle", "on_preview_toggle",
+        "on_device_name_toggle", "on_preview_toggle", "on_mic_select",
+        "on_mic_refresh",
         "on_stt_select", "on_stt_remote_select",
         "on_stt_add_provider", "on_stt_remove_provider",
         "on_llm_select", "on_llm_add_provider", "on_llm_remove_provider",
@@ -575,3 +582,6 @@ class TestLoadHtml:
         assert 'id="tab-speech"' in html_content
         assert 'id="tab-ai"' in html_content
         assert 'id="tab-launcher"' in html_content
+        assert 'id="ctl-device-name"' not in html_content
+        assert '"automatic_device_name": "MacBook Pro Microphone"' in html_content
+        assert "microphone_tab.automatic_desc" in html_content

@@ -15,6 +15,7 @@ from ApplicationServices import AXIsProcessTrusted, AXIsProcessTrustedWithOption
 from CoreFoundation import kCFBooleanTrue
 
 from wenzi import async_loop
+from wenzi.op_guard import OpGuard
 
 from .audio.recorder import Recorder
 from .audio.recording_indicator import RecordingIndicatorPanel
@@ -271,7 +272,7 @@ class WenZiApp(StatusBarApp):
         self._preview_enabled = self._config["output"].get("preview", True)
         self._hotkey_listener: MultiHotkeyListener | None = None
         self._voice_input_available = True
-        self._busy = False
+        self._op_guard = OpGuard()
         self._preview_panel = ResultPreviewPanel()
         self._conversation_history = ConversationHistory(data_dir=self._data_dir)
         self._usage_stats = UsageStats(data_dir=self._data_dir)
@@ -582,6 +583,31 @@ class WenZiApp(StatusBarApp):
             return img
         except Exception:
             return None
+
+    # ------------------------------------------------------------------
+    # Exclusive-operation guard (recording / model switch / preview ops)
+    # ------------------------------------------------------------------
+
+    @property
+    def _busy(self) -> bool:
+        """True while an exclusive operation is in progress."""
+        return self._op_guard.busy
+
+    def _try_begin_op(self, name: str) -> object | None:
+        """Claim the app-wide exclusive-operation slot.
+
+        Returns an opaque release token, or None when another operation
+        is in progress.  Pair every successful call with _end_op(token).
+        """
+        return self._op_guard.try_begin(name)
+
+    def _end_op(self, token: object | None) -> None:
+        """Release the slot if *token* is the claim that holds it.
+
+        Token identity (not a name string) keeps a stale or duplicate
+        release from freeing a slot claimed by a newer operation.
+        """
+        self._op_guard.end(token)
 
     @staticmethod
     def _create_local_transcriber(asr_cfg: dict, default_backend: str, hotwords):

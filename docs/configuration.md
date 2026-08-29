@@ -109,7 +109,7 @@ The config file is always `config.json` inside the resolved directory.
 |-----|---------|-------------|
 | `audio.sample_rate` | `16000` | Audio sample rate in Hz |
 | `audio.block_ms` | `20` | Recording block size in milliseconds |
-| `audio.device` | `null` | Audio input device (null = system default) |
+| `audio.device` | `null` | Audio input device UID. `null` uses automatic routing: when the system default input is Bluetooth, WenZi prefers the Mac's built-in microphone to keep Bluetooth playback stable; otherwise it keeps the system default. An explicit UID is always honored. |
 | `audio.max_session_bytes` | `20971520` | Max recording size (~20 MB) |
 | `audio.silence_rms` | `20` | RMS threshold below which audio is considered silence |
 
@@ -187,7 +187,7 @@ The config file is always `config.json` inside the resolved directory.
 |-----|---------|-------------|
 | `feedback.sound_enabled` | `true` | Enable sound feedback for recording start/stop |
 | `feedback.sound_volume` | `0.4` | Sound volume (0.0 -- 1.0) |
-| `feedback.visual_indicator` | `true` | Show floating recording indicator with audio level bars |
+| `feedback.visual_indicator` | `true` | Show an audio-reactive recording orb |
 | `feedback.restart_key` | `"cmd"` | Key to restart recording while the trigger hotkey is held. Options: `space`, `cmd`, `ctrl`, `alt`, `shift`, `esc` |
 | `feedback.cancel_key` | `"space"` | Key to cancel recording while the trigger hotkey is held. Options: `space`, `cmd`, `ctrl`, `alt`, `shift`, `esc` |
 

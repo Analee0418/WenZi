@@ -1,0 +1,3 @@
+display_name: DeBank
+short_description: Query DeBank wallet and DeFi portfolio data.
+default_prompt: "Use DeBank OpenAPI to analyze this wallet address:"

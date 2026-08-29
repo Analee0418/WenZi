@@ -6,7 +6,7 @@ in subdirectories.
 
 Keyboard:
   - Tab / Shift+Tab: cycle between Name → Keyword → Content
-  - Enter: save (Shift+Enter for newline in Content)
+  - Cmd+Enter: save (plain Enter inserts a newline in Content)
   - Esc: cancel
 """
 
@@ -275,11 +275,13 @@ class SnippetEditorPanel:
                     self._panel.makeFirstResponder_(self._name_field)
                     return None  # consume
 
-            # Enter (without Shift) → save; Shift+Enter in Content → newline
+            # Cmd+Enter → save; plain Enter falls through so it inserts a
+            # newline in Content (Name/Keyword still save via their own
+            # NSTextField action).
             if char == "\r":
-                from AppKit import NSShiftKeyMask
+                from AppKit import NSCommandKeyMask
 
-                if not (modifier_flags & NSShiftKeyMask):
+                if modifier_flags & NSCommandKeyMask:
                     self._clear_error()
                     self._do_save()
                     return None  # consume

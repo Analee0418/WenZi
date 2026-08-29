@@ -249,6 +249,9 @@ class AppleSpeechTranscriber(BaseTranscriber):
         self._stream_runloop_thread: threading.Thread | None = None
         self._stream_runloop_stop = threading.Event()
         self._stream_final_event = threading.Event()
+        # Serializes stop/cancel: concurrent finalization would race the
+        # run-loop teardown and shared stream state.
+        self._stream_lifecycle_lock = threading.Lock()
         self._stream_final_text: str = ""
         self._stream_on_partial: Callable[[str, bool], None] | None = None
         self._stream_accumulated: str = ""
@@ -486,7 +489,15 @@ class AppleSpeechTranscriber(BaseTranscriber):
                 CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, False)
 
         t = threading.Thread(target=_runloop_thread, daemon=True)
-        t.start()
+        try:
+            t.start()
+        except Exception:
+            # Transactional: a failed start must leave no allocated
+            # request/task/thread state behind.
+            logger.exception("Apple streaming run-loop thread failed to start")
+            with self._stream_lifecycle_lock:
+                self._reset_streaming_state()
+            raise
         self._stream_runloop_thread = t
         logger.info("Streaming recognition started")
 
@@ -504,7 +515,21 @@ class AppleSpeechTranscriber(BaseTranscriber):
         return 16000
 
     def stop_streaming(self) -> str:
-        """End audio and wait for the final transcription result."""
+        """End audio and wait for the final transcription result.
+
+        Serialized with cancel_streaming() and idempotent — a repeated
+        call after cleanup returns immediately.
+        """
+        with self._stream_lifecycle_lock:
+            return self._stop_streaming_locked()
+
+    def _stop_streaming_locked(self) -> str:
+        if (
+            self._stream_request is None
+            and self._stream_task is None
+            and self._stream_runloop_thread is None
+        ):
+            return ""
         request = self._stream_request
         if request is not None:
             self._stream_ending = True
@@ -527,12 +552,19 @@ class AppleSpeechTranscriber(BaseTranscriber):
         return text
 
     def cancel_streaming(self) -> None:
-        """Cancel the active streaming session."""
-        if self._stream_task is not None:
-            self._stream_task.cancel()
-        self._stop_runloop_thread()
-        self._reset_streaming_state()
-        logger.info("Streaming recognition cancelled")
+        """Cancel the active streaming session (serialized, idempotent)."""
+        with self._stream_lifecycle_lock:
+            if (
+                self._stream_request is None
+                and self._stream_task is None
+                and self._stream_runloop_thread is None
+            ):
+                return
+            if self._stream_task is not None:
+                self._stream_task.cancel()
+            self._stop_runloop_thread()
+            self._reset_streaming_state()
+            logger.info("Streaming recognition cancelled")
 
     def _stop_runloop_thread(self) -> None:
         """Signal the RunLoop thread to stop and wait for it."""

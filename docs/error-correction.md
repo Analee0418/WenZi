@@ -182,7 +182,7 @@ The LLM, armed with vocabulary context and conversation history, produces:
 All errors corrected. Punctuation added.
 
 **Step 5 — Preview Panel: You Confirm:**
-The result looks perfect. You press Enter to confirm. The text is typed into your active application.
+The result looks perfect. You press ⌘+Enter to confirm. The text is typed into your active application.
 
 **Step 6 — Self-Improving: Recorded for the Future:**
 This session is logged. Next time you mention "Ciriel" or "Kubernetes", the system will be even more confident in making the right correction.

@@ -89,6 +89,11 @@ def _is_deepseek_thinking_model(model_lower: str) -> bool:
     return "deepseek" in lower and not _is_deepseek_reasoning_model(lower)
 
 
+def _is_deepseek_v4_model(model_lower: str) -> bool:
+    """Check if model uses the DeepSeek V4 thinking API."""
+    return model_lower.lower().startswith("deepseek-v4-")
+
+
 def build_thinking_body(model: str, enabled: bool) -> dict[str, Any]:
     """Build extra_body parameters to control thinking for a given model.
 
@@ -99,6 +104,7 @@ def build_thinking_body(model: str, enabled: bool) -> dict[str, Any]:
     |-------------------|-------------------------------------------|-------------------------------------------|
     | GLM               | {"thinking": {"type": "enabled"}}         | {"thinking": {"type": "disabled"}}        |
     | Qwen              | chat_template_kwargs enable_thinking=True | chat_template_kwargs enable_thinking=False|
+    | DeepSeek V4       | {"thinking": {"type": "enabled"}}      | {"thinking": {"type": "disabled"}}     |
     | DeepSeek (V3 etc) | {"enable_thinking": true}                 | {"enable_thinking": false}                |
     | OpenAI reasoning  | {"reasoning_effort": "low"}               | {} (no param)                             |
     | DeepSeek reasoning| {"reasoning_effort": "low"}               | {} (no param)                             |
@@ -114,6 +120,10 @@ def build_thinking_body(model: str, enabled: bool) -> dict[str, Any]:
 
     if "qwen" in model_lower:
         return {"chat_template_kwargs": {"enable_thinking": enabled}}
+
+    if _is_deepseek_v4_model(model_lower):
+        state = "enabled" if enabled else "disabled"
+        return {"thinking": {"type": state}}
 
     if _is_deepseek_thinking_model(model_lower):
         return {"enable_thinking": enabled}
@@ -1087,6 +1097,10 @@ class TextEnhancer:
                         None,
                         "retry",
                     )
+                    # Always finish with the fallback terminal so consumers
+                    # restore the final text to the original — otherwise a
+                    # previous request's output could linger and be typed.
+                    yield text, None, "timeout"
                     return
                 except TimeoutError:
                     last_error = (
@@ -1182,6 +1196,13 @@ class TextEnhancer:
         except TimeoutError:
             self._pool_monitor.log_stats("stream:timeout", self._active_provider)
             logger.error("AI stream enhancement timed out after %ds", self._timeout)
+            # Status marker first so the UI shows the true reason; the
+            # "timeout" marker itself only signals the fallback.
+            yield (
+                f"(Error: enhancement timed out after {self._timeout}s)\n",
+                None,
+                "retry",
+            )
             yield text, None, "timeout"
         except Exception as e:
             if isinstance(e, RateLimitError):
@@ -1190,7 +1211,11 @@ class TextEnhancer:
             else:
                 self._pool_monitor.log_stats("stream:error", self._active_provider)
                 logger.error("AI stream enhancement failed: %s", e)
-            yield f"(error: {e})", None, False
+            # Surface the error as a status marker and fall back to the
+            # original text — the error string must never be yielded as
+            # content, or it would be typed into the target application.
+            yield f"(Error: {e})\n", None, "retry"
+            yield text, None, "timeout"
 
 
 def create_enhancer(

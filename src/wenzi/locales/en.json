@@ -18,6 +18,11 @@
   "statusbar.status.clearing": "Clearing...",
   "statusbar.status.vocab_building": "VT \u23f3",
 
+  "recording_indicator.preparing": "Preparing",
+  "recording_indicator.listening": "Listening",
+  "live_overlay.preparing": "Preparing live transcript",
+  "live_overlay.listening": "Live transcript",
+
   "menu.hotkey": "Hotkey",
   "menu.record_hotkey": "Record Hotkey...",
   "menu.stt_model": "STT Model",
@@ -99,6 +104,8 @@
 
   "alert.recording.empty": "No Audio Captured",
   "alert.recording.empty.message": "The microphone did not capture any audio. Please check that your microphone is not muted or disconnected.",
+  "alert.recording.busy": "Model switch in progress — recording is unavailable",
+  "alert.recording.start_failed": "Recording failed to start — try again or check microphone permissions",
 
   "alert.provider.add_asr.title": "Add ASR Provider",
   "alert.provider.add_asr.message": "name       — unique provider name\nbase_url   — OpenAI-compatible ASR endpoint\napi_key    — authentication key\nmodels     — one model per line (indented)",
@@ -250,7 +257,7 @@
 
   "snippet_editor.title": "New Snippet",
   "snippet_editor.btn.cancel": "Cancel [ESC]",
-  "snippet_editor.btn.save": "Save [⏎]",
+  "snippet_editor.btn.save": "Save [⌘⏎]",
   "snippet_editor.placeholder.optional": "Optional",
   "snippet_editor.placeholder.category": "category/name or just name",
   "snippet_editor.label.name": "Name",
@@ -331,7 +338,7 @@
   "settings.general_tab.sound_feedback": "Sound Feedback",
   "settings.general_tab.sound_feedback_desc": "Adds ~350ms delay before recording to avoid capturing the sound",
   "settings.general_tab.visual_indicator": "Visual Indicator",
-  "settings.general_tab.visual_indicator_desc": "Show a floating indicator while recording",
+  "settings.general_tab.visual_indicator_desc": "Show an audio-reactive orb while recording",
   "settings.general_tab.show_device_name": "Show Device Name",
   "settings.general_tab.show_device_name_desc": "Show the input device name on the recording indicator",
   "settings.general_tab.hide_status_icon": "Hide Status Icon",
@@ -383,7 +390,8 @@
   "settings.microphone_tab.refresh": "Refresh",
   "settings.microphone_tab.device_label": "Device",
   "settings.microphone_tab.device_desc": "Select which microphone to use for recording",
-  "settings.microphone_tab.system_default": "System Default",
+  "settings.microphone_tab.automatic": "Automatic",
+  "settings.microphone_tab.automatic_desc": "Prefers the Mac's built-in microphone when the system default is Bluetooth, keeping playback stable",
 
   "settings.stt_tab.title": "STT",
   "settings.stt_tab.local_section": "Local",
@@ -478,6 +486,7 @@
   "preview.asr_title.clipboard": "Clipboard Text",
   "preview.btn.hotwords": "Hotwords",
   "preview.btn.punc": "Punc",
+  "preview.btn.thinking": "Thinking mode",
   "preview.btn.play": "Play \u25b6",
   "preview.btn.pause": "Pause \u23f8",
   "preview.btn.save_audio": "Save",
@@ -486,8 +495,8 @@
   "preview.btn.diff": "Diff",
   "preview.btn.history": "History",
   "preview.btn.cancel": "Cancel",
-  "preview.btn.confirm": "Confirm \u23ce",
-  "preview.btn.copy": "Copy \u2318\u23ce",
+  "preview.btn.confirm": "Confirm \u2318\u23ce",
+  "preview.btn.copy": "Copy \u2318\u21e7\u23ce",
   "preview.section.ai": "AI",
   "preview.section.final": "Final Result (editable)",
   "preview.loading.transcribing": "\u23f3 Transcribing...",

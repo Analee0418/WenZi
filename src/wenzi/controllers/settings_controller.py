@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from wenzi.app import WenZiApp
 
 from wenzi import get_version, is_version_compatible
-from wenzi.audio.recorder import default_input_device_name, list_input_devices
+from wenzi.audio.recorder import automatic_input_device_name, list_input_devices
 from wenzi.config import BUILTIN_REGISTRY_URL, is_keychain_enabled, save_config
 from wenzi.enhance.enhancer import MODE_OFF
 from wenzi.i18n import build_doc_url, t
@@ -332,15 +332,13 @@ class SettingsController:
         ui_cfg = app._config.get("ui", {})
         last_tab = ui_cfg.get("settings_last_tab", "general")
 
-        audio_cfg = app._config.get("audio", {})
+        microphone_state = self._microphone_state()
 
         fb_cfg = app._config.get("feedback", {})
         return {
             "last_tab": last_tab,
             "hotkeys": hotkeys,
-            "audio_devices": list_input_devices(),
-            "audio_device": audio_cfg.get("device"),
-            "default_device_name": default_input_device_name(),
+            **microphone_state,
             "restart_key": fb_cfg.get("restart_key", "cmd"),
             "cancel_key": fb_cfg.get("cancel_key", "space"),
             "sound_enabled": app._sound_manager.enabled,
@@ -799,21 +797,55 @@ class SettingsController:
         app = self._app
         device = uid if uid else None
         audio_cfg = app._config.setdefault("audio", {})
+        missing = object()
+        previous_config_device = audio_cfg.get("device", missing)
+        previous_runtime_device = app._recorder.device
         audio_cfg["device"] = device
         app._recorder.device = device
-        logger.info("Microphone set to: %s", device or "system default")
-        self._save_and_reload()
+        try:
+            save_config(app._config, app._config_path)
+        except Exception:
+            if previous_config_device is missing:
+                audio_cfg.pop("device", None)
+            else:
+                audio_cfg["device"] = previous_config_device
+            app._recorder.device = previous_runtime_device
+            logger.exception("Failed to save microphone selection; rolled back")
+            if app._settings_panel.is_visible:
+                try:
+                    app._settings_panel.update_state(self._microphone_state())
+                except Exception:
+                    logger.debug(
+                        "Failed to roll back microphone selection in panel",
+                        exc_info=True,
+                    )
+            raise
+        if app._settings_panel.is_visible:
+            try:
+                from PyObjCTools import AppHelper
+
+                AppHelper.callAfter(self._refresh_panel)
+            except Exception:
+                # Persistence already committed. A refresh failure must not
+                # roll runtime state back out of sync with the saved config.
+                logger.warning(
+                    "Failed to refresh microphone selection in panel",
+                    exc_info=True,
+                )
+        logger.info("Microphone set to: %s", device or "automatic")
 
     def mic_refresh(self) -> None:
         """Re-enumerate audio devices and update the Settings panel."""
-        app = self._app
-        audio_cfg = app._config.get("audio", {})
-        devices = list_input_devices()
-        app._settings_panel.update_state({
-            "audio_devices": devices,
+        self._app._settings_panel.update_state(self._microphone_state())
+
+    def _microphone_state(self) -> dict:
+        """Return the current microphone choices and automatic route."""
+        audio_cfg = self._app._config.get("audio", {})
+        return {
+            "audio_devices": list_input_devices(),
             "audio_device": audio_cfg.get("device"),
-            "default_device_name": default_input_device_name(),
-        })
+            "automatic_device_name": automatic_input_device_name(),
+        }
 
     def hide_status_icon_toggle(self, enabled: bool) -> None:
         """Handle hide status icon toggle from Settings panel."""
@@ -839,26 +871,30 @@ class SettingsController:
         app = self._app
         if preset_id == app._current_preset_id and not app._current_remote_asr:
             return
-        if app._busy:
-            topmost_alert(
-                t("alert.settings.cannot_switch"),
-                t("alert.settings.cannot_switch.message"),
-            )
-            restore_accessory()
-            return
-
         preset = PRESET_BY_ID.get(preset_id)
         if not preset:
             logger.warning("Unknown preset: %s", preset_id)
             return
 
-        app._busy = True
+        op_token = app._try_begin_op("model-switch")
+        if op_token is None:
+            topmost_alert(
+                t("alert.settings.cannot_switch"),
+                t("alert.settings.cannot_switch.message"),
+            )
+            restore_accessory()
+            # The panel radio already moved to the clicked item — revert
+            self._revert_settings_panel_selection(app._current_preset_id)
+            return
+
         old_preset_id = app._current_preset_id
         old_transcriber = app._transcriber
 
         def _do_switch():
             stop_event = threading.Event()
             monitor_thread = None
+            new_transcriber = None
+            committed = False
             try:
                 # For Apple Speech, verify Siri/Dictation is enabled first
                 if preset.backend == "apple":
@@ -887,9 +923,6 @@ class SettingsController:
                         app._set_status("statusbar.status.ready")
                         return
 
-                app._set_status("statusbar.status.unloading")
-                old_transcriber.cleanup()
-
                 cached = is_model_cached(preset)
                 if not cached:
                     monitor_args = app._model_controller._make_download_monitor_args(preset)
@@ -909,7 +942,17 @@ class SettingsController:
                 if monitor_thread:
                     monitor_thread.join(timeout=2)
 
+                # Swap first, then dispose of the old model — a failed
+                # initialize() above leaves the old transcriber untouched
+                # and still active.
                 app._transcriber = new_transcriber
+                committed = True
+                try:
+                    old_transcriber.cleanup()
+                except Exception:
+                    logger.warning(
+                        "Old transcriber cleanup failed", exc_info=True
+                    )
                 app._current_preset_id = preset_id
                 app._current_remote_asr = None
                 app._menu_builder.update_model_checkmarks()
@@ -936,6 +979,22 @@ class SettingsController:
                     monitor_thread.join(timeout=2)
                 logger.error("Model switch failed: %s", e)
                 app._set_status("statusbar.status.error")
+                if committed:
+                    # The new model is already installed and the old one is
+                    # gone — only post-switch bookkeeping failed.  Never
+                    # fall into the cleanup below, which would destroy the
+                    # only working transcriber.
+                    logger.error("Post-switch bookkeeping failed: %s", e)
+                    return
+                # The old transcriber was never touched; discard the failed
+                # new one and keep the current model active.
+                if new_transcriber is not None:
+                    try:
+                        new_transcriber.cleanup()
+                    except Exception:
+                        logger.debug(
+                            "Failed transcriber cleanup", exc_info=True
+                        )
 
                 can_clear = preset.backend not in ("apple", "whisper-api")
                 if can_clear:
@@ -960,17 +1019,28 @@ class SettingsController:
                     )
                     restore_accessory()
 
-                app._model_controller._try_restore_previous_model(old_preset_id)
+                app._set_status("statusbar.status.ready")
                 self._revert_settings_panel_selection(old_preset_id)
 
             finally:
-                app._busy = False
+                app._end_op(op_token)
 
-        threading.Thread(target=_do_switch, daemon=True).start()
+        switch_thread = threading.Thread(target=_do_switch, daemon=True)
+        try:
+            switch_thread.start()
+        except Exception:
+            # The worker never ran — release the claim and restore the UI
+            app._end_op(op_token)
+            app._set_status("statusbar.status.ready")
+            self._revert_settings_panel_selection(old_preset_id)
+            raise
 
     def _clear_cache_and_retry_switch(self, preset, old_preset_id) -> None:
         """Clear model cache and retry the switch (settings panel path)."""
         app = self._app
+        old_transcriber = app._transcriber
+        new_transcriber = None
+        committed = False
         stop_event = threading.Event()
         monitor_thread = None
         try:
@@ -991,7 +1061,17 @@ class SettingsController:
             stop_event.set()
             monitor_thread.join(timeout=2)
 
+            # Swap first, then dispose of the old model — a failed
+            # initialize() above leaves the old transcriber untouched
+            # and still active.
             app._transcriber = new_transcriber
+            committed = True
+            try:
+                old_transcriber.cleanup()
+            except Exception:
+                logger.warning(
+                    "Old transcriber cleanup failed", exc_info=True
+                )
             app._current_preset_id = preset.id
             app._current_remote_asr = None
             app._menu_builder.update_model_checkmarks()
@@ -1015,15 +1095,25 @@ class SettingsController:
                 monitor_thread.join(timeout=2)
             logger.error("Retry after cache clear failed: %s", e2)
             app._set_status("statusbar.status.error")
+            if committed:
+                logger.error("Post-switch bookkeeping failed: %s", e2)
+                return
+            # The old transcriber was never touched; discard the failed
+            # new one and keep the current model active.
+            if new_transcriber is not None:
+                try:
+                    new_transcriber.cleanup()
+                except Exception:
+                    logger.debug("Failed transcriber cleanup", exc_info=True)
             topmost_alert(
                 title=t("alert.model.switch_failed.title"),
                 message=t("alert.model.switch_failed.retry_message", error=str(e2)[:200]),
             )
             restore_accessory()
-            app._model_controller._try_restore_previous_model(old_preset_id)
+            app._set_status("statusbar.status.ready")
             self._revert_settings_panel_selection(old_preset_id)
-        finally:
-            app._busy = False
+        # The op slot is released by the outer switch that invoked this
+        # retry — never here (its token lives in that scope).
 
     def _revert_settings_panel_selection(self, old_preset_id) -> None:
         """Revert settings panel radio to the previous model after switch failure."""
@@ -1042,14 +1132,6 @@ class SettingsController:
         key = (provider, model)
         if key == app._current_remote_asr:
             return
-        if app._busy:
-            topmost_alert(
-                t("alert.settings.cannot_switch"),
-                t("alert.settings.cannot_switch.message"),
-            )
-            restore_accessory()
-            return
-
         # Find the RemoteASRModel with connection details
         asr_cfg = app._config.get("asr", {})
         providers = asr_cfg.get("providers", {})
@@ -1058,13 +1140,24 @@ class SettingsController:
             logger.warning("Unknown ASR provider: %s", provider)
             return
 
-        app._busy = True
+        op_token = app._try_begin_op("model-switch")
+        if op_token is None:
+            topmost_alert(
+                t("alert.settings.cannot_switch"),
+                t("alert.settings.cannot_switch.message"),
+            )
+            restore_accessory()
+            # The panel radio already moved to the clicked item — revert
+            self._revert_settings_panel_selection(app._current_preset_id)
+            return
+
         old_transcriber = app._transcriber
 
         def _do_switch():
+            new_transcriber = None
+            committed = False
             try:
                 app._set_status("statusbar.status.switching")
-                old_transcriber.cleanup()
 
                 new_transcriber = app._create_transcriber_for_remote(
                     base_url=pcfg["base_url"],
@@ -1073,8 +1166,21 @@ class SettingsController:
                     asr_cfg=asr_cfg,
                 )
                 new_transcriber.initialize()
+                # Probe endpoint/key/model before replacing the old model —
+                # a remote initialize() only builds the HTTP client.
+                new_transcriber.verify()
 
+                # Swap first, then dispose of the old model — a failed
+                # initialize() above leaves the old transcriber untouched
+                # and still active.
                 app._transcriber = new_transcriber
+                committed = True
+                try:
+                    old_transcriber.cleanup()
+                except Exception:
+                    logger.warning(
+                        "Old transcriber cleanup failed", exc_info=True
+                    )
                 app._current_remote_asr = key
                 app._current_preset_id = None
                 app._menu_builder.update_model_checkmarks()
@@ -1089,10 +1195,34 @@ class SettingsController:
             except Exception as e:
                 logger.error("Remote ASR switch failed: %s", e)
                 app._set_status("statusbar.status.error")
+                if committed:
+                    logger.error("Post-switch bookkeeping failed: %s", e)
+                    return
+                # The old transcriber was never touched; discard the failed
+                # new one and keep the current model active.
+                if new_transcriber is not None:
+                    try:
+                        new_transcriber.cleanup()
+                    except Exception:
+                        logger.debug(
+                            "Failed transcriber cleanup", exc_info=True
+                        )
+                # The old model still works — revert the panel selection
+                # and return to ready.
+                app._set_status("statusbar.status.ready")
+                self._revert_settings_panel_selection(app._current_preset_id)
             finally:
-                app._busy = False
+                app._end_op(op_token)
 
-        threading.Thread(target=_do_switch, daemon=True).start()
+        switch_thread = threading.Thread(target=_do_switch, daemon=True)
+        try:
+            switch_thread.start()
+        except Exception:
+            # The worker never ran — release the claim and restore the UI
+            app._end_op(op_token)
+            app._set_status("statusbar.status.ready")
+            self._revert_settings_panel_selection(app._current_preset_id)
+            raise
 
     def stt_remove_provider(self, provider: str = "") -> None:
         """Handle STT remove provider from Settings panel."""

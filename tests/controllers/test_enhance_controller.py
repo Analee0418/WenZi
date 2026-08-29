@@ -668,7 +668,8 @@ class TestRunWrapper:
         assert captured_task is not None
 
     def test_wrapper_handles_exception(self, controller, mock_panel, event_loop):
-        """_run_wrapper should catch exceptions and report error."""
+        """_run_wrapper should report errors via the label only — never via
+        set_enhance_result, which would fill the editable final text."""
         async def _failing():
             raise ValueError("boom")
 
@@ -676,9 +677,66 @@ class TestRunWrapper:
             controller._run_wrapper(_failing(), request_id=42)
         )
 
-        mock_panel.set_enhance_result.assert_called_once()
-        call_args = mock_panel.set_enhance_result.call_args
+        mock_panel.set_enhance_result.assert_not_called()
+        mock_panel.set_enhance_label.assert_called_once()
+        call_args = mock_panel.set_enhance_label.call_args
         assert "boom" in call_args[0][0]
+
+    def test_fallback_discards_partial_output(
+        self, controller, mock_enhancer, mock_panel, event_loop
+    ):
+        """Partial chunks streamed before an error must not become the
+        final text, a cache entry, or tracked corrections."""
+        chunks = [
+            ("half-finis", None, False),
+            ("(Error: 401 unauthorized)\n", None, "retry"),
+            ("original text", None, "timeout"),
+        ]
+        mock_enhancer.enhance_stream.return_value = _make_async_gen(chunks)
+
+        result_holder: dict = {}
+        event_loop.run_until_complete(
+            controller._run_single_async(
+                "original text", request_id=1, result_holder=result_holder,
+            )
+        )
+
+        # Final text falls back to the ASR text, not the partial output
+        assert result_holder["enhanced_text"] == "original text"
+        mock_panel.set_enhance_complete.assert_not_called()
+        mock_panel.clear_enhance_text.assert_called()
+        # The editable final text is restored to ASR — it may still hold
+        # a previous request's output
+        mock_panel.reset_final_text_to_asr.assert_called_once()
+
+    def test_chain_aborts_on_fallback(
+        self, controller, mock_enhancer, mock_panel, event_loop
+    ):
+        """A failed chain step must abort the chain (no later steps), and
+        must not mark the run complete nor cache it."""
+        calls: list[str] = []
+
+        def _make_stream(text, input_context=None):
+            calls.append(text)
+            return _make_async_gen([
+                ("(Error: boom)\n", None, "retry"),
+                (text, None, "timeout"),
+            ])
+
+        mock_enhancer.enhance_stream.side_effect = _make_stream
+
+        result_holder: dict = {}
+        event_loop.run_until_complete(
+            controller._run_chain_async(
+                "asr text", request_id=1, result_holder=result_holder,
+                chain_steps=["step1", "step2"], original_mode_id="chain",
+            )
+        )
+
+        assert calls == ["asr text"]  # step2 never ran
+        assert result_holder["enhanced_text"] == "asr text"
+        mock_panel.set_enhance_complete.assert_not_called()
+        mock_panel.reset_final_text_to_asr.assert_called_once()
 
     def test_wrapper_handles_cancellation(self, controller, event_loop):
         """_run_wrapper should catch CancelledError silently."""

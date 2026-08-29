@@ -870,6 +870,14 @@ class TestThinkingAndExtraBody:
         result = build_thinking_body("deepseek-chat", enabled=True)
         assert result == {"enable_thinking": True}
 
+    def test_build_thinking_body_deepseek_v4_flash_disabled(self):
+        result = build_thinking_body("deepseek-v4-flash", enabled=False)
+        assert result == {"thinking": {"type": "disabled"}}
+
+    def test_build_thinking_body_deepseek_v4_pro_enabled(self):
+        result = build_thinking_body("deepseek-v4-pro", enabled=True)
+        assert result == {"thinking": {"type": "enabled"}}
+
     def test_build_thinking_body_unknown_model(self):
         result = build_thinking_body("llama-3.1:8b", enabled=False)
         assert result == {}
@@ -1714,8 +1722,13 @@ class TestTextEnhancerEnhanceStream:
                 results.append((chunk, usage, is_thinking))
 
         asyncio.run(collect())
-        assert len(results) == 1
-        assert "(error:" in results[0][0]
+        # The error is surfaced as a status marker plus an original-text
+        # fallback — it must never be yielded as content (is_thinking=False),
+        # or it would be typed into the target application.
+        assert len(results) == 2
+        assert results[0][2] == "retry"
+        assert "(Error:" in results[0][0]
+        assert results[1] == ("original text", None, "timeout")
 
     @patch("wenzi.enhance.enhancer.asyncio.wait_for", side_effect=asyncio.TimeoutError)
     def test_fallback_on_timeout(self, mock_wait_for):
@@ -1923,10 +1936,12 @@ class TestRateLimitHandling:
 
         # Should only be called once — no retry
         assert mock_client.create.call_count == 1
-        # Single retry-type yield with rate limit message
-        assert len(results) == 1
+        # Retry-type status yield, then the fallback terminal — a 429 must
+        # never end the stream without restoring the original text
+        assert len(results) == 2
         assert results[0][2] == "retry"
         assert "Rate limited" in results[0][0]
+        assert results[1] == ("hello", None, "timeout")
 
     def test_enhance_nonstream_rate_limit(self, rate_limit_error):
         """429 during non-streaming enhance — should return original text."""

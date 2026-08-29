@@ -104,6 +104,34 @@ class TestSherpaStreaming:
 
         t.cancel_streaming()
 
+    def test_start_streaming_thread_failure_cleans_state(
+        self, _mock_sherpa, monkeypatch
+    ):
+        """start_streaming is transactional: Thread.start failing must
+        leave stream/thread/callback all cleared, and later stop/cancel
+        must not try to join the never-started thread."""
+        import threading as _threading
+
+        t = self._make_transcriber(_mock_sherpa)
+        monkeypatch.setattr(
+            _threading.Thread,
+            "start",
+            MagicMock(side_effect=RuntimeError("no threads")),
+        )
+
+        with pytest.raises(RuntimeError):
+            t.start_streaming(MagicMock())
+
+        assert t._stream is None
+        assert t._decode_thread is None
+        assert t._on_partial is None
+
+        # Cleanup afterwards must be a safe no-op (no join on an
+        # unstarted thread, no second failure)
+        monkeypatch.undo()
+        t.cancel_streaming()
+        assert t.stop_streaming() == ""
+
     def test_feed_audio(self, _mock_sherpa):
         t = self._make_transcriber(_mock_sherpa)
         on_partial = MagicMock()

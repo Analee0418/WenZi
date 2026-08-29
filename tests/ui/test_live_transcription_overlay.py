@@ -39,6 +39,7 @@ class TestLiveTranscriptionOverlayInit:
 
         assert overlay._panel is not None
         assert overlay._text_field is not None
+        assert overlay._status_field is not None
         assert overlay._content_view is not None
 
     def test_show_sets_panel_properties(self):
@@ -132,6 +133,7 @@ class TestLiveTranscriptionOverlayLifecycle:
         panel.orderOut_.assert_called()
         assert overlay._panel is None
         assert overlay._text_field is None
+        assert overlay._status_field is None
         assert overlay._content_view is None
 
     def test_close_cleans_up(self):
@@ -145,6 +147,7 @@ class TestLiveTranscriptionOverlayLifecycle:
         assert overlay._panel is None
         assert overlay._content_view is None
         assert overlay._text_field is None
+        assert overlay._status_field is None
 
     def test_close_without_show(self):
         from wenzi.ui.live_transcription_overlay import LiveTranscriptionOverlay
@@ -163,6 +166,37 @@ class TestLiveTranscriptionOverlayLifecycle:
 
         assert overlay._panel is not None
 
+    def test_show_after_close_is_registered_for_bulk_cleanup(self):
+        from wenzi.ui.live_transcription_overlay import LiveTranscriptionOverlay
+
+        overlay = LiveTranscriptionOverlay()
+        overlay.show()
+        overlay.close()
+        overlay.show()
+        replacement_panel = overlay._panel
+        replacement_panel.orderOut_.reset_mock()
+
+        LiveTranscriptionOverlay.close_all()
+
+        replacement_panel.orderOut_.assert_called_once_with(None)
+        assert overlay._panel is None
+
+    def test_show_animation_failure_cleans_partial_panel(self):
+        from wenzi.ui.live_transcription_overlay import LiveTranscriptionOverlay
+
+        overlay = LiveTranscriptionOverlay()
+        with patch.object(
+            LiveTranscriptionOverlay,
+            "_animate_alpha",
+            side_effect=RuntimeError("animation failed"),
+        ):
+            overlay.show()
+
+        assert overlay._panel is None
+        assert overlay._text_field is None
+        assert overlay._status_field is None
+        assert overlay._content_view is None
+
 
 class TestLiveTranscriptionOverlayActiveState:
     def test_show_active_by_default(self):
@@ -172,8 +206,8 @@ class TestLiveTranscriptionOverlayActiveState:
         overlay.show()
 
         assert overlay._active is True
-        # setAlphaValue_ should NOT have been called (defaults to 1.0)
-        overlay._panel.setAlphaValue_.assert_not_called()
+        overlay._panel.setAlphaValue_.assert_called_once_with(0.0)
+        overlay._panel.animator().setAlphaValue_.assert_called_once_with(1.0)
 
     def test_show_inactive_sets_low_alpha(self):
         from wenzi.ui.live_transcription_overlay import LiveTranscriptionOverlay
@@ -182,7 +216,8 @@ class TestLiveTranscriptionOverlayActiveState:
         overlay.show(active=False)
 
         assert overlay._active is False
-        overlay._panel.setAlphaValue_.assert_called_once_with(
+        overlay._panel.setAlphaValue_.assert_called_once_with(0.0)
+        overlay._panel.animator().setAlphaValue_.assert_called_once_with(
             LiveTranscriptionOverlay._INACTIVE_ALPHA
         )
 
@@ -192,22 +227,25 @@ class TestLiveTranscriptionOverlayActiveState:
         overlay = LiveTranscriptionOverlay()
         overlay.show(active=False)
         overlay._panel.setAlphaValue_.reset_mock()
+        overlay._panel.animator().setAlphaValue_.reset_mock()
+        overlay._status_field.setStringValue_.reset_mock()
 
         overlay.set_active()
 
         assert overlay._active is True
-        overlay._panel.setAlphaValue_.assert_called_once_with(1.0)
+        overlay._panel.animator().setAlphaValue_.assert_called_once_with(1.0)
+        overlay._status_field.setStringValue_.assert_called_once()
 
     def test_set_active_noop_when_already_active(self):
         from wenzi.ui.live_transcription_overlay import LiveTranscriptionOverlay
 
         overlay = LiveTranscriptionOverlay()
         overlay.show()
+        overlay._panel.animator().setAlphaValue_.reset_mock()
 
         overlay.set_active()
 
-        # Should not call setAlphaValue_ at all
-        overlay._panel.setAlphaValue_.assert_not_called()
+        overlay._panel.animator().setAlphaValue_.assert_not_called()
 
     def test_set_active_noop_without_panel(self):
         from wenzi.ui.live_transcription_overlay import LiveTranscriptionOverlay
@@ -236,10 +274,22 @@ class TestLiveTranscriptionOverlayDarkMode:
         # Text color should be set (dynamic, not hardcoded)
         overlay._text_field.setTextColor_.assert_called_once()
 
-    def test_text_center_aligned(self):
+    def test_text_left_aligned(self):
         from wenzi.ui.live_transcription_overlay import LiveTranscriptionOverlay
 
         overlay = LiveTranscriptionOverlay()
         overlay.show()
 
-        overlay._text_field.setAlignment_.assert_called_once_with(1)
+        overlay._text_field.setAlignment_.assert_called_once_with(0)
+
+    def test_show_has_no_repeating_appearance_timer(self, _mock_appkit):
+        from wenzi.ui.live_transcription_overlay import LiveTranscriptionOverlay
+
+        overlay = LiveTranscriptionOverlay()
+        overlay.show()
+
+        timer_factory = (
+            _mock_appkit.foundation.NSTimer
+            .scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_
+        )
+        timer_factory.assert_not_called()

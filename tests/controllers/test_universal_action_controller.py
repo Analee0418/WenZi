@@ -86,7 +86,7 @@ class TestTrigger:
         app._enhancer.available_modes = []
         app._script_engine._wz.chooser._command_source._commands = {}
         app._script_engine._wz.chooser._panel._sources = {}
-        app._recording_controller._is_busy = False
+        app._recording_controller.is_busy = False
         ctrl = UniversalActionController(app)
 
         # Patch callAfter to execute the callback immediately so we can
@@ -100,7 +100,7 @@ class TestTrigger:
     @patch("wenzi.controllers.universal_action_controller.get_selected_text")
     def test_trigger_skips_when_busy(self, mock_get):
         app = MagicMock()
-        app._recording_controller._is_busy = True
+        app._recording_controller.is_busy = True
         ctrl = UniversalActionController(app)
         ctrl.trigger()
         mock_get.assert_not_called()

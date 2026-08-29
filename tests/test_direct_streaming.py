@@ -1,37 +1,45 @@
-"""Integration tests for Direct mode streaming enhancement.
+"""Integration tests for Direct-mode streaming enhancement.
 
-Tests the streaming helper functions (_run_direct_single_stream,
-_run_direct_chain_stream) and the _do_transcribe_direct flow using
-mock objects, without importing the full app module.
+These call the REAL RecordingFlow._run_direct_single_stream /
+_run_direct_chain_stream coroutines (no replicated logic) against a mock
+app on the shared asyncio loop.
 """
 
 from __future__ import annotations
 
 import asyncio
-import sys
-import threading
 from unittest.mock import MagicMock
 
 import pytest
 
+import wenzi.async_loop as async_loop
+from wenzi.controllers.recording_flow import RecordingFlow
+
 
 @pytest.fixture(autouse=True)
-def _mock_pyobjc(monkeypatch):
-    """Mock PyObjCTools.AppHelper so callAfter executes immediately."""
-    mock_apphelper = MagicMock()
-    mock_apphelper.callAfter = lambda fn: fn()
-    mock_pyobjctools = MagicMock()
-    mock_pyobjctools.AppHelper = mock_apphelper
+def _fresh_loop():
+    async_loop.shutdown_sync(timeout=2)
+    yield
+    async_loop.shutdown_sync(timeout=2)
 
-    monkeypatch.setitem(sys.modules, "PyObjCTools", mock_pyobjctools)
-    monkeypatch.setitem(sys.modules, "PyObjCTools.AppHelper", mock_apphelper)
 
-    return mock_apphelper
+@pytest.fixture
+def mock_app():
+    app = MagicMock()
+    app._streaming_overlay = MagicMock()
+    app._usage_stats = MagicMock()
+    app._enhancer = MagicMock()
+    app._enhancer.mode = "proofread"
+    app._enhancer.get_mode_definition.return_value = None
+    return app
+
+
+@pytest.fixture
+def flow(mock_app):
+    return RecordingFlow(mock_app)
 
 
 def _make_async_gen(chunks):
-    """Create an async generator from a list of (chunk, usage, is_thinking) tuples."""
-
     async def gen():
         for item in chunks:
             yield item
@@ -39,529 +47,236 @@ def _make_async_gen(chunks):
     return gen()
 
 
-def _run_single_stream(app, asr_text, cancel_event):
-    """Replicate _run_direct_single_stream logic for testing."""
-    loop = asyncio.new_event_loop()
-    collected: list[str] = []
-    usage = None
-
-    async def _stream():
-        nonlocal usage
-        gen = app._enhancer.enhance_stream(asr_text)
-        completion_tokens = 0
-        thinking_tokens = 0
-        had_thinking = False
-        try:
-            async for chunk, chunk_usage, is_thinking in gen:
-                if cancel_event.is_set():
-                    return
-                if is_thinking == "retry" and chunk:
-                    had_thinking = True
-                    app._streaming_overlay.append_thinking_text(chunk)
-                    label = chunk.strip().strip("()\n")
-                    app._streaming_overlay.set_status(f"\u23f3 {label}")
-                elif is_thinking and chunk:
-                    had_thinking = True
-                    thinking_tokens += 1
-                    app._streaming_overlay.append_thinking_text(
-                        chunk, thinking_tokens=thinking_tokens
-                    )
-                elif chunk:
-                    if had_thinking:
-                        had_thinking = False
-                        app._streaming_overlay.clear_text()
-                    collected.append(chunk)
-                    completion_tokens += 1
-                    app._streaming_overlay.append_text(
-                        chunk, completion_tokens=completion_tokens
-                    )
-                if chunk_usage is not None:
-                    usage = chunk_usage
-        finally:
-            await gen.aclose()
-
-    loop.run_until_complete(_stream())
-    loop.run_until_complete(loop.shutdown_asyncgens())
-    loop.close()
-
-    if usage:
-        app._usage_stats.record_token_usage(usage)
-        app._streaming_overlay.set_complete(usage)
-
-    return "".join(collected).strip() or asr_text
-
-
-def _run_chain_stream(app, asr_text, chain_steps, cancel_event):
-    """Replicate _run_direct_chain_stream logic for testing."""
-    loop = asyncio.new_event_loop()
-    total_steps = len(chain_steps)
-    input_text = asr_text
-    original_mode = app._enhancer.mode
-    total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-
-    try:
-        for step_idx, step_id in enumerate(chain_steps, 1):
-            if cancel_event.is_set():
-                break
-
-            step_def = app._enhancer.get_mode_definition(step_id)
-            step_label = step_def.label if step_def else step_id
-
-            app._streaming_overlay.set_status(
-                f"\u23f3 Step {step_idx}/{total_steps}: {step_label}"
-            )
-
-            if step_idx > 1:
-                app._streaming_overlay.clear_text()
-
-            app._enhancer.mode = step_id
-            collected: list[str] = []
-            step_usage = None
-
-            async def _stream_step(text_input: str) -> None:
-                nonlocal step_usage
-                gen = app._enhancer.enhance_stream(text_input)
-                completion_tokens = 0
-                thinking_tokens = 0
-                had_thinking = False
-                try:
-                    async for chunk, chunk_usage, is_thinking in gen:
-                        if cancel_event.is_set():
-                            return
-                        if is_thinking == "retry" and chunk:
-                            had_thinking = True
-                            app._streaming_overlay.append_thinking_text(chunk)
-                        elif is_thinking and chunk:
-                            had_thinking = True
-                            thinking_tokens += 1
-                            app._streaming_overlay.append_thinking_text(
-                                chunk, thinking_tokens=thinking_tokens
-                            )
-                        elif chunk:
-                            if had_thinking:
-                                had_thinking = False
-                            collected.append(chunk)
-                            completion_tokens += 1
-                            app._streaming_overlay.append_text(
-                                chunk, completion_tokens=completion_tokens
-                            )
-                        if chunk_usage is not None:
-                            step_usage = chunk_usage
-                finally:
-                    await gen.aclose()
-
-            loop.run_until_complete(_stream_step(input_text))
-
-            if cancel_event.is_set():
-                break
-
-            step_result = "".join(collected).strip()
-            if step_result:
-                input_text = step_result
-
-            if step_usage:
-                total_usage["prompt_tokens"] += step_usage.get("prompt_tokens", 0)
-                total_usage["completion_tokens"] += step_usage.get("completion_tokens", 0)
-                total_usage["total_tokens"] += step_usage.get("total_tokens", 0)
-            app._usage_stats.record_token_usage(step_usage)
-
-        loop.run_until_complete(loop.shutdown_asyncgens())
-        loop.close()
-
-        if total_usage["total_tokens"] > 0:
-            app._streaming_overlay.set_complete(total_usage)
-
-        return input_text.strip() or asr_text
-    finally:
-        app._enhancer.mode = original_mode
-
-
-@pytest.fixture
-def mock_enhancer():
-    """Create a mock TextEnhancer with enhance_stream support."""
-    enhancer = MagicMock()
-    enhancer.is_active = True
-    enhancer.mode = "proofread"
-    enhancer.provider_name = "openai"
-    enhancer.model_name = "gpt-4o"
-    enhancer.last_system_prompt = "You are a proofreader."
-
-    mode_def = MagicMock()
-    mode_def.label = "Proofread"
-    mode_def.steps = None
-    enhancer.get_mode_definition.return_value = mode_def
-
-    return enhancer
-
-
-@pytest.fixture
-def mock_overlay():
-    return MagicMock()
-
-
-@pytest.fixture
-def mock_app(mock_enhancer, mock_overlay):
-    app = MagicMock()
-    app._enhancer = mock_enhancer
-    app._streaming_overlay = mock_overlay
-    app._usage_stats = MagicMock()
-    app._enhance_mode = "proofread"
-    app._append_newline = False
-    app._output_method = "key"
-    app._conversation_history = MagicMock()
-    return app
+def run(coro):
+    return async_loop.submit(coro).result(timeout=10)
 
 
 class TestRunDirectSingleStream:
-    """Test the single-step streaming logic."""
+    def test_collects_chunks_and_returns_text(self, flow, mock_app):
+        mock_app._enhancer.enhance_stream.return_value = _make_async_gen([
+            ("Hello ", None, False),
+            ("world", None, False),
+            ("", {"total_tokens": 5}, False),
+        ])
 
-    def test_collects_chunks_and_returns_text(self, mock_app):
-        chunks = [
-            ("Hello", None, False),
-            (" world", None, False),
-            ("", {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}, False),
-        ]
-        mock_app._enhancer.enhance_stream.return_value = _make_async_gen(chunks)
-
-        result = _run_single_stream(mock_app, "你好世界", threading.Event())
+        result, fell_back = run(
+            flow._run_direct_single_stream("orig", asyncio.Event())
+        )
 
         assert result == "Hello world"
+        assert fell_back is False
         assert mock_app._streaming_overlay.append_text.call_count == 2
-        mock_app._streaming_overlay.append_text.assert_any_call(
-            "Hello", completion_tokens=1
-        )
-        mock_app._streaming_overlay.append_text.assert_any_call(
-            " world", completion_tokens=2
-        )
 
-    def test_thinking_then_content(self, mock_app):
-        """Thinking tokens should show in overlay, then be cleared for content."""
-        chunks = [
+    def test_thinking_then_content(self, flow, mock_app):
+        mock_app._enhancer.enhance_stream.return_value = _make_async_gen([
             ("thinking...", None, True),
             ("Result", None, False),
-            ("", {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11}, False),
-        ]
-        mock_app._enhancer.enhance_stream.return_value = _make_async_gen(chunks)
+        ])
 
-        result = _run_single_stream(mock_app, "test", threading.Event())
+        result, fell_back = run(
+            flow._run_direct_single_stream("orig", asyncio.Event())
+        )
 
         assert result == "Result"
-        # Thinking text was appended
-        mock_app._streaming_overlay.append_thinking_text.assert_called_once_with(
-            "thinking...", thinking_tokens=1
-        )
-        # Text view was cleared before content
-        mock_app._streaming_overlay.clear_text.assert_called_once()
-        # Content was appended
-        mock_app._streaming_overlay.append_text.assert_called_once_with(
-            "Result", completion_tokens=1
-        )
+        assert fell_back is False
+        mock_app._streaming_overlay.append_thinking_text.assert_called()
+        # Content after thinking clears the thinking view first
+        mock_app._streaming_overlay.clear_text.assert_called()
 
-    def test_retry_shows_status(self, mock_app):
-        """Retry messages should update status label."""
-        chunks = [
-            ("(Retrying 1/3...)\n", None, "retry"),
+    def test_retry_marker_shows_status(self, flow, mock_app):
+        mock_app._enhancer.enhance_stream.return_value = _make_async_gen([
+            ("(Connection timed out, retrying in 2s — 1/3...)\n", None, "retry"),
             ("Result", None, False),
-            ("", {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11}, False),
-        ]
-        mock_app._enhancer.enhance_stream.return_value = _make_async_gen(chunks)
+        ])
 
-        result = _run_single_stream(mock_app, "test", threading.Event())
-
-        assert result == "Result"
-        mock_app._streaming_overlay.set_status.assert_any_call(
-            "\u23f3 Retrying 1/3..."
+        result, fell_back = run(
+            flow._run_direct_single_stream("orig", asyncio.Event())
         )
 
-    def test_cancel_stops_streaming(self, mock_app):
-        cancel_event = threading.Event()
-        cancel_event.set()  # Pre-cancel
+        assert result == "Result"
+        assert fell_back is False
+        mock_app._streaming_overlay.set_status.assert_called()
 
-        chunks = [("Hello", None, False), (" world", None, False)]
-        mock_app._enhancer.enhance_stream.return_value = _make_async_gen(chunks)
+    def test_cancel_stops_consumption(self, flow, mock_app):
+        cancel_event = asyncio.Event()
+        consumed: list[str] = []
 
-        result = _run_single_stream(mock_app, "test", cancel_event)
+        async def _gen():
+            consumed.append("a")
+            yield "part-a", None, False
+            cancel_event.set()
+            # Give the canceller a chance to win the race
+            await asyncio.sleep(0.2)
+            consumed.append("b")
+            yield "part-b", None, False
 
-        assert result == "test"
-        mock_app._streaming_overlay.append_text.assert_not_called()
+        mock_app._enhancer.enhance_stream.return_value = _gen()
 
-    def test_fallback_on_empty_result(self, mock_app):
-        chunks = [
-            ("", {"prompt_tokens": 10, "completion_tokens": 0, "total_tokens": 10}, False),
-        ]
-        mock_app._enhancer.enhance_stream.return_value = _make_async_gen(chunks)
+        result, fell_back = run(
+            flow._run_direct_single_stream("orig", cancel_event)
+        )
 
-        result = _run_single_stream(mock_app, "original", threading.Event())
+        # Cancelled mid-stream: only the first chunk was collected
+        assert result == "part-a"
+        assert fell_back is False
+        assert consumed == ["a"]
+
+    def test_empty_stream_falls_back_to_original(self, flow, mock_app):
+        mock_app._enhancer.enhance_stream.return_value = _make_async_gen([
+            ("", {"total_tokens": 1}, False),
+        ])
+
+        result, fell_back = run(
+            flow._run_direct_single_stream("original", asyncio.Event())
+        )
 
         assert result == "original"
+        assert fell_back is False
 
-    def test_records_token_usage_and_set_complete(self, mock_app):
-        usage = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
-        chunks = [("Hi", None, False), ("", usage, False)]
-        mock_app._enhancer.enhance_stream.return_value = _make_async_gen(chunks)
+    def test_records_token_usage_and_sets_complete(self, flow, mock_app):
+        usage = {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+        mock_app._enhancer.enhance_stream.return_value = _make_async_gen([
+            ("text", None, False),
+            ("", usage, False),
+        ])
 
-        _run_single_stream(mock_app, "test", threading.Event())
-        mock_app._usage_stats.record_token_usage.assert_called_with(usage)
-        mock_app._streaming_overlay.set_complete.assert_called_with(usage)
+        run(flow._run_direct_single_stream("orig", asyncio.Event()))
+
+        mock_app._usage_stats.record_token_usage.assert_called_once_with(usage)
+        mock_app._streaming_overlay.set_complete.assert_called_once_with(usage)
+
+    def test_timeout_fallback_returns_original(self, flow, mock_app):
+        mock_app._enhancer.enhance_stream.return_value = _make_async_gen([
+            ("partial", None, False),
+            ("orig", None, "timeout"),
+        ])
+        flow._show_error_alert = MagicMock()
+
+        result, fell_back = run(
+            flow._run_direct_single_stream("orig", asyncio.Event())
+        )
+
+        assert result == "orig"
+        assert fell_back is True
+        # Fallback must never be marked complete
+        mock_app._streaming_overlay.set_complete.assert_not_called()
 
 
 class TestRunDirectChainStream:
-    """Test multi-step chain streaming logic."""
-
-    def test_chain_runs_steps_sequentially(self, mock_app):
-        step1_def = MagicMock()
-        step1_def.label = "Proofread"
-        step2_def = MagicMock()
-        step2_def.label = "Translate"
-
-        def get_mode_def(mode_id):
-            return {"proofread": step1_def, "translate": step2_def}.get(mode_id)
-
-        mock_app._enhancer.get_mode_definition.side_effect = get_mode_def
-
-        call_count = [0]
-
-        def make_stream(text):
-            call_count[0] += 1
-            if call_count[0] == 1:
-                return _make_async_gen([
-                    ("Corrected text", None, False),
-                    ("", {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}, False),
-                ])
-            else:
-                return _make_async_gen([
-                    ("Translated text", None, False),
-                    ("", {"prompt_tokens": 15, "completion_tokens": 2, "total_tokens": 17}, False),
-                ])
-
-        mock_app._enhancer.enhance_stream.side_effect = make_stream
-
-        result = _run_chain_stream(
-            mock_app, "原始文本", ["proofread", "translate"], threading.Event()
+    def _setup_steps(self, mock_app):
+        step1 = MagicMock()
+        step1.label = "Proofread"
+        step2 = MagicMock()
+        step2.label = "Translate"
+        mock_app._enhancer.get_mode_definition.side_effect = (
+            lambda mode_id: {"s1": step1, "s2": step2}.get(mode_id)
         )
 
-        assert result == "Translated text"
-        mock_app._streaming_overlay.set_status.assert_any_call(
-            "\u23f3 Step 1/2: Proofread"
-        )
-        mock_app._streaming_overlay.set_status.assert_any_call(
-            "\u23f3 Step 2/2: Translate"
-        )
-        mock_app._streaming_overlay.clear_text.assert_called()
-        # Mode restored
-        assert mock_app._enhancer.mode == "proofread"
+    def test_chain_runs_steps_sequentially(self, flow, mock_app):
+        self._setup_steps(mock_app)
+        inputs: list[str] = []
 
-    def test_chain_cancel_stops_early(self, mock_app):
-        cancel_event = threading.Event()
-        cancel_event.set()
+        def _make_stream(text, input_context=None):
+            inputs.append(text)
+            return _make_async_gen([(f"{text}+", None, False)])
 
-        step_def = MagicMock()
-        step_def.label = "Step"
-        mock_app._enhancer.get_mode_definition.return_value = step_def
+        mock_app._enhancer.enhance_stream.side_effect = _make_stream
 
-        result = _run_chain_stream(
-            mock_app, "original", ["step1", "step2"], cancel_event
+        result, fell_back = run(
+            flow._run_direct_chain_stream("orig", ["s1", "s2"], asyncio.Event())
         )
 
-        assert result == "original"
-        mock_app._enhancer.enhance_stream.assert_not_called()
+        assert inputs == ["orig", "orig+"]
+        assert result == "orig++"
+        assert fell_back is False
 
-    def test_chain_restores_mode_on_error(self, mock_app):
-        mock_app._enhancer.mode = "original_mode"
-        step_def = MagicMock()
-        step_def.label = "Step"
-        mock_app._enhancer.get_mode_definition.return_value = step_def
-
-        async def failing_gen():
-            raise RuntimeError("LLM error")
-            yield  # noqa: E275
-
-        mock_app._enhancer.enhance_stream.return_value = failing_gen()
-
-        with pytest.raises(RuntimeError):
-            _run_chain_stream(mock_app, "test", ["step1"], threading.Event())
-
-        assert mock_app._enhancer.mode == "original_mode"
-
-
-class TestDoTranscribeDirectFlow:
-    """Test the full _do_transcribe_direct flow logic."""
-
-    def test_enhance_shows_overlay_and_types_result(self, mock_app):
-        """Full flow: show overlay, stream enhance, close overlay, type result."""
-        from PyObjCTools import AppHelper
-
-        chunks = [
-            ("Enhanced!", None, False),
-            ("", {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11}, False),
-        ]
-        mock_app._enhancer.enhance_stream.return_value = _make_async_gen(chunks)
-
-        mode_def = MagicMock()
-        mode_def.steps = None
-        mock_app._enhancer.get_mode_definition.return_value = mode_def
-
-        # Simulate _do_transcribe_direct flow
-        asr_text = "你好"
-        cancel_event = threading.Event()
-
-        AppHelper.callAfter(
-            lambda: mock_app._streaming_overlay.show(
-                asr_text=asr_text, cancel_event=cancel_event
+    def test_chain_restores_original_mode(self, flow, mock_app):
+        self._setup_steps(mock_app)
+        mock_app._enhancer.mode = "chain-mode"
+        mock_app._enhancer.enhance_stream.side_effect = (
+            lambda text, input_context=None: _make_async_gen(
+                [("x", None, False)]
             )
         )
 
-        text = _run_single_stream(mock_app, asr_text, cancel_event)
-        AppHelper.callAfter(mock_app._streaming_overlay.close)
+        run(flow._run_direct_chain_stream("orig", ["s1"], asyncio.Event()))
 
-        mock_app._streaming_overlay.show.assert_called_once()
-        mock_app._streaming_overlay.close.assert_called_once()
-        assert text == "Enhanced!"
+        assert mock_app._enhancer.mode == "chain-mode"
 
-    def test_no_enhance_skips_overlay(self, mock_app):
-        """Without enhance, overlay should not be shown."""
-        # Just verify the overlay is not called when use_enhance=False
-        mock_app._streaming_overlay.show.assert_not_called()
+    def test_chain_empty_step_keeps_previous_text(self, flow, mock_app):
+        self._setup_steps(mock_app)
+        streams = iter([
+            [("improved", None, False)],
+            [("", None, False)],  # step 2 returns nothing
+        ])
+        mock_app._enhancer.enhance_stream.side_effect = (
+            lambda text, input_context=None: _make_async_gen(next(streams))
+        )
 
-    def test_cancel_returns_original_text(self, mock_app):
-        """When cancelled, result should be original ASR text."""
-        cancel_event = threading.Event()
+        result, fell_back = run(
+            flow._run_direct_chain_stream("orig", ["s1", "s2"], asyncio.Event())
+        )
 
-        def fake_show(asr_text="", cancel_event=None):
-            if cancel_event:
+        assert result == "improved"
+        assert fell_back is False
+
+    def test_chain_cancel_stops_before_next_step(self, flow, mock_app):
+        self._setup_steps(mock_app)
+        cancel_event = asyncio.Event()
+        inputs: list[str] = []
+
+        def _make_stream(text, input_context=None):
+            inputs.append(text)
+
+            async def _gen():
+                yield "step1-out", None, False
                 cancel_event.set()
 
-        mock_app._streaming_overlay.show.side_effect = fake_show
+            return _gen()
 
-        from PyObjCTools import AppHelper
+        mock_app._enhancer.enhance_stream.side_effect = _make_stream
 
-        AppHelper.callAfter(
-            lambda: mock_app._streaming_overlay.show(
-                asr_text="test", cancel_event=cancel_event
-            )
+        run(flow._run_direct_chain_stream("orig", ["s1", "s2"], cancel_event))
+
+        assert inputs == ["orig"]  # step 2 never ran
+
+    def test_chain_accumulates_usage(self, flow, mock_app):
+        self._setup_steps(mock_app)
+        streams = iter([
+            [("a", {"prompt_tokens": 1, "completion_tokens": 1,
+                    "total_tokens": 2}, False)],
+            [("b", {"prompt_tokens": 2, "completion_tokens": 2,
+                    "total_tokens": 4}, False)],
+        ])
+        mock_app._enhancer.enhance_stream.side_effect = (
+            lambda text, input_context=None: _make_async_gen(next(streams))
         )
 
-        assert cancel_event.is_set()
+        run(flow._run_direct_chain_stream("orig", ["s1", "s2"], asyncio.Event()))
 
-    def test_enhance_failure_fallback(self, mock_app):
-        """Enhancement failure should result in original ASR text."""
-        mock_app._enhancer.enhance_stream.side_effect = RuntimeError("LLM down")
+        totals = mock_app._streaming_overlay.set_complete.call_args.args[0]
+        assert totals["total_tokens"] == 6
+        assert mock_app._usage_stats.record_token_usage.call_count == 2
 
-        asr_text = "原始"
-        cancel_event = threading.Event()
-        text = asr_text
+    def test_chain_step_failure_aborts_and_falls_back(self, flow, mock_app):
+        self._setup_steps(mock_app)
+        inputs: list[str] = []
 
-        try:
-            text = _run_single_stream(mock_app, asr_text, cancel_event)
-        except Exception:
-            text = asr_text
+        def _make_stream(text, input_context=None):
+            inputs.append(text)
+            return _make_async_gen([
+                ("partial", None, False),
+                ("orig", None, "timeout"),
+            ])
 
-        assert text == "原始"
+        mock_app._enhancer.enhance_stream.side_effect = _make_stream
+        flow._show_error_alert = MagicMock()
 
+        result, fell_back = run(
+            flow._run_direct_chain_stream("orig", ["s1", "s2"], asyncio.Event())
+        )
 
-class TestMergeEvents:
-    """Test the _merge_events helper."""
-
-    def test_first_event_sets_merged(self):
-        from wenzi.controllers.recording_flow import _merge_events
-
-        loop = asyncio.new_event_loop()
-
-        async def _run():
-            a = asyncio.Event()
-            b = asyncio.Event()
-            merged, tasks = _merge_events(a, b)
-            assert not merged.is_set()
-            a.set()
-            await asyncio.sleep(0)  # let waiter tasks run
-            assert merged.is_set()
-            for t in tasks:
-                t.cancel()
-
-        loop.run_until_complete(_run())
-        loop.close()
-
-    def test_second_event_sets_merged(self):
-        from wenzi.controllers.recording_flow import _merge_events
-
-        loop = asyncio.new_event_loop()
-
-        async def _run():
-            a = asyncio.Event()
-            b = asyncio.Event()
-            merged, tasks = _merge_events(a, b)
-            b.set()
-            await asyncio.sleep(0)
-            assert merged.is_set()
-            for t in tasks:
-                t.cancel()
-
-        loop.run_until_complete(_run())
-        loop.close()
-
-    def test_merged_not_set_when_neither(self):
-        from wenzi.controllers.recording_flow import _merge_events
-
-        loop = asyncio.new_event_loop()
-
-        async def _run():
-            a = asyncio.Event()
-            b = asyncio.Event()
-            merged, tasks = _merge_events(a, b)
-            await asyncio.sleep(0)
-            assert not merged.is_set()
-            for t in tasks:
-                t.cancel()
-
-        loop.run_until_complete(_run())
-        loop.close()
-
-    def test_tasks_can_be_cancelled(self):
-        from wenzi.controllers.recording_flow import _merge_events
-
-        loop = asyncio.new_event_loop()
-
-        async def _run():
-            a = asyncio.Event()
-            b = asyncio.Event()
-            merged, tasks = _merge_events(a, b)
-            assert len(tasks) == 2
-            for t in tasks:
-                t.cancel()
-            await asyncio.sleep(0)
-            # Merged should not be set since tasks were cancelled
-            assert not merged.is_set()
-
-        loop.run_until_complete(_run())
-        loop.close()
-
-
-class TestConfirmAsrAction:
-    """Test that CONFIRM_ASR action exists and _watch_cancel handles it."""
-
-    def test_action_enum_has_confirm_asr(self):
-        from wenzi.controllers.recording_flow import Action
-        assert Action.CONFIRM_ASR.value == "confirm_asr"
-
-    def test_watch_cancel_handles_confirm_asr(self):
-        from wenzi.controllers.recording_flow import Action
-
-        loop = asyncio.new_event_loop()
-
-        async def _run():
-            actions = asyncio.Queue()
-            cancel_event = asyncio.Event()
-            confirm_asr_event = asyncio.Event()
-
-            # Simulate the watcher logic
-            actions.put_nowait(Action.CONFIRM_ASR)
-
-            action = await actions.get()
-            if action == Action.CONFIRM_ASR:
-                confirm_asr_event.set()
-
-            assert confirm_asr_event.is_set()
-            assert not cancel_event.is_set()
-
-        loop.run_until_complete(_run())
-        loop.close()
+        assert fell_back is True
+        assert result == "orig"
+        assert inputs == ["orig"]  # aborted before step 2
+        mock_app._streaming_overlay.set_complete.assert_not_called()

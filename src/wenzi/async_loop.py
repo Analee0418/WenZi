@@ -126,7 +126,16 @@ def shutdown_sync(timeout: float = 5.0) -> None:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         await loop.shutdown_asyncgens()
-        await loop.shutdown_default_executor()
+        try:
+            # Bounded: a hung executor job (e.g. blocking I/O in a test)
+            # must not keep this cleanup task pending past loop.stop(),
+            # which surfaces as "Task was destroyed but it is pending!".
+            await asyncio.wait_for(
+                loop.shutdown_default_executor(),
+                timeout=max(0.1, timeout - 0.5),
+            )
+        except TimeoutError:
+            logger.warning("Default executor did not shut down in time")
 
     future = asyncio.run_coroutine_threadsafe(_cleanup(), loop)
     try:

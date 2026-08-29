@@ -28,6 +28,9 @@ class _StreamResult:
 
     collected: list[str]
     usage: dict | None
+    # True when the stream fell back to the original text after an error
+    # or timeout — partial output was discarded and must not be cached.
+    fell_back: bool = False
 
 
 @dataclasses.dataclass
@@ -351,7 +354,10 @@ class EnhanceController:
             logger.info("AI enhancement cancelled by user")
         except Exception as e:
             logger.error("AI enhancement failed: %s", e)
-            self._preview_panel.set_enhance_result(
+            # Show the error in the enhance status label only — it must not
+            # reach the editable final text, which gets typed into the
+            # target application on confirm.
+            self._preview_panel.set_enhance_label(
                 f"(error: {e})", request_id=request_id
             )
 
@@ -377,15 +383,19 @@ class EnhanceController:
         thinking_tokens = 0
         had_thinking = False
         first_chunk = True
+        fell_back = False
+        extra_start = len(extra_collected) if extra_collected is not None else 0
         try:
             async for chunk, chunk_usage, is_thinking in gen:
                 if first_chunk:
                     first_chunk = False
                     self._preview_panel.update_system_prompt(
-                        self._enhancer.last_system_prompt
+                        self._enhancer.last_system_prompt,
+                        request_id=request_id,
                     )
                     self._preview_panel.set_llm_vocab(
-                        self._enhancer.last_llm_vocab
+                        self._enhancer.last_llm_vocab,
+                        request_id=request_id,
                     )
                 if is_thinking == "retry" and chunk:
                     had_thinking = True
@@ -397,6 +407,19 @@ class EnhanceController:
                     self._preview_panel.set_enhance_label(
                         f"\u23f3 {label}", request_id=request_id,
                     )
+                elif is_thinking == "timeout":
+                    # Error/timeout fallback: discard this pass's partial
+                    # output so a half-finished enhancement never becomes
+                    # the final text, a cache entry, or a chain step's
+                    # input.  The final text falls back to the ASR result.
+                    fell_back = True
+                    collected.clear()
+                    if extra_collected is not None:
+                        del extra_collected[extra_start:]
+                    self._preview_panel.clear_enhance_text(
+                        request_id=request_id,
+                    )
+                    continue
                 elif is_thinking and chunk:
                     had_thinking = True
                     thinking_tokens += len(chunk)
@@ -423,7 +446,9 @@ class EnhanceController:
         finally:
             await gen.aclose()
 
-        return _StreamResult(collected=collected, usage=usage)
+        return _StreamResult(
+            collected=collected, usage=usage, fell_back=fell_back,
+        )
 
     # ------------------------------------------------------------------
     # Single-step enhancement
@@ -451,6 +476,10 @@ class EnhanceController:
             result_holder["enhanced_text"] = enhanced
             result_holder["system_prompt"] = system_prompt
             result_holder["thinking_text"] = self._preview_panel._thinking_text
+            # Explicitly clear: the holder is reused across requests, so a
+            # previous chain run must not leave is_chain sticking to this
+            # single-step result.
+            result_holder["is_chain"] = False
             result_holder["token_usage"] = result.usage
 
         if result.collected:
@@ -474,6 +503,11 @@ class EnhanceController:
                 self._track_corrections(
                     asr_text, enhanced, asr_miss_entries, input_context,
                 )
+        elif result.fell_back:
+            # The stream already set a specific error label; also restore
+            # the editable final text to the ASR text — it may still hold
+            # a previous request's output (e.g. after a mode/model switch).
+            self._preview_panel.reset_final_text_to_asr(request_id)
         else:
             self._preview_panel.set_enhance_label(
                 "Connection failed", request_id=request_id,
@@ -502,6 +536,7 @@ class EnhanceController:
             "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
         }
         all_display_parts: list[str] = []
+        chain_fell_back = False
 
         try:
             for step_idx, step_id in enumerate(chain_steps, 1):
@@ -510,6 +545,7 @@ class EnhanceController:
 
                 self._preview_panel.set_enhance_step_info(
                     step_idx, total_steps, step_label,
+                    request_id=request_id,
                 )
 
                 if step_idx > 1:
@@ -527,6 +563,11 @@ class EnhanceController:
                 result = await self._consume_stream(
                     gen, request_id, extra_collected=all_display_parts,
                 )
+                if result.fell_back:
+                    # Abort the chain: running later steps after a failed
+                    # step wastes tokens and yields a half-chain result.
+                    chain_fell_back = True
+                    break
 
                 step_result = "".join(result.collected).strip()
                 if step_result:
@@ -547,7 +588,9 @@ class EnhanceController:
                     except Exception as e:
                         logger.error("Failed to record token usage: %s", e)
 
-            enhanced = input_text.strip() or asr_text
+            enhanced = asr_text if chain_fell_back else (
+                input_text.strip() or asr_text
+            )
             system_prompt = self._enhancer.last_system_prompt
             final_usage = total_usage if total_usage["total_tokens"] > 0 else None
             if result_holder is not None:
@@ -556,25 +599,29 @@ class EnhanceController:
                 result_holder["thinking_text"] = self._preview_panel._thinking_text
                 result_holder["is_chain"] = True
                 result_holder["token_usage"] = final_usage
-            self._preview_panel.set_enhance_complete(
-                request_id=request_id,
-                usage=final_usage,
-                system_prompt=system_prompt,
-                final_text=enhanced,
-            )
-            cache_key = (
-                original_mode_id,
-                self._enhancer.provider_name,
-                self._enhancer.model_name,
-                self._enhancer.thinking,
-            )
-            self._cache[cache_key] = EnhanceCacheEntry(
-                display_text="".join(all_display_parts),
-                usage=final_usage,
-                system_prompt=system_prompt,
-                thinking_text=self._preview_panel._thinking_text,
-                final_text=enhanced,
-            )
+            if chain_fell_back:
+                # Aborted chain: don't mark the run as complete, cache it,
+                # or feed correction tracking; restore the editable final
+                # text to the ASR text.
+                self._preview_panel.reset_final_text_to_asr(request_id)
+                track_corrections = False
+            else:
+                self._preview_panel.set_enhance_complete(
+                    request_id=request_id,
+                    usage=final_usage,
+                    system_prompt=system_prompt,
+                    final_text=enhanced,
+                )
+                # Same key shape as get_cached()/cache_key(): the
+                # handwritten 4-tuple used before could never be read
+                # back, so chain results were silently never cached.
+                self._cache[self.cache_key(asr_text)] = EnhanceCacheEntry(
+                    display_text="".join(all_display_parts),
+                    usage=final_usage,
+                    system_prompt=system_prompt,
+                    thinking_text=self._preview_panel._thinking_text,
+                    final_text=enhanced,
+                )
             if track_corrections:
                 self._track_corrections(
                     asr_text, enhanced, asr_miss_entries, input_context,

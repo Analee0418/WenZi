@@ -9,6 +9,7 @@ import ctypes
 import ctypes.util
 import logging as _logging
 import threading as _threading
+import time as _time
 from ctypes import CFUNCTYPE, c_bool, c_int32, c_int64, c_uint32, c_uint64, c_void_p
 
 # ---------------------------------------------------------------------------
@@ -198,6 +199,17 @@ class CGEventTapRunner:
     on stop().  Consumers only supply a callback and event mask.
     """
 
+
+    _STATE_IDLE = "idle"
+    _STATE_STARTING = "starting"
+    _STATE_RUNNING = "running"
+    _STATE_STOPPING = "stopping"
+    _STATE_REAPING = "reaping"
+
+    # How long stop() keeps re-issuing CFRunLoopStop + join before giving
+    # up and letting the thread's own reaper finish the cleanup later.
+    _STOP_JOIN_TIMEOUT = 2.0
+
     def __init__(self) -> None:
         self.tap = None
         self._source = None
@@ -205,10 +217,17 @@ class CGEventTapRunner:
         self._thread: _threading.Thread | None = None
         self._ctypes_cb = None
         self._ready = _threading.Event()
+        # Explicit lifecycle: IDLE -> STARTING -> RUNNING -> STOPPING ->
+        # IDLE.  Guarded by _lifecycle; join/wait never happen inside it.
+        self._lifecycle = _threading.Lock()
+        self._state = self._STATE_IDLE
+        # Generation identity: the run thread's reaper only cleans up its
+        # own generation and can never touch a newer instance's state.
+        self._gen = 0
 
     @property
     def running(self) -> bool:
-        return self.tap is not None
+        return self._state in (self._STATE_STARTING, self._STATE_RUNNING)
 
     def start(
         self,
@@ -222,71 +241,211 @@ class CGEventTapRunner:
 
         *callback* receives ``(proxy, event_type, event, refcon)`` and must
         return the event (pass-through) or ``None`` (swallow / listen-only).
-
         *on_create_failed* is called (on the bg thread) if
         ``CGEventTapCreate`` returns NULL.
+
+        Raises RuntimeError unless the runner is IDLE: a previous
+        instance that has not finished cleaning up still owns native
+        objects, and replacing its ctypes callback would be a
+        use-after-free under the live run loop.
         """
-        def _raw_cb(proxy, event_type, event, refcon):
-            return callback(proxy, event_type, event, refcon) or 0
-        self._ctypes_cb = CGEventTapCallBack(_raw_cb)
+        with self._lifecycle:
+            if self._state != self._STATE_IDLE:
+                raise RuntimeError(
+                    "CGEventTapRunner.start() while "
+                    f"{self._state}; previous instance not cleaned up yet"
+                )
+            self._state = self._STATE_STARTING
+            self._gen += 1
+            gen = self._gen
+            ready = _threading.Event()
+            self._ready = ready
+
+            def _raw_cb(proxy, event_type, event, refcon):
+                return callback(proxy, event_type, event, refcon) or 0
+
+            # The closure keeps this generation's ctypes callback alive
+            # for as long as ITS thread may use it, independent of any
+            # newer instance overwriting self._ctypes_cb.
+            cb_ref = CGEventTapCallBack(_raw_cb)
+            self._ctypes_cb = cb_ref
 
         def _run():
-            tap = CGEventTapCreate(
-                kCGSessionEventTap, kCGHeadInsertEventTap,
-                option, mask, self._ctypes_cb, None,
-            )
-            if not tap:
-                _runner_logger.warning(
-                    "CGEventTapCreate failed — check Accessibility permissions "
-                    "in System Settings > Privacy & Security > Accessibility"
+            tap = None
+            source = None
+            entered_loop = False
+            try:
+                tap = CGEventTapCreate(
+                    kCGSessionEventTap, kCGHeadInsertEventTap,
+                    option, mask, cb_ref, None,
                 )
-                self._ready.set()
-                if on_create_failed is not None:
-                    on_create_failed()
-                return
-            source = CFMachPortCreateRunLoopSource(None, tap, 0)
-            self.tap = tap
-            self._source = source
-            self._loop = CFRunLoopGetCurrent()
-            CFRunLoopAddSource(self._loop, source, kCFRunLoopDefaultMode.value)
-            CGEventTapEnable(tap, True)
-            _runner_logger.info("CGEventTap created (tap=%#x, option=%d, mask=0x%x)", tap, option, mask)
-            self._ready.set()
-            CFRunLoopRun()
+                if not tap:
+                    _runner_logger.warning(
+                        "CGEventTapCreate failed — check Accessibility "
+                        "permissions in System Settings > Privacy & "
+                        "Security > Accessibility"
+                    )
+                    if on_create_failed is not None:
+                        on_create_failed()
+                    return
+                source = CFMachPortCreateRunLoopSource(None, tap, 0)
+                loop = CFRunLoopGetCurrent()
+                CFRunLoopAddSource(loop, source, kCFRunLoopDefaultMode.value)
+                CGEventTapEnable(tap, True)
+                with self._lifecycle:
+                    if (
+                        self._gen == gen
+                        and self._state == self._STATE_STARTING
+                    ):
+                        self.tap = tap
+                        self._source = source
+                        self._loop = loop
+                        self._state = self._STATE_RUNNING
+                        entered_loop = True
+                    # else: stop() arrived during setup — skip the loop,
+                    # fall through to the reaper below.
+                _runner_logger.info(
+                    "CGEventTap created (tap=%#x, option=%d, mask=0x%x)",
+                    tap, option, mask,
+                )
+                ready.set()
+                if entered_loop:
+                    CFRunLoopRun()
+            except Exception:
+                _runner_logger.exception("CGEventTap setup failed")
+            finally:
+                ready.set()
+                # Reaper, three phases:
+                #   1 (locked)   claim REAPING for our generation and
+                #                atomically detach the shared handles — a
+                #                concurrent stop() can never again reach a
+                #                native object that is about to be freed;
+                #   2 (unlocked) disable/release the LOCAL handles;
+                #   3 (locked)   clear thread/callback and go IDLE.
+                with self._lifecycle:
+                    if self._gen == gen:
+                        self._state = self._STATE_REAPING
+                        self.tap = None
+                        self._source = None
+                        self._loop = None
+                try:
+                    if tap:
+                        try:
+                            CGEventTapEnable(tap, False)
+                        except Exception:
+                            _runner_logger.debug(
+                                "Tap disable failed", exc_info=True
+                            )
+                    if source:
+                        try:
+                            CFRelease(source)
+                        except Exception:
+                            _runner_logger.debug(
+                                "CFRelease(source) failed", exc_info=True
+                            )
+                    if tap:
+                        try:
+                            CFRelease(tap)
+                        except Exception:
+                            _runner_logger.debug(
+                                "CFRelease(tap) failed", exc_info=True
+                            )
+                finally:
+                    with self._lifecycle:
+                        # Only our own generation: a newer instance's
+                        # state must never be cleared by an old reaper.
+                        if self._gen == gen:
+                            self._thread = None
+                            self._ctypes_cb = None
+                            self._state = self._STATE_IDLE
 
-        self._ready.clear()
-        self._thread = _threading.Thread(target=_run, daemon=True)
-        self._thread.start()
+        thread = _threading.Thread(
+            target=_run, name=f"cgeventtap-runloop-{gen}", daemon=True,
+        )
+        with self._lifecycle:
+            self._thread = thread
+        thread.start()
 
     def wait_ready(self, timeout: float = 2.0) -> None:
         """Block until the background thread has created the tap (or failed)."""
         self._ready.wait(timeout)
 
     def stop(self) -> None:
-        """Disable the tap, stop the run loop, release CF objects."""
-        if self.tap is None and self._thread is None:
+        """Request shutdown; never frees native objects itself.
+
+        Ownership of every CFRelease lives in the run thread's reaper, so
+        the release happens exactly once and provably after CFRunLoopRun
+        returned.  stop() only flips the state, disables the tap, kicks
+        the loop, and (outside the lifecycle lock) waits briefly for the
+        thread; a thread that misses the deadline reclaims itself later.
+        Safe to call concurrently and from the tap callback itself.
+        """
+        with self._lifecycle:
+            if self._state == self._STATE_IDLE:
+                return
+            if self._state in (self._STATE_STARTING, self._STATE_RUNNING):
+                self._state = self._STATE_STOPPING
+            # In REAPING the shared handles are already detached (None) —
+            # nothing below can touch a freed native object.
+            gen = self._gen
+            thread = self._thread
+            tap = self.tap
+            loop = self._loop
+            ready = self._ready
+
+        if thread is not None and thread is _threading.current_thread():
+            # Called from the tap callback on our own run-loop thread:
+            # disable the tap and ask the loop to exit after this
+            # callback returns — our own finally reaps everything.
+            try:
+                if tap:
+                    CGEventTapEnable(tap, False)
+                if loop:
+                    CFRunLoopStop(loop)
+            except Exception:
+                _runner_logger.debug("Self-stop error", exc_info=True)
             return
-        try:
-            if self.tap is not None:
-                CGEventTapEnable(self.tap, False)
-            if self._loop is not None:
-                CFRunLoopStop(self._loop)
-        except Exception:
-            _runner_logger.debug("CGEventTapRunner: error during disable", exc_info=True)
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
-        self._loop = None
-        if self._source is not None:
+
+        # Let setup finish so tap/loop below hold their final values.
+        ready.wait(2.0)
+        # The generation check, the handle read AND the native disable
+        # form ONE linearized interval under the lifecycle lock: the
+        # reaper's phase 1 takes the same lock, so it cannot detach and
+        # free the tap while we are inside CGEventTapEnable — and once it
+        # has reaped, we read None and touch nothing.
+        with self._lifecycle:
+            if self._gen == gen:
+                tap_now = self.tap
+                if tap_now:
+                    try:
+                        CGEventTapEnable(tap_now, False)
+                    except Exception:
+                        _runner_logger.debug(
+                            "CGEventTapRunner: error during disable",
+                            exc_info=True,
+                        )
+                thread = self._thread or thread
+
+        if thread is None:
+            return
+        # The thread may be anywhere between ready.set() and
+        # CFRunLoopRun(); re-issue CFRunLoopStop until it exits.  This
+        # join deliberately happens OUTSIDE the lifecycle lock.
+        deadline = _time.monotonic() + self._STOP_JOIN_TIMEOUT
+        while thread.is_alive() and _time.monotonic() < deadline:
+            # Re-read the loop handle under the lock every iteration: the
+            # reaper detaches it (phase 1) before freeing, so we can never
+            # kick a loop that is being (or has been) released.
+            with self._lifecycle:
+                loop_now = self._loop if self._gen == gen else None
             try:
-                CFRelease(self._source)
+                if loop_now:
+                    CFRunLoopStop(loop_now)
             except Exception:
-                _runner_logger.debug("CFRelease(source) failed", exc_info=True)
-            self._source = None
-        if self.tap is not None:
-            try:
-                CFRelease(self.tap)
-            except Exception:
-                _runner_logger.debug("CFRelease(tap) failed", exc_info=True)
-            self.tap = None
-        self._ctypes_cb = None
+                _runner_logger.debug("CFRunLoopStop failed", exc_info=True)
+            thread.join(timeout=0.1)
+        if thread.is_alive():
+            _runner_logger.error(
+                "CGEventTap run-loop thread did not exit in time; it will "
+                "reap its own native objects when it exits"
+            )

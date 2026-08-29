@@ -2,11 +2,23 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from wenzi.controllers.settings_controller import SettingsController
+
+
+def _wait_not_busy(app, timeout: float = 5.0) -> bool:
+    """Wait for a background _do_switch thread to finish (clears _busy)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if app._busy is False:
+            return True
+        time.sleep(0.01)
+    return False
 
 
 @pytest.fixture
@@ -57,12 +69,25 @@ def mock_app():
     app._recording_indicator = MagicMock()
     app._recording_indicator.enabled = True
     app._visual_indicator_item = MagicMock()
+    app._recorder = MagicMock()
+    app._recorder.device = None
     app._preview_enabled = True
     app._preview_panel = MagicMock()
     app._preview_item = MagicMock()
     app._current_preset_id = "funasr-zh"
     app._current_remote_asr = None
     app._busy = False
+
+    def _try_begin(name):
+        if app._busy:
+            return None
+        app._busy = True
+        return object()
+
+    app._try_begin_op = MagicMock(side_effect=_try_begin)
+    app._end_op = MagicMock(
+        side_effect=lambda owner: setattr(app, "_busy", False)
+    )
     app._transcriber = MagicMock()
     app._menu_builder = MagicMock()
     app._model_controller = MagicMock()
@@ -185,6 +210,104 @@ class TestVisualToggle:
         mock_save.assert_called_once()
 
 
+class TestMicrophoneSelect:
+    @patch("wenzi.controllers.settings_controller.save_config")
+    def test_explicit_device_updates_config_and_recorder(
+        self, mock_save, ctrl, mock_app
+    ):
+        mock_app._settings_panel.is_visible = False
+
+        ctrl.mic_select("airpods-uid")
+
+        assert mock_app._config["audio"]["device"] == "airpods-uid"
+        assert mock_app._recorder.device == "airpods-uid"
+        mock_save.assert_called_once()
+
+    @patch("wenzi.controllers.settings_controller.save_config")
+    def test_empty_uid_selects_automatic(self, mock_save, ctrl, mock_app):
+        mock_app._config["audio"] = {"device": "airpods-uid"}
+        mock_app._recorder.device = "airpods-uid"
+        mock_app._settings_panel.is_visible = False
+
+        ctrl.mic_select("")
+
+        assert mock_app._config["audio"]["device"] is None
+        assert mock_app._recorder.device is None
+        mock_save.assert_called_once()
+
+    @patch("wenzi.controllers.settings_controller.save_config")
+    @patch("PyObjCTools.AppHelper.callAfter", side_effect=RuntimeError("UI busy"))
+    def test_refresh_failure_after_save_keeps_committed_selection(
+        self, mock_call_after, mock_save, ctrl, mock_app
+    ):
+        mock_app._config["audio"] = {"device": "old-uid"}
+        mock_app._recorder.device = "old-uid"
+        mock_app._settings_panel.is_visible = True
+
+        ctrl.mic_select("new-uid")
+
+        assert mock_app._config["audio"]["device"] == "new-uid"
+        assert mock_app._recorder.device == "new-uid"
+        mock_save.assert_called_once()
+        mock_call_after.assert_called_once()
+
+    @patch(
+        "wenzi.controllers.settings_controller.automatic_input_device_name",
+        return_value="MacBook Pro Microphone",
+    )
+    @patch(
+        "wenzi.controllers.settings_controller.list_input_devices",
+        return_value=[{"uid": "old-uid", "name": "Old Mic"}],
+    )
+    @patch(
+        "wenzi.controllers.settings_controller.save_config",
+        side_effect=OSError("disk full"),
+    )
+    def test_save_failure_rolls_back_memory_and_panel(
+        self, mock_save, mock_devices, mock_auto_name, ctrl, mock_app
+    ):
+        mock_app._config["audio"] = {"device": "old-uid"}
+        mock_app._recorder.device = "old-uid"
+        mock_app._settings_panel.is_visible = True
+
+        with pytest.raises(OSError, match="disk full"):
+            ctrl.mic_select("new-uid")
+
+        assert mock_app._config["audio"]["device"] == "old-uid"
+        assert mock_app._recorder.device == "old-uid"
+        mock_app._settings_panel.update_state.assert_called_once_with({
+            "audio_devices": [{"uid": "old-uid", "name": "Old Mic"}],
+            "audio_device": "old-uid",
+            "automatic_device_name": "MacBook Pro Microphone",
+        })
+        mock_save.assert_called_once()
+        mock_devices.assert_called_once()
+        mock_auto_name.assert_called_once()
+
+    @patch(
+        "wenzi.controllers.settings_controller.automatic_input_device_name",
+        return_value="MacBook Pro Microphone",
+    )
+    @patch(
+        "wenzi.controllers.settings_controller.list_input_devices",
+        return_value=[],
+    )
+    def test_refresh_reports_automatic_route(
+        self, mock_devices, mock_auto_name, ctrl, mock_app
+    ):
+        mock_app._config["audio"] = {"device": None}
+
+        ctrl.mic_refresh()
+
+        mock_app._settings_panel.update_state.assert_called_once_with({
+            "audio_devices": [],
+            "audio_device": None,
+            "automatic_device_name": "MacBook Pro Microphone",
+        })
+        mock_devices.assert_called_once()
+        mock_auto_name.assert_called_once()
+
+
 class TestLauncherRecycleMode:
     @patch("wenzi.controllers.settings_controller.save_config")
     def test_build_launcher_state_includes_recycle_mode(self, mock_save, ctrl, mock_app):
@@ -267,17 +390,115 @@ class TestSttSelect:
         ctrl.stt_select("funasr-zh")
         mock_save.assert_not_called()
 
-    def test_busy_shows_alert(self, ctrl, mock_app):
+    def test_busy_shows_alert_and_reverts_selection(self, ctrl, mock_app):
         mock_app._busy = True
         with patch("wenzi.controllers.settings_controller.topmost_alert") as mock_alert:
             with patch("wenzi.controllers.settings_controller.restore_accessory"):
-                ctrl.stt_select("mlx-whisper-large-v3-turbo")
+                with patch("PyObjCTools.AppHelper") as mock_ah:
+                    mock_ah.callAfter = lambda fn, *a, **kw: fn(*a, **kw)
+                    ctrl.stt_select("mlx-whisper-large-v3-turbo")
         mock_alert.assert_called_once()
+        # The panel radio already moved to the clicked item — must revert
+        mock_app._settings_panel.update_stt_model.assert_called_once()
 
     def test_unknown_preset_warns(self, ctrl, mock_app):
         mock_app._current_preset_id = "something-else"
         ctrl.stt_select("nonexistent-preset-id")
         # Should not crash, just log warning
+
+    @patch("wenzi.controllers.settings_controller.send_notification")
+    def test_switch_success_swaps_then_cleans_old(
+        self, _mock_notify, ctrl, mock_app
+    ):
+        """The old transcriber is disposed only after the new one is live."""
+        old_transcriber = mock_app._transcriber
+        new_transcriber = MagicMock()
+        mock_app._create_transcriber_for_preset.return_value = new_transcriber
+
+        transcriber_at_cleanup = []
+        old_transcriber.cleanup.side_effect = (
+            lambda: transcriber_at_cleanup.append(mock_app._transcriber)
+        )
+
+        with patch.object(ctrl, "_save_and_reload"):
+            ctrl.stt_select("mlx-whisper-large-v3-turbo")
+            assert _wait_not_busy(mock_app)
+
+        assert mock_app._transcriber is new_transcriber
+        new_transcriber.initialize.assert_called_once()
+        old_transcriber.cleanup.assert_called_once()
+        assert transcriber_at_cleanup == [new_transcriber]
+        assert mock_app._current_preset_id == "mlx-whisper-large-v3-turbo"
+
+    @patch("wenzi.controllers.settings_controller.restore_accessory")
+    @patch("wenzi.controllers.settings_controller.topmost_alert", return_value=0)
+    def test_switch_failure_keeps_old_transcriber(
+        self, _mock_alert, _mock_restore, ctrl, mock_app
+    ):
+        """A failed initialize() must leave the old transcriber untouched."""
+        old_transcriber = mock_app._transcriber
+        new_transcriber = MagicMock()
+        new_transcriber.initialize.side_effect = RuntimeError("load failed")
+        mock_app._create_transcriber_for_preset.return_value = new_transcriber
+
+        ctrl.stt_select("mlx-whisper-large-v3-turbo")
+        assert _wait_not_busy(mock_app)
+
+        assert mock_app._transcriber is old_transcriber
+        old_transcriber.cleanup.assert_not_called()
+        new_transcriber.cleanup.assert_called_once()
+        assert mock_app._current_preset_id == "funasr-zh"
+
+    @patch("wenzi.controllers.settings_controller.send_notification")
+    def test_post_commit_failure_keeps_new_transcriber(
+        self, _mock_notify, ctrl, mock_app
+    ):
+        """A failure after the swap (e.g. config save) must not destroy
+        the new transcriber — the old one is already gone."""
+        old_transcriber = mock_app._transcriber
+        new_transcriber = MagicMock()
+        mock_app._create_transcriber_for_preset.return_value = new_transcriber
+
+        with patch.object(
+            ctrl, "_save_and_reload", side_effect=OSError("disk full")
+        ):
+            ctrl.stt_select("mlx-whisper-large-v3-turbo")
+            assert _wait_not_busy(mock_app)
+
+        assert mock_app._transcriber is new_transcriber
+        new_transcriber.cleanup.assert_not_called()
+        old_transcriber.cleanup.assert_called_once()
+
+    @patch("wenzi.controllers.settings_controller.restore_accessory")
+    @patch("wenzi.controllers.settings_controller.topmost_alert", return_value=0)
+    def test_concurrent_switch_refused(
+        self, mock_alert, _mock_restore, ctrl, mock_app
+    ):
+        """While one switch holds the op slot, a second one is refused."""
+        release = threading.Event()
+        new_transcriber = MagicMock()
+        new_transcriber.initialize.side_effect = lambda: release.wait(5)
+        mock_app._create_transcriber_for_preset.return_value = new_transcriber
+
+        try:
+            with patch.object(ctrl, "_save_and_reload"):
+                ctrl.stt_select("mlx-whisper-large-v3-turbo")
+                for _ in range(200):
+                    if mock_app._busy:
+                        break
+                    time.sleep(0.01)
+                assert mock_app._busy is True
+
+                # Second switch while the first is still initializing
+                ctrl.stt_select("mlx-whisper-large-v3-turbo")
+                mock_alert.assert_called_once()
+
+                release.set()
+                assert _wait_not_busy(mock_app)
+        finally:
+            release.set()
+
+        assert mock_app._transcriber is new_transcriber
 
 
 class TestSttRemoteSelect:
@@ -288,10 +509,33 @@ class TestSttRemoteSelect:
 
     def test_busy_shows_alert(self, ctrl, mock_app):
         mock_app._busy = True
+        mock_app._config["asr"]["providers"] = {
+            "groq": {"base_url": "https://example.test", "api_key": "k"},
+        }
         with patch("wenzi.controllers.settings_controller.topmost_alert") as mock_alert:
             with patch("wenzi.controllers.settings_controller.restore_accessory"):
                 ctrl.stt_remote_select("groq", "whisper-v3")
         mock_alert.assert_called_once()
+
+    def test_remote_verify_failure_keeps_old(self, ctrl, mock_app):
+        """A remote endpoint that fails verification must not replace
+        the working transcriber."""
+        mock_app._config["asr"]["providers"] = {
+            "groq": {"base_url": "https://example.test", "api_key": "k"},
+        }
+        old_transcriber = mock_app._transcriber
+        new_transcriber = MagicMock()
+        new_transcriber.verify.side_effect = RuntimeError("401 unauthorized")
+        mock_app._create_transcriber_for_remote.return_value = new_transcriber
+
+        ctrl.stt_remote_select("groq", "whisper-v3")
+        assert _wait_not_busy(mock_app)
+
+        assert mock_app._transcriber is old_transcriber
+        old_transcriber.cleanup.assert_not_called()
+        new_transcriber.cleanup.assert_called_once()
+        # The old model still works — status returns to ready
+        mock_app._set_status.assert_any_call("statusbar.status.ready")
 
 
 class TestLlmSelect:

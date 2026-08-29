@@ -31,8 +31,8 @@ class UniversalActionController:
         Captures selected text, then dispatches UI work to the main thread.
         """
         rc = getattr(self._app, "_recording_controller", None)
-        if rc is not None and getattr(rc, "_is_busy", False):
-            logger.debug("Universal Action ignored: app is busy")
+        if rc is not None and rc.is_busy:
+            logger.debug("Universal Action ignored: recording in progress")
             return
 
         text = get_selected_text() or ""
@@ -177,20 +177,15 @@ class UniversalActionController:
         if not text:
             return
 
-        from PyObjCTools import AppHelper
-
-        def _set_mode():
-            app._enhance_mode = mode_id
-            if app._enhancer:
-                app._enhancer.mode = mode_id
-
-        AppHelper.callAfter(_set_mode)
-
         preview_ctrl = getattr(app, "_preview_controller", None)
         if preview_ctrl is not None:
+            # Runs under the app-wide exclusive-op guard — never bypass
+            # the claim.  The mode change is applied inside, only after
+            # the claim succeeds, so a refused request cannot leave the
+            # global enhance mode modified.
             threading.Thread(
-                target=preview_ctrl._do_clipboard_with_preview,
-                args=(text,),
+                target=preview_ctrl.run_clipboard_preview,
+                args=(text, mode_id),
                 daemon=True,
             ).start()
 

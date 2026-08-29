@@ -18,6 +18,11 @@
   "statusbar.status.clearing": "清除中...",
   "statusbar.status.vocab_building": "VT \u23f3",
 
+  "recording_indicator.preparing": "准备中",
+  "recording_indicator.listening": "正在聆听",
+  "live_overlay.preparing": "正在准备实时转写",
+  "live_overlay.listening": "实时转写",
+
   "menu.hotkey": "热键",
   "menu.record_hotkey": "录制热键...",
   "menu.stt_model": "语音识别模型",
@@ -99,6 +104,8 @@
 
   "alert.recording.empty": "未捕获到音频",
   "alert.recording.empty.message": "麦克风未采集到任何音频，请检查麦克风是否被静音或已断开连接。",
+  "alert.recording.busy": "正在切换模型，暂时无法录音",
+  "alert.recording.start_failed": "录音启动失败，请重试或检查麦克风权限",
 
   "alert.provider.add_asr.title": "添加 ASR 服务商",
   "alert.provider.add_asr.message": "name       — 唯一的服务商名称\nbase_url   — OpenAI 兼容的 ASR 端点\napi_key    — 认证密钥\nmodels     — 每行一个模型（缩进）",
@@ -250,7 +257,7 @@
 
   "snippet_editor.title": "新建片段",
   "snippet_editor.btn.cancel": "取消 [ESC]",
-  "snippet_editor.btn.save": "保存 [⏎]",
+  "snippet_editor.btn.save": "保存 [⌘⏎]",
   "snippet_editor.placeholder.optional": "可选",
   "snippet_editor.placeholder.category": "分类/名称 或仅名称",
   "snippet_editor.label.name": "名称",
@@ -331,7 +338,7 @@
   "settings.general_tab.sound_feedback": "声音反馈",
   "settings.general_tab.sound_feedback_desc": "录音前增加约 350ms 延迟以避免录入提示音",
   "settings.general_tab.visual_indicator": "视觉指示",
-  "settings.general_tab.visual_indicator_desc": "录音时显示浮动指示器",
+  "settings.general_tab.visual_indicator_desc": "录音时显示随音量变化的光球",
   "settings.general_tab.show_device_name": "显示设备名称",
   "settings.general_tab.show_device_name_desc": "在录音指示器上显示输入设备名称",
   "settings.general_tab.hide_status_icon": "隐藏状态图标",
@@ -383,7 +390,8 @@
   "settings.microphone_tab.refresh": "刷新",
   "settings.microphone_tab.device_label": "设备",
   "settings.microphone_tab.device_desc": "选择用于录音的麦克风",
-  "settings.microphone_tab.system_default": "系统默认",
+  "settings.microphone_tab.automatic": "自动选择",
+  "settings.microphone_tab.automatic_desc": "系统默认是蓝牙设备时优先使用 Mac 内建麦克风，避免播放音质和音量变化",
 
   "settings.stt_tab.title": "语音识别",
   "settings.stt_tab.local_section": "本地",
@@ -478,6 +486,7 @@
   "preview.asr_title.clipboard": "剪贴板文本",
   "preview.btn.hotwords": "热词",
   "preview.btn.punc": "标点",
+  "preview.btn.thinking": "思考模式",
   "preview.btn.play": "播放 \u25b6",
   "preview.btn.pause": "暂停 \u23f8",
   "preview.btn.save_audio": "保存",
@@ -486,8 +495,8 @@
   "preview.btn.diff": "Diff",
   "preview.btn.history": "历史",
   "preview.btn.cancel": "取消",
-  "preview.btn.confirm": "确认 \u23ce",
-  "preview.btn.copy": "复制 \u2318\u23ce",
+  "preview.btn.confirm": "确认 \u2318\u23ce",
+  "preview.btn.copy": "复制 \u2318\u21e7\u23ce",
   "preview.section.ai": "AI",
   "preview.section.final": "最终结果（可编辑）",
   "preview.loading.transcribing": "\u23f3 转写中...",

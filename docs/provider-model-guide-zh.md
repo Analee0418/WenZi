@@ -182,7 +182,7 @@ AI 增强功能使用 OpenAI 兼容的 LLM 服务商。您可以配置多个服�
 | OpenAI | OpenAI | gpt-4o, gpt-4o-mini, gpt-4-turbo |
 | Qwen | 通义千问 (阿里云) | qwen-max, qwen-plus, qwen-turbo, qwen-coder-plus |
 | Doubao | 豆包 (字节跳动) | doubao-1-5-pro-32k, doubao-1-5-lite-32k |
-| DeepSeek | DeepSeek | deepseek-chat, deepseek-reasoner |
+| DeepSeek | DeepSeek | deepseek-v4-flash, deepseek-v4-pro |
 | MiniMax | MiniMax | MiniMax-Text-01, abab6.5s-chat |
 | Zhipu | 智谱AI | glm-4-plus, glm-4-9b, glm-4-flash |
 | Moonshot | 月之暗面 (Kimi) | moonshot-v1-8k, moonshot-v1-32k, moonshot-v1-128k |
@@ -245,7 +245,7 @@ AI 增强功能使用 OpenAI 兼容的 LLM 服务商。您可以配置多个服�
 "deepseek": {
   "base_url": "https://api.deepseek.com/v1",
   "api_key": "sk-xxx",
-  "models": ["deepseek-chat", "deepseek-reasoner"]
+  "models": ["deepseek-v4-flash", "deepseek-v4-pro"]
 }
 ```
 
@@ -294,7 +294,7 @@ AI 增强功能使用 OpenAI 兼容的 LLM 服务商。您可以配置多个服�
 {
   "ai_enhance": {
     "default_provider": "deepseek",
-    "default_model": "deepseek-chat",
+    "default_model": "deepseek-v4-flash",
     "thinking": false
   }
 }

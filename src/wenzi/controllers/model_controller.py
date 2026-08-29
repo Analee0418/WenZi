@@ -469,7 +469,9 @@ models:
         if preset_id == app._current_preset_id and not app._current_remote_asr:
             return
 
-        if app._busy:
+        preset = PRESET_BY_ID[preset_id]
+        op_token = app._try_begin_op("model-switch")
+        if op_token is None:
             send_notification(
                 t("app.name"),
                 t("notification.model.cannot_switch"),
@@ -477,20 +479,18 @@ models:
             )
             return
 
-        preset = PRESET_BY_ID[preset_id]
-        app._busy = True
-
         for item in app._model_menu_items.values():
             item.set_callback(None)
         for item in app._remote_asr_menu_items.values():
             item.set_callback(None)
 
-        old_preset_id = app._current_preset_id
         old_transcriber = app._transcriber
 
         def _do_switch():
             stop_event = threading.Event()
             monitor_thread = None
+            new_transcriber = None
+            committed = False
 
             try:
                 # For Apple Speech, verify Siri/Dictation is enabled first
@@ -512,9 +512,6 @@ models:
                         app._set_status("statusbar.status.ready")
                         return
 
-                app._set_status("statusbar.status.unloading")
-                old_transcriber.cleanup()
-
                 cached = is_model_cached(preset)
                 if not cached:
                     monitor_args = self._make_download_monitor_args(preset)
@@ -534,7 +531,17 @@ models:
                 if monitor_thread:
                     monitor_thread.join(timeout=2)
 
+                # Swap first, then dispose of the old model — a failed
+                # initialize() above leaves the old transcriber untouched
+                # and still active.
                 app._transcriber = new_transcriber
+                committed = True
+                try:
+                    old_transcriber.cleanup()
+                except Exception:
+                    logger.warning(
+                        "Old transcriber cleanup failed", exc_info=True
+                    )
                 app._current_preset_id = preset_id
                 app._current_remote_asr = None
                 app._menu_builder.update_model_checkmarks()
@@ -565,6 +572,22 @@ models:
 
                 logger.error("Model switch failed: %s", e)
                 app._set_status("statusbar.status.error")
+                if committed:
+                    # The new model is already installed and the old one is
+                    # gone — only post-switch bookkeeping failed.  Never
+                    # fall into the cleanup below, which would destroy the
+                    # only working transcriber.
+                    logger.error("Post-switch bookkeeping failed: %s", e)
+                    return
+                # The old transcriber was never touched; discard the failed
+                # new one and keep the current model active.
+                if new_transcriber is not None:
+                    try:
+                        new_transcriber.cleanup()
+                    except Exception:
+                        logger.debug(
+                            "Failed transcriber cleanup", exc_info=True
+                        )
 
                 can_clear = preset.backend not in ("apple", "whisper-api")
                 if can_clear:
@@ -577,9 +600,7 @@ models:
                     )
                     restore_accessory()
                     if result == 1:
-                        self._clear_cache_and_retry_switch(
-                            preset, old_preset_id
-                        )
+                        self._clear_cache_and_retry_switch(preset)
                         return
                 else:
                     topmost_alert(
@@ -589,18 +610,21 @@ models:
                     )
                     restore_accessory()
 
-                self._try_restore_previous_model(old_preset_id)
+                app._set_status("statusbar.status.ready")
 
             finally:
-                for pid, item in app._model_menu_items.items():
-                    p = PRESET_BY_ID[pid]
-                    if is_backend_available(p.backend):
-                        item.set_callback(self.on_model_select)
-                for item in app._remote_asr_menu_items.values():
-                    item.set_callback(self.on_remote_asr_select)
-                app._busy = False
+                self._restore_menu_callbacks()
+                app._end_op(op_token)
 
-        threading.Thread(target=_do_switch, daemon=True).start()
+        switch_thread = threading.Thread(target=_do_switch, daemon=True)
+        try:
+            switch_thread.start()
+        except Exception:
+            # The worker never ran — release the claim and restore the UI
+            app._end_op(op_token)
+            self._restore_menu_callbacks()
+            app._set_status("statusbar.status.ready")
+            raise
 
     def _make_download_monitor_args(self, preset: ModelPreset):
         """Pre-compute monitor paths on the calling thread.
@@ -668,32 +692,12 @@ models:
 
         return None
 
-    def _try_restore_previous_model(self, old_preset_id: str | None) -> None:
-        """Attempt to restore the previous model after a failed switch."""
-        app = self._app
-        if not old_preset_id or old_preset_id not in PRESET_BY_ID:
-            return
-
-        old_preset = PRESET_BY_ID[old_preset_id]
-        try:
-            logger.info("Restoring previous model: %s", old_preset.display_name)
-            app._set_status("statusbar.status.restoring")
-            restored = app._create_transcriber_for_preset(old_preset)
-            restored.initialize()
-            app._transcriber = restored
-            app._current_preset_id = old_preset_id
-            app._menu_builder.update_model_checkmarks()
-            app._set_status("statusbar.status.ready")
-            logger.info("Previous model restored")
-        except Exception as e2:
-            logger.error("Failed to restore previous model: %s", e2)
-            app._set_status("statusbar.status.error")
-
-    def _clear_cache_and_retry_switch(
-        self, preset: ModelPreset, old_preset_id
-    ) -> None:
+    def _clear_cache_and_retry_switch(self, preset: ModelPreset) -> None:
         """Clear model cache and retry the switch."""
         app = self._app
+        old_transcriber = app._transcriber
+        new_transcriber = None
+        committed = False
         stop_event = threading.Event()
         monitor_thread = None
         try:
@@ -714,7 +718,17 @@ models:
             stop_event.set()
             monitor_thread.join(timeout=2)
 
+            # Swap first, then dispose of the old model — a failed
+            # initialize() above leaves the old transcriber untouched
+            # and still active.
             app._transcriber = new_transcriber
+            committed = True
+            try:
+                old_transcriber.cleanup()
+            except Exception:
+                logger.warning(
+                    "Old transcriber cleanup failed", exc_info=True
+                )
             app._current_preset_id = preset.id
             app._current_remote_asr = None
             app._menu_builder.update_model_checkmarks()
@@ -735,20 +749,36 @@ models:
                 monitor_thread.join(timeout=2)
             logger.error("Retry after cache clear failed: %s", e2)
             app._set_status("statusbar.status.error")
+            if committed:
+                logger.error("Post-switch bookkeeping failed: %s", e2)
+                return
+            # The old transcriber was never touched; discard the failed
+            # new one and keep the current model active.
+            if new_transcriber is not None:
+                try:
+                    new_transcriber.cleanup()
+                except Exception:
+                    logger.debug("Failed transcriber cleanup", exc_info=True)
             topmost_alert(
                 title=t("alert.model.switch_failed.title"),
                 message=t("alert.model.switch_failed.retry_message", error=str(e2)[:200]),
             )
             restore_accessory()
-            self._try_restore_previous_model(old_preset_id)
+            app._set_status("statusbar.status.ready")
         finally:
-            for pid, item in app._model_menu_items.items():
-                p = PRESET_BY_ID[pid]
-                if is_backend_available(p.backend):
-                    item.set_callback(self.on_model_select)
-            for item in app._remote_asr_menu_items.values():
-                item.set_callback(self.on_remote_asr_select)
-            app._busy = False
+            # The op slot is released by the outer switch that invoked
+            # this retry — never here (its token lives in that scope).
+            self._restore_menu_callbacks()
+
+    def _restore_menu_callbacks(self) -> None:
+        """Re-enable model menu items after a switch (or a failed spawn)."""
+        app = self._app
+        for pid, item in app._model_menu_items.items():
+            p = PRESET_BY_ID[pid]
+            if is_backend_available(p.backend):
+                item.set_callback(self.on_model_select)
+        for item in app._remote_asr_menu_items.values():
+            item.set_callback(self.on_remote_asr_select)
 
     # ── Remote ASR model selection ────────────────────────────────────
 
@@ -761,7 +791,8 @@ models:
         if key == app._current_remote_asr:
             return
 
-        if app._busy:
+        op_token = app._try_begin_op("model-switch")
+        if op_token is None:
             send_notification(
                 t("app.name"),
                 t("notification.model.cannot_switch"),
@@ -769,13 +800,13 @@ models:
             )
             return
 
-        app._busy = True
         old_transcriber = app._transcriber
 
         def _do_switch():
+            new_transcriber = None
+            committed = False
             try:
                 app._set_status("statusbar.status.switching")
-                old_transcriber.cleanup()
 
                 new_transcriber = app._create_transcriber_for_remote(
                     base_url=rm.base_url,
@@ -783,8 +814,21 @@ models:
                     model=rm.model,
                 )
                 new_transcriber.initialize()
+                # Probe endpoint/key/model before replacing the old model —
+                # a remote initialize() only builds the HTTP client.
+                new_transcriber.verify()
 
+                # Swap first, then dispose of the old model — a failed
+                # initialize() above leaves the old transcriber untouched
+                # and still active.
                 app._transcriber = new_transcriber
+                committed = True
+                try:
+                    old_transcriber.cleanup()
+                except Exception:
+                    logger.warning(
+                        "Old transcriber cleanup failed", exc_info=True
+                    )
                 app._current_remote_asr = key
                 app._current_preset_id = None
                 app._menu_builder.update_model_checkmarks()
@@ -807,6 +851,18 @@ models:
             except Exception as e:
                 logger.error("Remote ASR switch failed: %s", e)
                 app._set_status("statusbar.status.error")
+                if committed:
+                    logger.error("Post-switch bookkeeping failed: %s", e)
+                    return
+                # The old transcriber was never touched; discard the failed
+                # new one and keep the current model active.
+                if new_transcriber is not None:
+                    try:
+                        new_transcriber.cleanup()
+                    except Exception:
+                        logger.debug(
+                            "Failed transcriber cleanup", exc_info=True
+                        )
                 try:
                     send_notification(
                         t("app.name"),
@@ -815,10 +871,20 @@ models:
                     )
                 except Exception:
                     logger.debug("Notification unavailable, skipping")
+                # The old model is still active — return to ready; the
+                # notification above carries the failure details.
+                app._set_status("statusbar.status.ready")
             finally:
-                app._busy = False
+                app._end_op(op_token)
 
-        threading.Thread(target=_do_switch, daemon=True).start()
+        switch_thread = threading.Thread(target=_do_switch, daemon=True)
+        try:
+            switch_thread.start()
+        except Exception:
+            # The worker never ran — release the claim and restore the UI
+            app._end_op(op_token)
+            app._set_status("statusbar.status.ready")
+            raise
 
     # ── LLM model selection ───────────────────────────────────────────
 

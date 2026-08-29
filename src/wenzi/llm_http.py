@@ -362,9 +362,12 @@ class TranscriptionClient:
     Drop-in replacement for ``openai.OpenAI`` in transcription use-cases.
     """
 
-    def __init__(self, base_url: str, api_key: str) -> None:
+    def __init__(
+        self, base_url: str, api_key: str, timeout: float = 30.0,
+    ) -> None:
         self.base_url = base_url
         self.api_key = api_key
+        self.timeout = timeout
 
     def create(self, **kwargs: Any) -> str:
         """Send an audio transcription request.
@@ -398,7 +401,7 @@ class TranscriptionClient:
             files={"file": (filename, file_data, "application/octet-stream")},
         )
 
-        conn, prefix = _connect(self.base_url)
+        conn, prefix = _connect(self.base_url, timeout=self.timeout)
         try:
             conn.request(
                 "POST",

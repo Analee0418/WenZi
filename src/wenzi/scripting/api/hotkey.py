@@ -139,7 +139,14 @@ class HotkeyAPI:
             pass
 
     def start(self) -> None:
-        """Start all hotkey and leader-key listeners."""
+        """Start all hotkey and leader-key listeners (idempotent).
+
+        Runtime paths (script reload, chooser enable) call this
+        repeatedly — without stopping first, each call would overwrite
+        the previous listeners and leak their live EventTap threads.
+        """
+        if self._started:
+            self.stop()
         self._started = True
         self._start_leader_listener()
         self._start_hotkey_listeners()
@@ -177,6 +184,11 @@ class HotkeyAPI:
         """Start the CGEventTap for leader-key detection."""
         if not self._registry.leaders:
             return
+
+        if self._listener is not None:
+            # Never overwrite a live listener — its tap thread would leak
+            self._listener.stop()
+            self._listener = None
 
         from wenzi.hotkey import _QuartzAllKeysListener
 

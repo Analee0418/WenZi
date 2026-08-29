@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 :root {
+    color-scheme: light;
     --bg: #ffffff; --text: #1d1d1f; --card-bg: #f5f5f7;
     --border: #d2d2d7; --secondary: #86868b; --accent: #007aff;
     --green: #34c759; --orange: #ff9500; --red: #ff3b30;
@@ -17,6 +18,7 @@
 }
 @media (prefers-color-scheme: dark) {
     :root {
+        color-scheme: dark;
         --bg: #1d1d1f; --text: #c8c8cc; --card-bg: #2c2c2e;
         --border: #48484a; --secondary: #98989d; --accent: #0a84ff;
         --green: #30d158; --orange: #ff9f0a; --red: #ff453a;
@@ -171,9 +173,8 @@ select {
 /* Hidden sections */
 .hidden { display: none !important; }
 
-/* Loading animation */
-@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-.loading { animation: pulse 1.5s ease-in-out infinite; }
+/* Loading text stays still; only the small section status dot animates. */
+.loading { color: var(--secondary); }
 
 /* --- Diff Side Panel --- */
 .diff-panel {
@@ -265,6 +266,137 @@ select {
 .hit-card .hit-stats {
     font-size: 10px; color: var(--secondary); margin-top: 1px;
 }
+
+/* --- Modern low-overhead visual layer --- */
+:root {
+    --bg: #f7f8fa; --text: #181a1d; --card-bg: #eef0f3;
+    --border: #d9dde2; --secondary: #70757d; --accent: #087b84;
+    --green: #217a49; --orange: #c77a12; --red: #d83b36;
+    --text-bg: #ffffff; --enhance-bg: #fffafd;
+    --btn-bg: #f1f3f5; --btn-hover: #e5e9ec;
+    --segment-bg: #e9ecef; --segment-active: #ffffff;
+    --segment-hover: rgba(7, 141, 152, 0.08);
+    --shadow: rgba(24, 30, 36, 0.12);
+    --focus-ring: rgba(7, 141, 152, 0.20);
+    --asr-accent: #078d98; --asr-halo: rgba(7, 141, 152, 0.10);
+    --ai-accent: #bd3f79; --ai-halo: rgba(189, 63, 121, 0.09);
+    --final-accent: #278e55; --final-halo: rgba(39, 142, 85, 0.09);
+    --confirm-bg: #217a49; --confirm-hover: #19613a;
+}
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg: #151719; --text: #e7e9eb; --card-bg: #202326;
+        --border: #373b40; --secondary: #9ba1a8; --accent: #45c9cc;
+        --green: #54c880; --orange: #e7a64a; --red: #ff6961;
+        --text-bg: #1b1e21; --enhance-bg: #211b20;
+        --btn-bg: #24282c; --btn-hover: #30353a;
+        --segment-bg: #202428; --segment-active: #343a3f;
+        --segment-hover: rgba(69, 201, 204, 0.10);
+        --shadow: rgba(0, 0, 0, 0.38);
+        --focus-ring: rgba(69, 201, 204, 0.22);
+        --asr-accent: #45c9cc; --asr-halo: rgba(69, 201, 204, 0.10);
+        --ai-accent: #ef73ad; --ai-halo: rgba(239, 115, 173, 0.10);
+        --final-accent: #54c880; --final-halo: rgba(84, 200, 128, 0.10);
+        --confirm-bg: #217a49; --confirm-hover: #2a6843;
+    }
+}
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+}
+#preview-content { padding: 13px 14px 12px; }
+.section { margin-bottom: 9px; }
+.section-header { margin-bottom: 5px; min-height: 23px; }
+.section-title {
+    display: inline-flex; align-items: center; gap: 7px;
+    font-size: 12px; font-weight: 650;
+}
+.section-title::before {
+    content: ""; width: 6px; height: 6px; flex: 0 0 6px;
+    border-radius: 50%; background: var(--section-accent, var(--secondary));
+    box-shadow: 0 0 0 3px var(--section-halo, rgba(112,117,125,.10));
+}
+#asr-section { --section-accent: var(--asr-accent); --section-halo: var(--asr-halo); }
+#enhance-section { --section-accent: var(--ai-accent); --section-halo: var(--ai-halo); }
+#final-section { --section-accent: var(--final-accent); --section-halo: var(--final-halo); }
+.section[data-state="loading"] .section-title::before {
+    animation: status-breathe 1.25s ease-in-out infinite;
+}
+.section[data-state="error"] .section-title::before {
+    background: var(--red); box-shadow: 0 0 0 3px rgba(216, 59, 54, 0.12);
+}
+@keyframes status-breathe {
+    0%, 100% { opacity: 0.45; transform: scale(0.78); }
+    50% { opacity: 1; transform: scale(1); }
+}
+.section-info, select {
+    font-family: "SF Mono", Menlo, monospace;
+}
+.text-area, .final-area {
+    border-radius: 7px; padding: 8px 11px;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+    font-size: 13px; line-height: 1.48;
+    border-color: var(--border);
+}
+#asr-text {
+    background: var(--text-bg);
+    box-shadow: inset 3px 0 0 var(--asr-accent);
+}
+#enhance-text {
+    box-shadow: inset 3px 0 0 var(--ai-accent);
+}
+#final-text {
+    box-shadow: inset 3px 0 0 var(--final-accent);
+}
+#asr-section[data-state="error"] #asr-text {
+    color: var(--red); border-color: color-mix(in srgb, var(--red) 42%, var(--border));
+    box-shadow: inset 3px 0 0 var(--red);
+}
+.final-area:focus {
+    border-color: var(--final-accent);
+    box-shadow: inset 3px 0 0 var(--final-accent), 0 0 0 3px var(--focus-ring);
+}
+.btn, .bar-btn, select, .segment-btn {
+    border-radius: 6px;
+    transition: background-color 0.14s, border-color 0.14s, color 0.14s, transform 0.10s;
+}
+.btn:active, .bar-btn:active, .segment-btn:active { opacity: 1; transform: translateY(1px); }
+.btn.primary, .bar-btn.primary {
+    background: var(--confirm-bg); border-color: var(--confirm-bg); color: #fff;
+}
+.btn.primary:hover, .bar-btn.primary:hover {
+    background: var(--confirm-hover); border-color: var(--confirm-hover); opacity: 1;
+}
+.btn:focus-visible, .bar-btn:focus-visible, select:focus-visible,
+.segment-btn:focus-visible, .checkbox-wrap input:focus-visible {
+    outline: 2px solid var(--asr-accent); outline-offset: 1px;
+}
+.segment-bar {
+    border: 1px solid var(--border); border-radius: 7px;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.12);
+}
+.segment-btn.active {
+    box-shadow: 0 1px 3px var(--shadow), inset 0 0 0 1px var(--asr-halo);
+}
+.button-bar { border-top-color: var(--border); }
+#history-dropdown {
+    background: var(--text-bg) !important;
+    border-color: var(--border) !important;
+    transform-origin: bottom left;
+}
+#history-dropdown.is-open { animation: menu-in 0.14s ease-out; }
+@keyframes menu-in {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+.diff-panel { background: var(--bg); }
+.diff-card, .hit-card { border-radius: 6px; }
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+        animation-duration: 0.001ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.001ms !important;
+    }
+}
 </style>
 </head>
 <body>
@@ -272,7 +404,7 @@ select {
 <div id="preview-content">
 
 <!-- ASR Section -->
-<div class="section expand" id="asr-section">
+<div class="section expand" id="asr-section" data-state="idle">
     <div class="section-header">
         <div class="left">
             <span class="section-title" id="asr-title">ASR</span>
@@ -296,7 +428,7 @@ select {
 <div class="segment-bar hidden" id="mode-segment"></div>
 
 <!-- Enhance Section -->
-<div class="section expand hidden" id="enhance-section">
+<div class="section expand hidden" id="enhance-section" data-state="idle">
     <div class="section-header">
         <div class="left">
             <span class="section-title" id="ai-title"></span>
@@ -316,7 +448,7 @@ select {
 </div>
 
 <!-- Final Result Section -->
-<div class="section expand">
+<div class="section expand" id="final-section" data-state="ready">
     <div class="section-header">
         <div class="left">
             <span class="section-title" id="final-title"></span>
@@ -340,7 +472,7 @@ select {
         </div>
     </div>
     <button class="bar-btn" id="cancel-btn" onclick="postAction('cancel')"></button>
-    <button class="bar-btn primary" id="confirm-btn" onclick="doConfirm(false)"></button>
+    <button class="bar-btn primary" id="confirm-btn" onclick="doConfirm(cmdHeld)"></button>
 </div>
 
 </div><!-- /preview-content -->
@@ -376,6 +508,11 @@ function i18n(key) { return (CONFIG.i18n && CONFIG.i18n[key]) || key; }
 let userEdited = false;
 let cmdHeld = false;
 
+function setSectionState(id, state) {
+    const section = document.getElementById(id);
+    if (section && section.dataset.state !== state) section.dataset.state = state;
+}
+
 // --- Init ---
 function init() {
     // i18n: set button/label text from translations
@@ -394,8 +531,10 @@ function init() {
     document.getElementById('asr-title').textContent = CONFIG.asrTitle;
     if (CONFIG.asrLoading) {
         document.getElementById('asr-text').innerHTML = '<span class="loading">' + i18n('loading.transcribing') + '</span>';
+        setSectionState('asr-section', 'loading');
     } else {
         document.getElementById('asr-text').textContent = CONFIG.asrText;
+        setSectionState('asr-section', 'ready');
     }
     document.getElementById('asr-info').textContent = CONFIG.asrInfo;
 
@@ -459,8 +598,10 @@ function init() {
         document.getElementById('enhance-section').classList.remove('hidden');
         if (CONFIG.showEnhance) {
             document.getElementById('enhance-info').textContent = i18n('loading.processing');
+            setSectionState('enhance-section', 'loading');
         } else {
             document.getElementById('enhance-info').textContent = i18n('enhance.off');
+            setSectionState('enhance-section', 'idle');
         }
     }
 
@@ -481,6 +622,7 @@ function init() {
 
     // Thinking checkbox
     const tcb = document.getElementById('thinking-cb');
+    tcb.setAttribute('aria-label', i18n('btn.thinking'));
     tcb.checked = CONFIG.thinkingEnabled;
     tcb.addEventListener('change', () => {
         postAction('thinkingToggle', { enabled: tcb.checked });
@@ -498,6 +640,7 @@ function init() {
 
     // Final text edit tracking
     document.getElementById('final-text').addEventListener('input', () => {
+        setSectionState('final-section', 'edited');
         if (!userEdited) {
             userEdited = true;
             postAction('userEdit');
@@ -568,12 +711,20 @@ document.addEventListener('keydown', (e) => {
         postAction('cancel');
         return;
     }
-    if (e.metaKey && e.key === 'Enter') {
+    if (e.metaKey && e.shiftKey && e.key === 'Enter') {
         e.preventDefault();
         doConfirm(true);
         return;
     }
+    if (e.metaKey && e.key === 'Enter') {
+        e.preventDefault();
+        doConfirm(false);
+        return;
+    }
     if (e.key === 'Enter' && !e.metaKey && !e.shiftKey && !e.altKey) {
+        // Inside the editable final text, plain Enter inserts a newline;
+        // confirm from there is Cmd+Enter.
+        if (e.target && e.target.id === 'final-text') return;
         e.preventDefault();
         doConfirm(false);
         return;
@@ -589,15 +740,15 @@ document.addEventListener('keydown', (e) => {
     }
 });
 
-// Track ⌘ key state for confirm button text
+// Track ⌘⇧ key state for confirm button text (⌘⇧⏎ = copy to clipboard)
 document.addEventListener('keydown', (e) => {
-    if (e.key === 'Meta' && !cmdHeld) {
+    if (e.metaKey && e.shiftKey && !cmdHeld) {
         cmdHeld = true;
         document.getElementById('confirm-btn').textContent = i18n('btn.copy');
     }
 });
 document.addEventListener('keyup', (e) => {
-    if (e.key === 'Meta' && cmdHeld) {
+    if (cmdHeld && (!e.metaKey || !e.shiftKey)) {
         cmdHeld = false;
         document.getElementById('confirm-btn').textContent = i18n('btn.confirm');
     }
@@ -606,19 +757,24 @@ document.addEventListener('keyup', (e) => {
 // --- Python→JS API ---
 function setAsrText(text) {
     document.getElementById('asr-text').textContent = text;
+    setSectionState('asr-section', 'ready');
     if (!userEdited) document.getElementById('final-text').value = text;
 }
 
 function setAsrLoading() {
     document.getElementById('asr-text').innerHTML = '<span class="loading">' + i18n('loading.retranscribing') + '</span>';
+    setSectionState('asr-section', 'loading');
     const sel = document.getElementById('stt-select');
     if (sel) sel.disabled = true;
 }
 
-function setAsrResult(text, info) {
+function setAsrResult(text, info, isError) {
     document.getElementById('asr-text').textContent = text;
     document.getElementById('asr-info').textContent = info;
-    if (!userEdited) document.getElementById('final-text').value = text;
+    setSectionState('asr-section', isError ? 'error' : 'ready');
+    // Error text is display-only — it must never fill the editable final
+    // text, which gets typed into the target application on confirm.
+    if (!userEdited && !isError) document.getElementById('final-text').value = text;
     const sel = document.getElementById('stt-select');
     if (sel) sel.disabled = false;
 }
@@ -644,12 +800,14 @@ function clearEnhanceText() {
 
 function appendEnhanceText(chunk) {
     const el = document.getElementById('enhance-text');
+    setSectionState('enhance-section', 'loading');
     el.textContent += chunk;
     el.scrollTop = el.scrollHeight;
 }
 
 function appendThinkingText(chunk) {
     const el = document.getElementById('enhance-text');
+    setSectionState('enhance-section', 'loading');
     // Create or find thinking span
     let span = el.querySelector('.thinking-current');
     if (!span) {
@@ -664,6 +822,7 @@ function appendThinkingText(chunk) {
 function setEnhanceResult(text) {
     const el = document.getElementById('enhance-text');
     el.textContent = text;
+    setSectionState('enhance-section', 'ready');
 }
 
 function setEnhanceInfo(text) {
@@ -675,6 +834,7 @@ function setEnhanceInfo(text) {
 
 function setEnhanceLoading() {
     document.getElementById('enhance-section').classList.remove('hidden');
+    setSectionState('enhance-section', 'loading');
     document.getElementById('enhance-text').innerHTML = '';
     document.getElementById('enhance-info').textContent = i18n('loading.processing');
     const _tb = document.getElementById('thinking-btn');
@@ -685,6 +845,7 @@ function setEnhanceLoading() {
 }
 
 function setEnhanceOff() {
+    setSectionState('enhance-section', 'idle');
     document.getElementById('enhance-info').textContent = i18n('enhance.off');
     document.getElementById('enhance-text').innerHTML = '';
     const _pb = document.getElementById('prompt-btn');
@@ -696,6 +857,7 @@ function setEnhanceOff() {
 }
 
 function setEnhanceComplete(info, hasThinking, finalText) {
+    setSectionState('enhance-section', 'ready');
     setEnhanceInfo(info);
     if (hasThinking) {
         const _tb = document.getElementById('thinking-btn');
@@ -722,6 +884,7 @@ function disableContextButton() {
 
 function setFinalText(text) {
     document.getElementById('final-text').value = text;
+    setSectionState('final-section', 'ready');
 }
 
 function finishThinkingSpan() {
@@ -732,6 +895,7 @@ function finishThinkingSpan() {
 function replayCachedResult(displayText, info, hasThinking, finalText) {
     const el = document.getElementById('enhance-text');
     el.textContent = displayText;
+    setSectionState('enhance-section', 'ready');
     setEnhanceInfo(info);
     if (hasThinking) {
         const _tb = document.getElementById('thinking-btn');
@@ -761,6 +925,7 @@ function toggleHistoryDropdown() {
     const dd = document.getElementById('history-dropdown');
     historyDropdownVisible = !historyDropdownVisible;
     dd.style.display = historyDropdownVisible ? 'block' : 'none';
+    dd.classList.toggle('is-open', historyDropdownVisible);
 }
 
 function buildHistoryDropdown(items) {
@@ -797,6 +962,7 @@ function buildHistoryDropdown(items) {
         row.addEventListener('click', () => {
             historyDropdownVisible = false;
             dd.style.display = 'none';
+            dd.classList.remove('is-open');
             postAction('selectHistory', { index: i });
         });
         dd.appendChild(row);
@@ -807,6 +973,7 @@ function loadHistoryRecord(data) {
     // Update ASR
     document.getElementById('asr-text').textContent = data.asrText;
     document.getElementById('asr-info').textContent = data.asrInfo || '';
+    setSectionState('asr-section', 'ready');
 
     // Update enhance — switch mode tab visually, show token info in label
     setActiveModeById(data.enhanceMode || 'off');
@@ -815,13 +982,16 @@ function loadHistoryRecord(data) {
         document.getElementById('enhance-section').classList.remove('hidden');
         enhEl.textContent = data.enhancedText;
         setEnhanceInfo(data.enhanceInfo || '');
+        setSectionState('enhance-section', 'ready');
     } else {
         enhEl.textContent = '';
         setEnhanceInfo('');
+        setSectionState('enhance-section', 'idle');
     }
 
     // Update final text
     document.getElementById('final-text').value = data.finalText;
+    setSectionState('final-section', 'ready');
     userEdited = false;
 
     // Prompt button
@@ -869,7 +1039,9 @@ document.addEventListener('click', (e) => {
         const wrap = document.getElementById('history-dropdown-wrap');
         if (!wrap.contains(e.target)) {
             historyDropdownVisible = false;
-            document.getElementById('history-dropdown').style.display = 'none';
+            const dropdown = document.getElementById('history-dropdown');
+            dropdown.style.display = 'none';
+            dropdown.classList.remove('is-open');
         }
     }
 });

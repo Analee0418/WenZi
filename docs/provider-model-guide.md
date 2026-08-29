@@ -182,7 +182,7 @@ AI enhancement uses OpenAI-compatible LLM providers. You can configure multiple 
 | OpenAI | OpenAI | gpt-4o, gpt-4o-mini, gpt-4-turbo |
 | Qwen | Alibaba DashScope | qwen-max, qwen-plus, qwen-turbo, qwen-coder-plus |
 | Doubao | ByteDance Volcano | doubao-1-5-pro-32k, doubao-1-5-lite-32k |
-| DeepSeek | DeepSeek | deepseek-chat, deepseek-reasoner |
+| DeepSeek | DeepSeek | deepseek-v4-flash, deepseek-v4-pro |
 | MiniMax | MiniMax | MiniMax-Text-01, abab6.5s-chat |
 | Zhipu | Zhipu AI | glm-4-plus, glm-4-9b, glm-4-flash |
 | Moonshot | Moonshot AI (Kimi) | moonshot-v1-8k, moonshot-v1-32k, moonshot-v1-128k |
@@ -245,7 +245,7 @@ After editing, restart 闻字 for changes to take effect.
 "deepseek": {
   "base_url": "https://api.deepseek.com/v1",
   "api_key": "sk-xxx",
-  "models": ["deepseek-chat", "deepseek-reasoner"]
+  "models": ["deepseek-v4-flash", "deepseek-v4-pro"]
 }
 ```
 
@@ -294,7 +294,7 @@ Update `default_provider` and `default_model` in `config.json`:
 {
   "ai_enhance": {
     "default_provider": "deepseek",
-    "default_model": "deepseek-chat",
+    "default_model": "deepseek-v4-flash",
     "thinking": false
   }
 }

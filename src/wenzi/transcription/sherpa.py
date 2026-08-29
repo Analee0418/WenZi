@@ -92,6 +92,9 @@ class SherpaOnnxTranscriber(BaseTranscriber):
         self._on_partial: Callable[[str, bool], None] | None = None
         self._decode_thread: threading.Thread | None = None
         self._stream_stop = threading.Event()
+        # Serializes stop/cancel: concurrent finalization would race the
+        # decode thread teardown and shared stream state.
+        self._stream_lifecycle_lock = threading.Lock()
         self._last_text = ""
 
     @property
@@ -230,12 +233,20 @@ class SherpaOnnxTranscriber(BaseTranscriber):
             self.initialize()
 
         self._on_partial = on_partial
-        self._stream = self._recognizer.create_stream()
-        self._stream_stop.clear()
-        self._last_text = ""
+        try:
+            self._stream = self._recognizer.create_stream()
+            self._stream_stop.clear()
+            self._last_text = ""
 
-        self._decode_thread = threading.Thread(target=self._decode_loop, daemon=True)
-        self._decode_thread.start()
+            thread = threading.Thread(target=self._decode_loop, daemon=True)
+            self._decode_thread = thread
+            thread.start()
+        except Exception:
+            # Transactional: a failed start must leave no allocated state
+            # behind (stream / decode thread / callback all cleared).
+            logger.exception("Sherpa streaming failed to start")
+            self._cleanup_stream()
+            raise
         logger.info("Sherpa streaming started")
 
     def feed_audio(self, samples: bytes) -> None:
@@ -247,6 +258,11 @@ class SherpaOnnxTranscriber(BaseTranscriber):
         stream.accept_waveform(16000, float_samples)
 
     def stop_streaming(self) -> str:
+        """Finalize streaming (serialized with cancel, idempotent)."""
+        with self._stream_lifecycle_lock:
+            return self._stop_streaming_locked()
+
+    def _stop_streaming_locked(self) -> str:
         if self._stream is None:
             return ""
 
@@ -254,11 +270,14 @@ class SherpaOnnxTranscriber(BaseTranscriber):
         tail = np.zeros(int(16000 * 0.3), dtype=np.float32)
         self._stream.accept_waveform(16000, tail)
 
-        # Signal decode thread to finish
+        # Signal decode thread to finish.  Only join a thread that was
+        # actually started and is alive — joining an unstarted thread
+        # raises RuntimeError.
         self._stream_stop.set()
-        if self._decode_thread is not None:
-            self._decode_thread.join(timeout=5.0)
-            if self._decode_thread.is_alive():
+        thread = self._decode_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5.0)
+            if thread.is_alive():
                 logger.warning(
                     "Decode thread did not exit within timeout, cleaning up references"
                 )
@@ -283,15 +302,21 @@ class SherpaOnnxTranscriber(BaseTranscriber):
         return text
 
     def cancel_streaming(self) -> None:
-        self._stream_stop.set()
-        if self._decode_thread is not None:
-            self._decode_thread.join(timeout=2.0)
-            if self._decode_thread.is_alive():
-                logger.warning(
-                    "Decode thread did not exit within timeout, cleaning up references"
-                )
-        self._cleanup_stream()
-        logger.info("Sherpa streaming cancelled")
+        """Cancel streaming (serialized with stop, idempotent)."""
+        with self._stream_lifecycle_lock:
+            if self._stream is None and self._decode_thread is None:
+                return
+            self._stream_stop.set()
+            thread = self._decode_thread
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=2.0)
+                if thread.is_alive():
+                    logger.warning(
+                        "Decode thread did not exit within timeout, "
+                        "cleaning up references"
+                    )
+            self._cleanup_stream()
+            logger.info("Sherpa streaming cancelled")
 
     def _decode_loop(self) -> None:
         """Background thread that polls is_ready and emits partial results."""

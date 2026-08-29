@@ -83,6 +83,14 @@ class RecordingFlow:
         self._loop = async_loop.get_loop()
         self._actions: asyncio.Queue[Action] = asyncio.Queue()
         self._current_task: asyncio.Task | None = None
+        # True from the loop callback that accepts a press until the
+        # session task is created (or the press is rejected).  Guards the
+        # pre-session phase against concurrent presses and lets
+        # send_action() accept a RELEASE racing with session startup.
+        self._press_pending = False
+        # Release token for the app-wide exclusive-op slot, held from a
+        # successful claim until the session ends.
+        self._op_token: object | None = None
         # Mode override state (carried over from RecordingController)
         self._prefer_mode: str | None = None
         self._saved_mode: tuple | None = None
@@ -92,6 +100,9 @@ class RecordingFlow:
         # Sub-tasks managed within a session
         self._level_task: asyncio.Task | None = None
         self._live_overlay = None
+        # Single-flight audio-shutdown task, one per recording session:
+        # recorder stop + streaming cleanup run at most once, serialized.
+        self._audio_shutdown_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------
     # Public properties
@@ -99,8 +110,10 @@ class RecordingFlow:
 
     @property
     def is_busy(self) -> bool:
-        """True while a recording session is in progress."""
-        return self._current_task is not None and not self._current_task.done()
+        """True while a press is being handled or a session is in progress."""
+        return self._press_pending or (
+            self._current_task is not None and not self._current_task.done()
+        )
 
     @property
     def input_context(self):
@@ -112,9 +125,21 @@ class RecordingFlow:
     # ------------------------------------------------------------------
 
     def on_press(self, key_name: str = "") -> None:
-        """Called from hotkey thread when the hotkey is pressed."""
-        future = async_loop.submit(self._handle_press(key_name))
-        future.add_done_callback(self._log_future_exception)
+        """Called from hotkey thread when the hotkey is pressed.
+
+        The pending flag is set inside the same loop callback that starts
+        the press coroutine.  A RELEASE sent right after the press lands
+        behind this callback in the loop's FIFO queue, so it can never
+        observe an idle flow and be dropped.
+        """
+        def _start() -> None:
+            if self.is_busy:
+                return
+            self._press_pending = True
+            task = self._loop.create_task(self._handle_press(key_name))
+            task.add_done_callback(self._log_future_exception)
+
+        self._loop.call_soon_threadsafe(_start)
 
     @staticmethod
     def _log_future_exception(future: asyncio.Future) -> None:
@@ -125,8 +150,19 @@ class RecordingFlow:
             logger.error("on_press failed: %s", exc, exc_info=exc)
 
     def send_action(self, action: Action) -> None:
-        """Send an action signal into the recording session (thread-safe)."""
-        self._loop.call_soon_threadsafe(self._actions.put_nowait, action)
+        """Send an action signal into the recording session (thread-safe).
+
+        Actions are dropped at enqueue time while the flow is idle —
+        otherwise a stray action queued between sessions would be misread
+        by the next one.  This replaces draining the queue on press,
+        which could swallow a quick RELEASE racing with session startup.
+        """
+        def _put() -> None:
+            if not self.is_busy:
+                return
+            self._actions.put_nowait(action)
+
+        self._loop.call_soon_threadsafe(_put)
 
     # Adapters so MultiHotkeyListener / app.py can use the same callback
     # names as the old RecordingController.
@@ -157,20 +193,53 @@ class RecordingFlow:
     # ------------------------------------------------------------------
 
     async def _handle_press(self, key_name: str) -> None:
-        if self.is_busy:
+        if self._current_task is not None and not self._current_task.done():
             return
+        session_started = False
+        try:
+            session_started = await self._do_handle_press(key_name)
+        finally:
+            # is_busy stays True throughout: when a session was started,
+            # _current_task was assigned before pending is cleared here.
+            self._press_pending = False
+            if not session_started:
+                # This press never became a session: release the op slot
+                # if it was claimed, and discard any actions queued for it
+                # (e.g. its own RELEASE) so they cannot poison the next
+                # session.  Token identity makes the release a no-op when
+                # the slot belongs to someone else.
+                self._app._end_op(self._op_token)
+                self._op_token = None
+                self._drain_actions()
 
+    async def _do_handle_press(self, key_name: str) -> bool:
+        """Handle one accepted press.  Returns True if a session started."""
         app = self._app
 
         if app._config_degraded:
             from PyObjCTools import AppHelper
             AppHelper.callAfter(app._show_config_error_alert)
-            return
+            return False
 
         if not app._voice_input_available:
             from PyObjCTools import AppHelper
             AppHelper.callAfter(self._try_enable_voice_input)
-            return
+            return False
+
+        # Claim the app-wide op slot before touching any state (mode
+        # overrides, context capture) so a refused press has nothing to
+        # roll back.
+        token = app._try_begin_op("recording")
+        if token is None:
+            from wenzi.i18n import t
+
+            logger.info(
+                "Recording ignored: another operation owns the app "
+                "(model switch in progress?)"
+            )
+            self._show_error_alert(t("alert.recording.busy"))
+            return False
+        self._op_token = token
 
         # Capture the frontmost app before any potentially slow AX context
         # lookup so we can reactivate the original target window later.
@@ -204,13 +273,11 @@ class RecordingFlow:
                 self._prefer_mode = prefer_mode
                 self._apply_prefer_mode(prefer_mode)
 
-        self._drain_actions()
-
-        app._busy = True
         logger.info("Hotkey pressed, starting recording session")
         self._current_task = asyncio.create_task(
             self._recording_session(key_name)
         )
+        return True
 
     # ------------------------------------------------------------------
     # The recording session coroutine
@@ -222,6 +289,9 @@ class RecordingFlow:
 
         app = self._app
         streaming = False
+        restarted = False
+        # Fresh session → fresh single-flight shutdown slot
+        self._audio_shutdown_task = None
 
         try:
             self._fire_scripting_event("recording_start")
@@ -287,6 +357,23 @@ class RecordingFlow:
                 app._recorder.mark_tainted()
                 AppHelper.callAfter(self._reset_to_idle)
                 return
+            except Exception:
+                # e.g. a concurrent start() in flight, or engine creation
+                # blowing up before the recorder could handle it.
+                logger.exception("Recorder.start() failed, aborting session")
+                AppHelper.callAfter(self._reset_to_idle)
+                return
+            if not app._recorder.is_recording:
+                # start() reports engine/finalization failures by returning
+                # without recording — never show a live recording UI while
+                # no engine is actually capturing audio.
+                from wenzi.i18n import t
+                from wenzi.scripting.api.alert import alert
+
+                logger.error("Recorder did not start, aborting session")
+                alert(t("alert.recording.start_failed"), duration=3.0)
+                AppHelper.callAfter(self._reset_to_idle)
+                return
             if dev_name and app._recording_indicator.show_device_name:
                 AppHelper.callAfter(
                     app._recording_indicator.update_device_name, dev_name
@@ -296,8 +383,10 @@ class RecordingFlow:
             # Start streaming transcription if supported
             streaming = self._start_streaming_if_supported()
 
-            # Start level polling
-            self._level_task = asyncio.create_task(self._poll_level())
+            # The indicator's EMA must advance on every existing 20 Hz tick.
+            # Skip the task entirely when the visual indicator is disabled.
+            if app._recording_indicator.enabled:
+                self._level_task = asyncio.create_task(self._poll_level())
 
             # ④ Wait for user action during recording
             max_sec = app._config.get("audio", {}).get(
@@ -317,32 +406,35 @@ class RecordingFlow:
                 )
 
             if action == Action.CANCEL:
-                self._stop_streaming(streaming)
-                await self._loop.run_in_executor(None, app._recorder.stop)
+                await asyncio.shield(
+                    self._ensure_audio_shutdown(streaming, cancel=True)
+                )
                 self._cancel_subtasks()
                 AppHelper.callAfter(self._reset_to_idle)
                 return
 
             if action == Action.RESTART:
-                self._stop_streaming(streaming)
-                await self._loop.run_in_executor(None, app._recorder.stop)
+                await asyncio.shield(
+                    self._ensure_audio_shutdown(streaming, cancel=True)
+                )
                 raise _RestartSession(key_name)
 
             if action == Action.PREVIEW_HISTORY:
-                self._stop_streaming(streaming)
-                await self._loop.run_in_executor(None, app._recorder.stop)
+                await asyncio.shield(
+                    self._ensure_audio_shutdown(streaming, cancel=True)
+                )
                 self._cancel_subtasks()
                 AppHelper.callAfter(self._reset_and_show_preview)
                 return
 
-            # ⑤ Release (or timeout) — stop recording
+            # ⑤ Release (or timeout) — stop recording.  Streaming (if any)
+            # finalizes inside the same single-flight shutdown task: with
+            # a non-empty wav it stops for the final text, otherwise it
+            # cancels.
             self._cancel_subtasks()
 
-            if streaming:
-                app._recorder.clear_on_audio_chunk()
-
-            wav_data = await self._loop.run_in_executor(
-                None, app._recorder.stop
+            wav_data, stream_text = await asyncio.shield(
+                self._ensure_audio_shutdown(streaming, cancel=False)
             )
 
             # Record audio duration
@@ -360,6 +452,8 @@ class RecordingFlow:
             )
 
             if not wav_data:
+                # (streaming was already cancelled by the shutdown task —
+                # an empty wav never finalizes for a result)
                 from wenzi.i18n import t
                 from wenzi.scripting.api.alert import alert
 
@@ -387,18 +481,13 @@ class RecordingFlow:
                 await self._do_direct_flow(
                     None, wav_data, audio_duration
                 )
-                app._busy = False
+                app._end_op(self._op_token)
                 logger.debug("Direct flow done, session done")
                 return
 
-            # All non-streaming paths returned above; only streaming remains.
-            try:
-                text = await self._loop.run_in_executor(
-                    None, app._transcriber.stop_streaming
-                )
-            except Exception as e:
-                logger.error("Streaming stop failed: %s", e)
-                text = None
+            # All non-streaming paths returned above; only streaming
+            # remains — its final text came from the shutdown task.
+            text = stream_text
             self._hide_live_overlay()
 
             logger.debug("Transcription result: %r", text[:100] if text else None)
@@ -409,7 +498,7 @@ class RecordingFlow:
                     app._set_status, "statusbar.status.empty"
                 )
                 logger.warning("Transcription returned empty text")
-                app._busy = False
+                app._end_op(self._op_token)
                 return
 
             asr_text = text.strip()
@@ -424,29 +513,38 @@ class RecordingFlow:
                 await self._do_direct_flow(
                     asr_text, wav_data, audio_duration
                 )
-                app._busy = False
+                app._end_op(self._op_token)
                 logger.debug("Direct flow done, session done")
 
         except _RestartSession as rs:
+            restarted = True
             self._cancel_subtasks()
             self._hide_live_overlay()
-            self._drain_actions()
+            # No drain here: a RELEASE queued right behind the RESTART
+            # belongs to the restarted session and must be delivered.
             self._current_task = asyncio.create_task(
                 self._recording_session(rs.key_name)
             )
             return
         except asyncio.CancelledError:
-            if app._recorder.is_recording:
-                self._stop_streaming(streaming)
-                await self._loop.run_in_executor(
-                    None, app._recorder.stop
-                )
+            await self._cleanup_session_audio(streaming)
             self._cancel_subtasks()
             AppHelper.callAfter(self._reset_to_idle)
         except Exception:
             logger.exception("Recording session failed")
+            # Never leave the microphone or a streaming session open
+            # behind a reset UI.
+            await self._cleanup_session_audio(streaming)
             self._cancel_subtasks()
             AppHelper.callAfter(self._reset_to_idle)
+        finally:
+            # A session may end with actions still queued (a RELEASE right
+            # after CANCEL, a start failure before the wait, ...).  Drop
+            # them on the loop thread so they cannot leak into the next
+            # session — EXCEPT on restart: queued actions (e.g. a RELEASE
+            # right behind the RESTART) belong to the restarted session.
+            if not restarted:
+                self._drain_actions()
 
     # ------------------------------------------------------------------
     # Action waiting
@@ -541,7 +639,7 @@ class RecordingFlow:
                 wav_data=wav_data,
             ),
         )
-        app._busy = False
+        app._end_op(self._op_token)
         logger.debug("Preview flow done, session done")
 
     # ------------------------------------------------------------------
@@ -569,6 +667,7 @@ class RecordingFlow:
 
         text = asr_text or ""
         enhanced_text = None
+        enhance_fell_back = False
         cancel_event = asyncio.Event()
 
         if use_enhance:
@@ -659,12 +758,16 @@ class RecordingFlow:
 
                     try:
                         if chain_steps:
-                            text = await self._run_direct_chain_stream(
-                                asr_text, chain_steps, abort_event
+                            text, enhance_fell_back = (
+                                await self._run_direct_chain_stream(
+                                    asr_text, chain_steps, abort_event
+                                )
                             )
                         else:
-                            text = await self._run_direct_single_stream(
-                                asr_text, abort_event
+                            text, enhance_fell_back = (
+                                await self._run_direct_single_stream(
+                                    asr_text, abort_event
+                                )
                             )
                     finally:
                         for t in abort_tasks:
@@ -686,6 +789,11 @@ class RecordingFlow:
                         enhanced_text = None
                     elif cancel_event.is_set():
                         text = asr_text
+                        enhanced_text = None
+                    elif enhance_fell_back:
+                        # Fallback output is the original text, not an
+                        # enhancement result: don't fire enhancement_done
+                        # or log it into history as enhanced.
                         enhanced_text = None
                     else:
                         enhanced_text = text
@@ -850,12 +958,12 @@ class RecordingFlow:
         if total_steps > 0:
             msg = (
                 f"\u26a0\ufe0f Step {step_idx}/{total_steps}: "
-                "AI timed out, using original text"
+                "AI enhancement failed, using original text"
             )
         else:
-            msg = "\u26a0\ufe0f AI timed out, using original text"
+            msg = "\u26a0\ufe0f AI enhancement failed, using original text"
         app._streaming_overlay.set_status(msg)
-        self._show_error_alert("AI enhancement timed out")
+        self._show_error_alert("AI enhancement failed, original text used")
         return [chunk], completion_tokens
 
     # ------------------------------------------------------------------
@@ -937,14 +1045,19 @@ class RecordingFlow:
 
     async def _run_direct_single_stream(
         self, asr_text: str, cancel_event: asyncio.Event,
-    ) -> str:
-        """Single-step streaming enhancement, updating overlay."""
+    ) -> tuple[str, bool]:
+        """Single-step streaming enhancement, updating overlay.
+
+        Returns ``(text, fell_back)`` — *fell_back* is True when the
+        stream failed and *text* is the original-text fallback.
+        """
         app = self._app
         collected: list[str] = []
         usage = None
         completion_tokens = 0
         thinking_tokens = 0
         had_thinking = False
+        fell_back = False
 
         gen = app._enhancer.enhance_stream(
             asr_text, input_context=self._input_context
@@ -962,6 +1075,7 @@ class RecordingFlow:
                 collected, completion_tokens = self._apply_timeout_fallback(
                     app, chunk,
                 )
+                fell_back = True
                 break
             elif is_thinking and chunk:
                 had_thinking = True
@@ -986,21 +1100,29 @@ class RecordingFlow:
                 app._usage_stats.record_token_usage(usage)
             except Exception as e:
                 logger.error("Failed to record token usage: %s", e)
-            app._streaming_overlay.set_complete(usage)
+            if not fell_back:
+                app._streaming_overlay.set_complete(usage)
 
-        return "".join(collected).strip() or asr_text
+        return "".join(collected).strip() or asr_text, fell_back
 
     async def _run_direct_chain_stream(
         self,
         asr_text: str,
         chain_steps: list[str],
         cancel_event: asyncio.Event,
-    ) -> str:
-        """Multi-step chain streaming enhancement, updating overlay."""
+    ) -> tuple[str, bool]:
+        """Multi-step chain streaming enhancement, updating overlay.
+
+        Returns ``(text, fell_back)`` — on a failed step the chain aborts
+        and falls back to the original ASR text (displayed AND returned,
+        so the overlay never shows something different from what gets
+        typed).
+        """
         app = self._app
         total_steps = len(chain_steps)
         input_text = asr_text
         original_mode = app._enhancer.mode
+        chain_fell_back = False
         total_usage: dict[str, int] = {
             "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
         }
@@ -1041,9 +1163,14 @@ class RecordingFlow:
                             f"\u23f3 Step {step_idx}/{total_steps}: {label}"
                         )
                     elif is_thinking == "timeout" and chunk:
+                        # Display the ORIGINAL text as the fallback — the
+                        # chain aborts and returns asr_text, and the
+                        # overlay must match what will be typed (the
+                        # step's input would show a half-chain result).
                         collected, completion_tokens = self._apply_timeout_fallback(
-                            app, chunk, step_idx, total_steps,
+                            app, asr_text, step_idx, total_steps,
                         )
+                        chain_fell_back = True
                         break
                     elif is_thinking and chunk:
                         thinking_tokens += len(chunk)
@@ -1058,6 +1185,11 @@ class RecordingFlow:
                         )
                     if chunk_usage is not None:
                         step_usage = chunk_usage
+
+                if chain_fell_back:
+                    # Abort the chain: later steps would run on stale
+                    # input and burn tokens for a result we won't use.
+                    break
 
                 step_result = "".join(collected).strip()
                 if step_result:
@@ -1078,10 +1210,16 @@ class RecordingFlow:
                 except Exception as e:
                     logger.error("Failed to record token usage: %s", e)
 
+            if chain_fell_back:
+                # Aborted chain falls back to the original text; don't
+                # mark the run complete — the overlay already shows the
+                # fallback text and the failure status.
+                return asr_text, True
+
             if total_usage["total_tokens"] > 0:
                 app._streaming_overlay.set_complete(total_usage)
 
-            return input_text.strip() or asr_text
+            return input_text.strip() or asr_text, False
         finally:
             app._enhancer.mode = original_mode
 
@@ -1101,7 +1239,18 @@ class RecordingFlow:
                 AppHelper.callAfter(self._update_live_overlay, text)
 
             app._transcriber.start_streaming(_on_partial)
-            app._recorder.set_on_audio_chunk(app._transcriber.feed_audio)
+            try:
+                app._recorder.set_on_audio_chunk(app._transcriber.feed_audio)
+            except Exception:
+                # Half-started: never leave a background recognizer running
+                logger.exception(
+                    "Audio-chunk attach failed; cancelling streaming"
+                )
+                try:
+                    app._transcriber.cancel_streaming()
+                except Exception:
+                    logger.exception("Cancel after attach failure failed")
+                return False
 
             # Activate the overlay (already shown in faded state)
             if self._live_overlay is not None:
@@ -1112,18 +1261,106 @@ class RecordingFlow:
             return True
         except Exception:
             logger.exception("Failed to start streaming, will use batch mode")
+            # start_streaming may have allocated backend resources before
+            # raising — best-effort cancel so no half-started recognizer
+            # session leaks.
+            try:
+                app._transcriber.cancel_streaming()
+            except Exception:
+                logger.exception("Cancel after failed start also failed")
             return False
 
-    def _stop_streaming(self, was_active: bool) -> None:
-        """Stop streaming transcription if it was active."""
-        if not was_active:
-            return
+    def _ensure_audio_shutdown(
+        self, streaming: bool, cancel: bool,
+    ) -> asyncio.Task:
+        """Return this session's single-flight audio-shutdown task.
+
+        The first caller creates it; every later caller — including the
+        exception and cancel handlers — awaits the SAME task, so the
+        recorder stop and the streaming cleanup run at most once,
+        strictly serialized on one executor job.  Always await through
+        ``asyncio.shield``: cancelling an awaiter must neither cancel the
+        underlying work nor open the door to a second cleanup.
+        """
+        if self._audio_shutdown_task is None:
+            self._audio_shutdown_task = asyncio.ensure_future(
+                self._loop.run_in_executor(
+                    None,
+                    lambda: self._audio_shutdown_sync(streaming, cancel),
+                )
+            )
+        return self._audio_shutdown_task
+
+    def _audio_shutdown_sync(
+        self, streaming: bool, cancel: bool,
+    ) -> tuple[bytes | None, str | None]:
+        """Executor body: stop the recorder FIRST (mic off, taps
+        quiesced), then finalize or cancel streaming — even when
+        recorder.stop() raises (try/finally).
+
+        Returns ``(wav_data, final_text)``.  Only a normal release with a
+        non-empty wav finalizes streaming for a result; empty wav,
+        cancel/restart/history and error paths all cancel it.
+        """
         app = self._app
-        app._recorder.clear_on_audio_chunk()
+        wav = None
+        text = None
         try:
-            app._transcriber.stop_streaming()
+            wav = app._recorder.stop()
+        finally:
+            if streaming:
+                app._recorder.clear_on_audio_chunk()
+                text = self._finalize_streaming_sync(cancel=cancel or not wav)
+        return wav, text
+
+    def _finalize_streaming_sync(self, cancel: bool) -> str | None:
+        """Stop or cancel streaming, with mutual fallback.
+
+        Streaming counts as cleaned only when one of the two paths
+        succeeded; when both fail the primary error propagates so the
+        caller knows the recognizer is in an unknown state.
+        """
+        app = self._app
+        try:
+            if cancel:
+                app._transcriber.cancel_streaming()
+                return None
+            return app._transcriber.stop_streaming()
+        except Exception as primary_exc:
+            logger.exception(
+                "Primary streaming cleanup (%s) failed",
+                "cancel" if cancel else "stop",
+            )
+            try:
+                if cancel:
+                    app._transcriber.stop_streaming()
+                else:
+                    app._transcriber.cancel_streaming()
+            except Exception:
+                logger.exception("Fallback streaming cleanup also failed")
+                raise primary_exc
+            return None
+
+    async def _cleanup_session_audio(self, streaming: bool) -> None:
+        """Best-effort abort cleanup via the single-flight shutdown task.
+
+        Awaiting the shared task makes this idempotent: when a shutdown
+        already ran (or is in flight), no second recorder stop and no
+        second streaming cleanup can ever start.
+        """
+        app = self._app
+        if (
+            self._audio_shutdown_task is None
+            and not app._recorder.is_recording
+            and not streaming
+        ):
+            return
+        try:
+            await asyncio.shield(
+                self._ensure_audio_shutdown(streaming, cancel=True)
+            )
         except Exception:
-            logger.exception("Failed to stop streaming")
+            logger.exception("Session audio cleanup failed")
 
     # ------------------------------------------------------------------
     # Level polling
@@ -1134,15 +1371,12 @@ class RecordingFlow:
         from PyObjCTools import AppHelper
 
         app = self._app
-        last_level = -1.0
         try:
             while True:
                 level = app._recorder.current_level
-                if abs(level - last_level) > 0.02:
-                    AppHelper.callAfter(
-                        app._recording_indicator.update_level, level
-                    )
-                    last_level = level
+                AppHelper.callAfter(
+                    app._recording_indicator.update_level, level
+                )
                 await asyncio.sleep(0.05)
         except asyncio.CancelledError:
             pass
@@ -1189,7 +1423,7 @@ class RecordingFlow:
 
     def _reset_to_idle(self) -> None:
         """Common cleanup: hide overlays/indicator and restore idle status."""
-        self._app._busy = False
+        self._app._end_op(self._op_token)
         self._target_app = None
         self._hide_live_overlay()
         self._cancel_level_task()

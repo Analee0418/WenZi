@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from unittest.mock import MagicMock, patch
 
@@ -43,6 +44,293 @@ def mock_app():
 @pytest.fixture
 def ctrl(mock_app):
     return PreviewController(mock_app)
+
+
+class TestPreviewSttLateCommit:
+    @patch("wenzi.controllers.preview_controller.save_config")
+    def test_stale_switch_result_discarded(self, _mock_save, ctrl, mock_app):
+        """A switch finishing after the panel closed must not replace the
+        app-wide transcriber (a new recording or switch may be using it)."""
+        mock_app._preview_stt_keys = [
+            ("preset", "funasr-zh"),
+            ("preset", "mlx-whisper-large-v3-turbo"),
+        ]
+        mock_app._current_preset_id = "funasr-zh"
+        mock_app._current_remote_asr = None
+        mock_app._config["asr"] = {}
+        mock_app._preview_panel.hotwords_detail = None
+        mock_app._preview_panel.asr_request_id = 7
+        mock_app._preview_panel.is_visible = False  # panel already closed
+        mock_app._preview_audio_duration = 1.5
+        old_transcriber = mock_app._transcriber
+        new_transcriber = MagicMock()
+        mock_app._create_transcriber_for_preset.return_value = new_transcriber
+
+        mock_helper = MagicMock()
+        mock_helper.callAfter = lambda fn, *a, **kw: fn(*a, **kw)
+        with patch.dict("sys.modules", {
+            "PyObjCTools": MagicMock(AppHelper=mock_helper),
+            "PyObjCTools.AppHelper": mock_helper,
+        }):
+            ctrl.on_preview_stt_change(1)
+            deadline = time.monotonic() + 5
+            while (
+                not new_transcriber.cleanup.called
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+
+        assert mock_app._transcriber is old_transcriber
+        old_transcriber.cleanup.assert_not_called()
+        new_transcriber.cleanup.assert_called_once()
+        assert ctrl._stt_switching is False
+
+    @patch("wenzi.controllers.preview_controller.save_config")
+    def test_superseded_switch_result_discarded(self, _mock_save, ctrl, mock_app):
+        """A switch whose request id was superseded (new preview session,
+        monotonic ids) must be discarded even if a panel is visible."""
+        mock_app._preview_stt_keys = [
+            ("preset", "funasr-zh"),
+            ("preset", "mlx-whisper-large-v3-turbo"),
+        ]
+        mock_app._current_preset_id = "funasr-zh"
+        mock_app._current_remote_asr = None
+        mock_app._config["asr"] = {}
+        mock_app._preview_panel.hotwords_detail = None
+        mock_app._preview_panel.asr_request_id = 7
+        mock_app._preview_panel.is_visible = True
+        mock_app._preview_audio_duration = 1.5
+        old_transcriber = mock_app._transcriber
+        new_transcriber = MagicMock()
+        release = threading.Event()
+        new_transcriber.transcribe.side_effect = (
+            lambda *a, **k: release.wait(5) or "new text"
+        )
+        mock_app._create_transcriber_for_preset.return_value = new_transcriber
+
+        mock_helper = MagicMock()
+        mock_helper.callAfter = lambda fn, *a, **kw: fn(*a, **kw)
+        try:
+            with patch.dict("sys.modules", {
+                "PyObjCTools": MagicMock(AppHelper=mock_helper),
+                "PyObjCTools.AppHelper": mock_helper,
+            }):
+                ctrl.on_preview_stt_change(1)
+                # A newer preview session bumps the monotonic id while
+                # the switch worker is still transcribing
+                mock_app._preview_panel.asr_request_id = 8
+                release.set()
+                deadline = time.monotonic() + 5
+                while (
+                    not new_transcriber.cleanup.called
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+        finally:
+            release.set()
+
+        assert mock_app._transcriber is old_transcriber
+        old_transcriber.cleanup.assert_not_called()
+        new_transcriber.cleanup.assert_called_once()
+
+
+def _tiny_wav() -> bytes:
+    import io
+    import struct
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(struct.pack("<8h", *([100] * 8)))
+    return buf.getvalue()
+
+
+class TestPreviewSttSessionLifecycle:
+    def test_cancelled_before_start_skips_transcribe(self, ctrl, mock_app):
+        """A session cancelled before the worker starts must not even
+        call transcribe."""
+        from wenzi.controllers.preview_controller import _PreviewSttSession
+
+        mock_app._preview_panel.asr_request_id = 5
+        session = _PreviewSttSession(5, MagicMock())
+        session.cancel_event.set()
+
+        ctrl._run_preview_stt(session, _tiny_wav(), [], False, None)
+
+        session.transcriber.transcribe.assert_not_called()
+        assert session.done_event.is_set()
+
+    def test_cancel_mid_transcribe_discards_result_and_event(
+        self, ctrl, mock_app
+    ):
+        """Cancelling (panel close) while transcribe blocks must discard
+        the result AND the scripting event."""
+        import threading as _threading
+
+        from wenzi.controllers.preview_controller import _PreviewSttSession
+
+        mock_app._preview_panel.asr_request_id = 5
+        session = _PreviewSttSession(5, MagicMock())
+        gate = _threading.Event()
+        session.transcriber.transcribe.side_effect = (
+            lambda *a, **k: gate.wait(5) or "late text"
+        )
+        mock_app._build_dynamic_hotwords = MagicMock(return_value=([], []))
+        ctrl._fire_scripting_event = MagicMock()
+
+        worker = _threading.Thread(
+            target=ctrl._run_preview_stt,
+            args=(session, _tiny_wav(), [], False, None),
+            daemon=True,
+        )
+        worker.start()
+        time.sleep(0.05)
+        session.cancel_event.set()  # panel closed
+        gate.set()
+        worker.join(5)
+
+        assert session.done_event.is_set()
+        ctrl._fire_scripting_event.assert_not_called()
+        mock_app._preview_panel.set_asr_result.assert_not_called()
+
+    def test_new_panel_generation_discards_old_result(self, ctrl, mock_app):
+        """A result finishing after the panel was reopened (generation
+        advanced) must be discarded."""
+        import threading as _threading
+
+        from wenzi.controllers.preview_controller import _PreviewSttSession
+
+        mock_app._preview_panel.asr_request_id = 5
+        session = _PreviewSttSession(5, MagicMock())
+        gate = _threading.Event()
+        session.transcriber.transcribe.side_effect = (
+            lambda *a, **k: gate.wait(5) or "old result"
+        )
+        mock_app._build_dynamic_hotwords = MagicMock(return_value=([], []))
+        ctrl._fire_scripting_event = MagicMock()
+
+        worker = _threading.Thread(
+            target=ctrl._run_preview_stt,
+            args=(session, _tiny_wav(), [], False, None),
+            daemon=True,
+        )
+        worker.start()
+        time.sleep(0.05)
+        mock_app._preview_panel.asr_request_id = 6  # panel reopened
+        gate.set()
+        worker.join(5)
+
+        ctrl._fire_scripting_event.assert_not_called()
+        mock_app._preview_panel.set_asr_result.assert_not_called()
+
+    def test_finish_never_releases_before_worker_done(self, ctrl, mock_app):
+        """_finish_stt_session must NEVER time out into a release: while
+        the worker is not done, the session stays set and the caller's
+        OpGuard stays busy — across multiple wait intervals."""
+        import threading as _threading
+
+        from wenzi.controllers.preview_controller import _PreviewSttSession
+
+        ctrl._STT_FINISH_WAIT_INTERVAL = 0.05  # several intervals elapse
+        session = _PreviewSttSession(5, MagicMock())
+        ctrl._stt_session = session
+        mock_app._busy = True  # the caller holds the op slot
+        released = _threading.Event()
+
+        def _close_and_release():
+            # Mirrors the production ordering: finish first, only then
+            # release the exclusive-op slot.
+            ctrl._finish_stt_session()
+            mock_app._busy = False
+            released.set()
+
+        waiter = _threading.Thread(target=_close_and_release, daemon=True)
+        waiter.start()
+        time.sleep(0.3)  # ≥ 5 wait intervals — the old code would give up
+        assert not released.is_set()          # still blocked on the worker
+        assert mock_app._busy is True         # OpGuard never released early
+        assert ctrl._stt_session is session   # session NOT cleared
+        assert session.cancel_event.is_set()  # close cancels the worker
+
+        session.done_event.set()              # worker actually exits
+        waiter.join(5)
+        assert released.is_set()
+        assert mock_app._busy is False        # released only after done
+        assert ctrl._stt_session is None
+
+
+class TestPreviewSttCommitTransaction:
+    def _setup_switch(self, ctrl, mock_app):
+        mock_app._preview_stt_keys = [
+            ("preset", "funasr-zh"),
+            ("preset", "mlx-whisper-large-v3-turbo"),
+        ]
+        mock_app._current_preset_id = "funasr-zh"
+        mock_app._current_remote_asr = None
+        mock_app._config["asr"] = {}
+        mock_app._preview_panel.hotwords_detail = None
+        mock_app._preview_panel.asr_request_id = 7
+        mock_app._preview_panel.is_visible = True
+        mock_app._preview_audio_duration = 1.5
+        new_transcriber = MagicMock()
+        new_transcriber.transcribe.return_value = "new text"
+        mock_app._create_transcriber_for_preset.return_value = new_transcriber
+        return new_transcriber
+
+    def _run_switch(self, ctrl, mock_app, new_transcriber):
+        mock_helper = MagicMock()
+        mock_helper.callAfter = lambda fn, *a, **kw: fn(*a, **kw)
+        with patch.dict("sys.modules", {
+            "PyObjCTools": MagicMock(AppHelper=mock_helper),
+            "PyObjCTools.AppHelper": mock_helper,
+        }):
+            ctrl.on_preview_stt_change(1)
+            deadline = time.monotonic() + 5
+            while ctrl._stt_switching and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+    @patch(
+        "wenzi.controllers.preview_controller.save_config",
+        side_effect=OSError("disk full"),
+    )
+    def test_save_config_failure_keeps_live_state(
+        self, _mock_save, ctrl, mock_app
+    ):
+        """Persistence failing must not leave panel/live state on the old
+        model, and the loading state must resolve."""
+        new_transcriber = self._setup_switch(ctrl, mock_app)
+        old_transcriber = mock_app._transcriber
+
+        self._run_switch(ctrl, mock_app, new_transcriber)
+
+        assert mock_app._transcriber is new_transcriber
+        old_transcriber.cleanup.assert_called_once()
+        assert mock_app._current_preview_asr_text == "new text"
+        mock_app._enhance_controller.clear_cache.assert_called_once()
+        calls = [
+            c for c in mock_app._preview_panel.set_asr_result.call_args_list
+            if c.args and c.args[0] == "new text"
+        ]
+        assert calls  # panel resolved with the NEW transcription
+
+    @patch("wenzi.controllers.preview_controller.save_config")
+    def test_menu_update_failure_keeps_live_state(
+        self, _mock_save, ctrl, mock_app
+    ):
+        new_transcriber = self._setup_switch(ctrl, mock_app)
+        mock_app._menu_builder.update_model_checkmarks.side_effect = (
+            RuntimeError("menu")
+        )
+
+        self._run_switch(ctrl, mock_app, new_transcriber)
+
+        assert mock_app._transcriber is new_transcriber
+        assert mock_app._current_preview_asr_text == "new text"
+        mock_app._enhance_controller.clear_cache.assert_called_once()
+        assert mock_app._current_preset_id == "mlx-whisper-large-v3-turbo"
 
 
 class TestEnhanceModeDebounce:

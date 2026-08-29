@@ -121,8 +121,8 @@ Toggle via: menubar → **Settings...** → General tab → **Preview** checkbox
 
 When Preview is on, after recording you'll see a floating panel:
 
-- **Confirm** (`Enter`) — types the text and closes the panel
-- **Copy to clipboard** (`⌘+Enter`) — copies the text to clipboard instead of typing
+- **Confirm** (`⌘+Enter`) — types the text and closes the panel; plain `Enter` outside the editable final text also confirms, while inside it `Enter` inserts a newline
+- **Copy to clipboard** (`⌘+Shift+Enter`) — copies the text to clipboard instead of typing
 - **Cancel** (`Esc`) — discards the text
 - **Edit** — click the text area to modify before confirming
 
@@ -223,7 +223,7 @@ You need an LLM backend. Two easy options:
    base_url: https://api.deepseek.com/v1
    api_key: sk-your-key
    models:
-     deepseek-chat
+     deepseek-v4-flash
    ```
 3. Click **Verify** → **Save**
 
@@ -285,7 +285,7 @@ The preview panel uses a modern **WKWebView-based** (HTML/CSS/JS) interface by d
 | Feature | How |
 |---|---|
 | **Edit text** | Click the text area and type |
-| **Copy to clipboard** | `⌘+Enter` — copies instead of typing into the active app |
+| **Copy to clipboard** | `⌘+Shift+Enter` — copies instead of typing into the active app |
 | **Toggle punctuation** | Check/uncheck the **Punc** checkbox to re-transcribe with/without punctuation |
 | **Switch STT model** | Use the STT dropdown in the panel |
 | **Switch LLM model** | Use the LLM dropdown in the panel |
@@ -709,8 +709,8 @@ Menubar → **Usage Stats** opens an interactive statistics dashboard with:
 | `fn` + `Z` | During recording | Cancel recording and show last preview history |
 | `Ctrl+Cmd+V` | Global | Clipboard enhancement |
 | `Cmd+Space` | Global | Open/close Launcher (if enabled) |
-| `Enter` | Preview panel | Confirm and type text |
-| `⌘+Enter` | Preview panel | Copy to clipboard |
+| `⌘+Enter` | Preview panel | Confirm and type text (`Enter` inside the final text inserts a newline) |
+| `⌘+Shift+Enter` | Preview panel | Copy to clipboard |
 | `Esc` | Preview panel / Streaming overlay | Cancel |
 | `⌘1` – `⌘9` | Preview panel | Switch enhancement mode |
 | `⌘A/C/V/X` | Preview panel | Standard edit shortcuts |

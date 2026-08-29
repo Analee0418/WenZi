@@ -500,34 +500,37 @@ class SharedHotkeyTap:
 
         When the last binding is removed the tap is auto-stopped.
         """
+        runner_to_stop = None
         with self._lock:
             key = self._tokens.pop(token, None)
             if key is None:
                 return
 
             callbacks = self._bindings.get(key)
-            if callbacks is None:
-                return
-
-            callbacks.pop(token, None)
-            if not callbacks:
-                self._bindings.pop(key, None)
+            if callbacks is not None:
+                callbacks.pop(token, None)
+                if not callbacks:
+                    self._bindings.pop(key, None)
             if not self._bindings:
-                self._stop_tap_locked()
+                runner_to_stop = self._runner
+                self._runner = None
+        if runner_to_stop is not None:
+            # Stop OUTSIDE the lock: the tap callback takes the same lock,
+            # so holding it here deadlocks the run loop against stop()'s
+            # join and forces the runner's leak fallback.
+            runner_to_stop.stop()
 
     def stop(self) -> None:
         """Stop the tap and remove all bindings."""
         with self._lock:
             self._bindings.clear()
             self._tokens.clear()
-            self._stop_tap_locked()
-        logger.info("SharedHotkeyTap stopped")
-
-    def _stop_tap_locked(self) -> None:
-        """Stop the underlying tap. Caller must hold *_lock*."""
-        if self._runner is not None:
-            self._runner.stop()
+            runner = self._runner
             self._runner = None
+        if runner is not None:
+            # Outside the lock — see remove()
+            runner.stop()
+        logger.info("SharedHotkeyTap stopped")
 
     def _start_tap(self) -> None:
         """Create and start the CGEventTap.  Caller must hold *_lock*."""
@@ -535,9 +538,24 @@ class SharedHotkeyTap:
 
         self._cg = cg
         mask = cg.CGEventMaskBit(cg.kCGEventKeyDown)
-        self._runner = cg.CGEventTapRunner()
-        self._runner.start(mask, self._callback)
+        runner = cg.CGEventTapRunner()
+        runner.start(mask, self._make_runner_callback(runner))
+        self._runner = runner
         logger.info("SharedHotkeyTap: CGEventTap created (bindings=%d)", len(self._bindings))
+
+    def _make_runner_callback(self, runner):
+        """Bind the tap callback to *runner*'s generation.
+
+        A superseded runner's thread may outlive its stop(); its callback
+        must then pass events through untouched instead of reading (or
+        executing) the bindings that now belong to a newer tap.
+        """
+        def _generation_bound_callback(proxy, event_type, event, refcon):
+            if self._runner is not runner:
+                return event
+            return self._callback(proxy, event_type, event, refcon)
+
+        return _generation_bound_callback
 
     def _callback(self, proxy, event_type, event, refcon):
         cg = self._cg
@@ -603,6 +621,12 @@ class KeyRemapListener:
         self._remaps: dict[int, tuple] = {}  # source_vk → (target_vk, is_modifier, mod_flag)
         self._runner = None  # CGEventTapRunner | None
         self._prev_flags: int = 0
+        # Lifecycle lock + generation token: start/stop use two-phase
+        # commit (claim under lock, stop/start unlocked, commit by token)
+        # so concurrent calls can neither leak a runner nor join under
+        # the lock.
+        self._lifecycle = threading.Lock()
+        self._gen = 0
 
     def add(self, source_vk: int, target_vk: int, is_modifier: bool, mod_flag: int) -> None:
         """Add a remap.  Can be called while running."""
@@ -664,14 +688,55 @@ class KeyRemapListener:
     def start(self) -> None:
         from wenzi import _cgeventtap as cg
 
+        # Phase 1 (locked): claim a new generation, detach the old runner.
+        with self._lifecycle:
+            self._gen += 1
+            token = self._gen
+            old_runner = self._runner
+            self._runner = None
+
+        # Phase 2 (unlocked): stop the old instance, start the new one —
+        # joins never happen while holding the lifecycle lock.
+        if old_runner is not None:
+            old_runner.stop()
+
         mask = cg.CGEventMaskBit(cg.kCGEventFlagsChanged) | cg.CGEventMaskBit(cg.kCGEventKeyDown) | cg.CGEventMaskBit(cg.kCGEventKeyUp)
-        self._runner = cg.CGEventTapRunner()
-        self._runner.start(mask, self._callback)
+        runner = cg.CGEventTapRunner()
+        runner.start(mask, self._make_callback(runner, token))
+
+        # Phase 3 (locked): commit only if our token is still current —
+        # a concurrent start/stop supersedes us and our runner must die.
+        with self._lifecycle:
+            if self._gen == token and self._runner is None:
+                self._runner = runner
+                return
+        runner.stop()
+
+    def _make_callback(self, runner, token: int):
+        """Bind the tap callback to one start() generation.
+
+        The generation check and the ENTIRE dispatch (event posting,
+        state mutation, swallowing) run inside the lifecycle lock — one
+        linearized interval.  A new generation can only commit (phase 3,
+        same lock) after an in-flight old-generation dispatch finished;
+        after that commit the old callback can never produce another
+        side effect and passes events through untouched.
+        """
+        def _generation_bound_callback(proxy, event_type, event, refcon):
+            with self._lifecycle:
+                if self._gen != token or self._runner is not runner:
+                    return event
+                return self._callback(proxy, event_type, event, refcon)
+
+        return _generation_bound_callback
 
     def stop(self) -> None:
-        if self._runner is not None:
-            self._runner.stop()
+        with self._lifecycle:
+            self._gen += 1  # invalidate any in-flight start()
+            runner = self._runner
             self._runner = None
+        if runner is not None:
+            runner.stop()
         logger.info("KeyRemapListener stopped")
 
 
@@ -1004,9 +1069,10 @@ class MultiHotkeyListener:
                 self._cancel_requested = False
             if cancel:
                 return
-            try:
-                self._on_release(name)
-            except Exception as e:
-                logger.error("on_release callback error: %s", e)
+            # Dispatch through the same single-worker executor as press so
+            # press/release ordering is preserved end-to-end: a release
+            # invoked directly from the tap thread could reach the asyncio
+            # loop before its own press and be dropped as a stray action.
+            _submit_callback(self._on_release, name)
         except Exception:
             logger.warning("_handle_release exception", exc_info=True)

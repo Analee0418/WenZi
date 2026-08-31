@@ -210,9 +210,9 @@ class TestRecorder:
 
     def test_current_level_after_rms_set(self):
         r = Recorder(sample_rate=16000, block_ms=20)
-        # RMS lives on the session: 500 → level = 500/800 = 0.625
+        # RMS lives on the session: 1500 → level = 1500/2400 = 0.625
         r._session = _TapSession()
-        r._session.rms = 500.0
+        r._session.rms = 1500.0
         assert abs(r.current_level - 0.625) < 0.01
 
     def test_current_level_capped_at_one(self):
@@ -624,6 +624,183 @@ class TestGenerationIsolation:
         r.start()
         assert r.is_recording is True
         r.stop()
+
+
+class TestArmedGate:
+    def test_start_unarmed_tap_discards_frames(self, monkeypatch):
+        """Unarmed frames (the start-sound window) must not reach rms,
+        buffers or on_chunk."""
+        _mock_engine(monkeypatch)
+        r = Recorder(sample_rate=16000, block_ms=20)
+        r._query_device_name_enabled = False
+        r.start(armed=False)
+        received: list = []
+        r.set_on_audio_chunk(lambda b: received.append(b))
+        buf = _voice_buffer()
+
+        r._tap_callback(buf, r._active_gen, 3.0, r._session)
+
+        assert r._session.queue.empty()
+        assert r._session.rms == 0.0
+        assert r._session.total_bytes == 0
+        assert not received
+        assert r.current_level == 0.0
+        r.stop()
+
+    def test_arm_opens_gate_for_buffers_and_chunks(self, monkeypatch):
+        _mock_engine(monkeypatch)
+        r = Recorder(sample_rate=16000, block_ms=20)
+        r._query_device_name_enabled = False
+        r.start(armed=False)
+        received: list = []
+        r.set_on_audio_chunk(lambda b: received.append(b))
+        buf = _voice_buffer()
+
+        r._tap_callback(buf, r._active_gen, 3.0, r._session)  # gated
+        r.arm()
+        r._tap_callback(buf, r._active_gen, 3.0, r._session)  # flows
+
+        assert r._session.queue.qsize() == 1
+        assert r._session.rms > 0.0
+        assert len(received) == 1
+        r.stop()
+
+    def test_start_default_is_armed(self, monkeypatch):
+        """Without the keyword the sequential behavior is unchanged."""
+        _mock_engine(monkeypatch)
+        r = Recorder(sample_rate=16000, block_ms=20)
+        r._query_device_name_enabled = False
+        r.start()
+        buf = _voice_buffer()
+
+        r._tap_callback(buf, r._active_gen, 3.0, r._session)
+
+        assert r._session.armed is True
+        assert r._session.queue.qsize() == 1
+        r.stop()
+
+    def test_arm_without_session_is_noop(self):
+        r = Recorder()
+        r.arm()  # must not raise
+        assert r.is_recording is False
+
+
+def _explicit_bind_mocks(monkeypatch, engine, uid="uid-1", dev_id=42):
+    """Route selection + id resolution mocks for an explicitly bound device."""
+    select = MagicMock(
+        return_value=_InputRoute(uid, "Selected Mic", None, True)
+    )
+    resolve = MagicMock(return_value=dev_id)
+    monkeypatch.setattr("wenzi.audio.recorder._select_input_route", select)
+    monkeypatch.setattr("wenzi.audio.recorder._resolve_device_id", resolve)
+    au = engine.inputNode.return_value.AUAudioUnit.return_value
+    au.setDeviceID_error_.return_value = True
+    au.deviceID.return_value = dev_id
+    return select, resolve
+
+
+class TestRouteCache:
+    def test_explicit_route_resolved_once_across_starts(self, monkeypatch):
+        engine = _mock_engine(monkeypatch)
+        select, resolve = _explicit_bind_mocks(monkeypatch, engine)
+        au = engine.inputNode.return_value.AUAudioUnit.return_value
+
+        r = Recorder(sample_rate=16000, block_ms=20, device="uid-1")
+        r._query_device_name_enabled = False
+        r.start()
+        assert r.is_recording is True
+        r.stop()
+        r.start()
+        assert r.is_recording is True
+        r.stop()
+
+        select.assert_called_once_with("uid-1")
+        resolve.assert_called_once_with("uid-1")
+        # The bind itself is re-verified on every start (stale-id guard)
+        assert au.setDeviceID_error_.call_count == 2
+
+    def test_automatic_route_never_cached(self, monkeypatch):
+        _mock_engine(monkeypatch)
+        select = MagicMock(
+            return_value=_InputRoute("test-uid", "TestMic", None, False)
+        )
+        monkeypatch.setattr("wenzi.audio.recorder._select_input_route", select)
+
+        r = Recorder(sample_rate=16000, block_ms=20)
+        r._query_device_name_enabled = False
+        r.start()
+        r.stop()
+        r.start()
+        r.stop()
+
+        assert select.call_count == 2
+        assert r._route_cache is None
+
+    def test_device_setter_invalidates_route_cache(self, monkeypatch):
+        engine = _mock_engine(monkeypatch)
+        select, resolve = _explicit_bind_mocks(monkeypatch, engine)
+
+        r = Recorder(sample_rate=16000, block_ms=20, device="uid-1")
+        r._query_device_name_enabled = False
+        r.start()
+        r.stop()
+        assert r._route_cache is not None
+
+        r.device = "uid-2"
+        assert r._route_cache is None
+        assert r.device == "uid-2"
+
+        r.start()
+        r.stop()
+        assert select.call_args_list[-1].args == ("uid-2",)
+
+    def test_config_change_invalidates_route_cache(self, monkeypatch):
+        engine = _mock_engine(monkeypatch)
+        _explicit_bind_mocks(monkeypatch, engine)
+
+        r = Recorder(sample_rate=16000, block_ms=20, device="uid-1")
+        r._query_device_name_enabled = False
+        r.start()
+        r.stop()
+        assert r._route_cache is not None
+
+        r._on_config_change()
+        assert r._route_cache is None
+
+    def test_start_failure_invalidates_route_cache(self, monkeypatch):
+        engine = _mock_engine(monkeypatch)
+        _explicit_bind_mocks(monkeypatch, engine)
+
+        r = Recorder(sample_rate=16000, block_ms=20, device="uid-1")
+        r._query_device_name_enabled = False
+        r.start()
+        r.stop()
+        assert r._route_cache is not None
+
+        engine.startAndReturnError_.return_value = (False, "boom")
+        assert r.start() is None
+        assert r._route_cache is None
+
+    def test_coreaudio_bindings_created_once(self, monkeypatch):
+        import ctypes.util
+
+        from wenzi.audio import recorder as recorder_module
+
+        monkeypatch.setattr(recorder_module, "_COREAUDIO_BINDINGS", None)
+        calls: list = []
+        real_find = ctypes.util.find_library
+
+        def _counting_find(name):
+            calls.append(name)
+            return real_find(name)
+
+        monkeypatch.setattr(ctypes.util, "find_library", _counting_find)
+
+        first = recorder_module._coreaudio_bindings()
+        second = recorder_module._coreaudio_bindings()
+
+        assert first is second
+        assert calls == ["CoreAudio", "CoreFoundation"]
 
 
 class TestRmsInt16:

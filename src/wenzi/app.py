@@ -1270,6 +1270,10 @@ class WenZiApp(StatusBarApp):
             self._sound_manager.warmup()
         except Exception:
             logger.debug("Sound warmup failed", exc_info=True)
+        try:
+            self._recording_indicator.prewarm()
+        except Exception:
+            logger.debug("Recording indicator warmup failed", exc_info=True)
         # ResultPreviewPanel warmup intentionally deferred to first show()
         # to avoid loading WebKit framework at startup (~8-12 MB).
         # _build_panel() handles the cold path transparently.

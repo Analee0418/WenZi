@@ -72,7 +72,7 @@ def mock_app(tmp_path):
     app._recorder.current_level = 0.5
     app._recorder.last_device_name = "MacBook Pro Microphone"
 
-    def _recorder_start():
+    def _recorder_start(*args, **kwargs):
         # Mirror the real contract: a successful start() flips is_recording
         app._recorder.is_recording = True
         return "MacBook Pro Microphone"
@@ -200,7 +200,8 @@ class TestSoundDelay:
 
         run(_test())
 
-        # Recorder should never have been started
+        # A quick tap must never touch the microphone — that keeps the
+        # reset instant and avoids any system-audio hiccup on press.
         mock_app._recorder.start.assert_not_called()
         # Overlay and indicator must be cleaned up
         mock_app._recording_indicator.hide.assert_called()
@@ -253,7 +254,7 @@ class TestSoundDelay:
 
         restart_seen = asyncio.Event()
 
-        def _start_side_effect():
+        def _start_side_effect(*a, **kw):
             restart_seen.set()
             mock_app._recorder.is_recording = True
             return None
@@ -272,6 +273,270 @@ class TestSoundDelay:
         run(_test())
 
         mock_app._recorder.start.assert_called()
+
+
+class TestWarmupStart:
+    """Tap grace + gated warm-up: a press that survives _TAP_GRACE_SECS
+    starts the mic concurrently with the rest of the sound window
+    (frames gated), so speech is captured from the window's end.  A tap
+    inside the grace never touches the engine."""
+
+    @patch("wenzi.controllers.recording_flow.capture_input_context", return_value=None)
+    @patch("PyObjCTools.AppHelper")
+    def test_tap_within_grace_never_touches_engine(
+        self, mock_ah, _mock_ic, flow, mock_app, monkeypatch
+    ):
+        mock_ah.callAfter = lambda fn, *a, **kw: fn(*a, **kw)
+        mock_app._sound_manager.enabled = True
+        monkeypatch.setattr(RecordingFlow, "_TAP_GRACE_SECS", 30.0)
+        monkeypatch.setattr(RecordingFlow, "_DELAYED_START_SECS", 60.0)
+
+        async def _test():
+            await flow._handle_press("fn")
+            await asyncio.sleep(0.05)
+            flow._actions.put_nowait(Action.RELEASE)
+            await flow._current_task
+
+        run(_test())
+
+        mock_app._recorder.start.assert_not_called()
+        mock_app._recorder.stop.assert_not_called()
+        mock_app._recording_indicator.hide.assert_called()
+        assert not flow.is_busy
+
+    @patch("wenzi.controllers.recording_flow.capture_input_context", return_value=None)
+    @patch("PyObjCTools.AppHelper")
+    def test_hold_past_grace_warms_mic_gated_during_guard(
+        self, mock_ah, _mock_ic, flow, mock_app, monkeypatch
+    ):
+        """After the grace, start() launches with armed=False while the
+        sound window is still pending."""
+        mock_ah.callAfter = lambda fn, *a, **kw: fn(*a, **kw)
+        mock_app._sound_manager.enabled = True
+        monkeypatch.setattr(RecordingFlow, "_TAP_GRACE_SECS", 0.02)
+        monkeypatch.setattr(RecordingFlow, "_DELAYED_START_SECS", 30.0)
+
+        async def _test():
+            started = asyncio.Event()
+            loop = asyncio.get_running_loop()
+
+            def _start(*a, **kw):
+                mock_app._recorder.is_recording = True
+                loop.call_soon_threadsafe(started.set)
+                return "MacBook Pro Microphone"
+
+            mock_app._recorder.start.side_effect = _start
+            await flow._handle_press("fn")
+            # The guard window (30s) is still pending — the start already
+            # ran concurrently with it.
+            await asyncio.wait_for(started.wait(), timeout=5.0)
+            assert flow.is_busy
+            flow._actions.put_nowait(Action.RELEASE)
+            await flow._current_task
+
+        run(_test())
+
+        assert mock_app._recorder.start.call_args.kwargs == {"armed": False}
+        mock_app._recorder.arm.assert_not_called()  # released before window end
+        mock_app._recorder.stop.assert_called_once()
+        assert mock_app._recorder.is_recording is False
+        mock_app._recording_indicator.hide.assert_called()
+        assert not flow.is_busy
+
+    @patch("wenzi.controllers.recording_flow.capture_input_context", return_value=None)
+    @patch("PyObjCTools.AppHelper")
+    def test_early_release_settles_inflight_start_and_stops_mic(
+        self, mock_ah, _mock_ic, flow, mock_app, monkeypatch
+    ):
+        """A RELEASE while start() is STILL RUNNING on the executor must
+        wait the start out and then close the mic via the single-flight
+        shutdown."""
+        mock_ah.callAfter = lambda fn, *a, **kw: fn(*a, **kw)
+        mock_app._sound_manager.enabled = True
+        monkeypatch.setattr(RecordingFlow, "_TAP_GRACE_SECS", 0.02)
+        monkeypatch.setattr(RecordingFlow, "_DELAYED_START_SECS", 30.0)
+
+        async def _test():
+            hold = threading.Event()
+            started = asyncio.Event()
+            loop = asyncio.get_running_loop()
+
+            def _start(*a, **kw):
+                loop.call_soon_threadsafe(started.set)
+                assert hold.wait(timeout=5)
+                mock_app._recorder.is_recording = True
+                return "MacBook Pro Microphone"
+
+            mock_app._recorder.start.side_effect = _start
+            await flow._handle_press("fn")
+            await asyncio.wait_for(started.wait(), timeout=5.0)
+            # start() is deterministically in flight (blocked on hold)
+            flow._actions.put_nowait(Action.RELEASE)
+            hold.set()
+            await flow._current_task
+
+        run(_test())
+
+        mock_app._recorder.stop.assert_called_once()
+        assert mock_app._recorder.is_recording is False
+        mock_app._recorder.arm.assert_not_called()
+        assert not flow.is_busy
+
+    @patch("wenzi.controllers.recording_flow.capture_input_context", return_value=None)
+    @patch("PyObjCTools.AppHelper")
+    def test_early_cancel_with_hung_start_marks_tainted(
+        self, mock_ah, _mock_ic, flow, mock_app, monkeypatch
+    ):
+        """When the in-flight start() hangs past _START_TIMEOUT, the early
+        cancel abandons it through the taint mechanism (exactly once)."""
+        mock_ah.callAfter = lambda fn, *a, **kw: fn(*a, **kw)
+        mock_app._sound_manager.enabled = True
+        monkeypatch.setattr(RecordingFlow, "_TAP_GRACE_SECS", 0.02)
+        monkeypatch.setattr(RecordingFlow, "_DELAYED_START_SECS", 30.0)
+        monkeypatch.setattr(RecordingFlow, "_START_TIMEOUT", 0.2)
+
+        hold = threading.Event()
+
+        async def _test():
+            started = asyncio.Event()
+            loop = asyncio.get_running_loop()
+
+            def _start(*a, **kw):
+                loop.call_soon_threadsafe(started.set)
+                hold.wait(timeout=5)
+                return None  # abandoned: the recorder never commits
+
+            mock_app._recorder.start.side_effect = _start
+            await flow._handle_press("fn")
+            await asyncio.wait_for(started.wait(), timeout=5.0)
+            flow._actions.put_nowait(Action.CANCEL)
+            await flow._current_task
+            hold.set()  # let the executor thread finish
+
+        run(_test())
+
+        mock_app._recorder.mark_tainted.assert_called_once()
+        mock_app._recorder.stop.assert_not_called()
+        mock_app._recording_indicator.hide.assert_called()
+        assert not flow.is_busy
+
+    @patch("wenzi.controllers.recording_flow.capture_input_context", return_value=None)
+    @patch("PyObjCTools.AppHelper")
+    def test_arm_after_commit_and_before_streaming_attach(
+        self, mock_ah, _mock_ic, flow, mock_app, monkeypatch
+    ):
+        """Gate order on the happy path: start commits → arm opens the
+        gate → indicator activates → streaming attaches.  Gated frames
+        can therefore never reach a streaming backend."""
+        mock_ah.callAfter = lambda fn, *a, **kw: fn(*a, **kw)
+        mock_app._sound_manager.enabled = True
+        monkeypatch.setattr(RecordingFlow, "_TAP_GRACE_SECS", 0.02)
+        monkeypatch.setattr(RecordingFlow, "_DELAYED_START_SECS", 0.1)
+        mock_app._transcriber.supports_streaming = True
+        mock_app._transcriber.stop_streaming.return_value = (
+            f"[mock from {_FILE}::test_arm_after_commit]"
+        )
+        order: list[str] = []
+
+        def _start(*a, **kw):
+            order.append("start")
+            mock_app._recorder.is_recording = True
+            return "MacBook Pro Microphone"
+
+        mock_app._recorder.start.side_effect = _start
+        mock_app._recorder.arm.side_effect = lambda: order.append("arm")
+        mock_app._recording_indicator.set_recording_active.side_effect = (
+            lambda: order.append("active")
+        )
+
+        async def _test():
+            attached = asyncio.Event()
+
+            def _attach(cb):
+                order.append("attach")
+                attached.set()
+
+            mock_app._recorder.set_on_audio_chunk.side_effect = _attach
+
+            await flow._handle_press("fn")
+            # Streaming attach ⇒ the sound window elapsed and arm() ran;
+            # only then may the RELEASE be delivered.
+            await asyncio.wait_for(attached.wait(), timeout=5.0)
+            flow._actions.put_nowait(Action.RELEASE)
+            await flow._current_task
+
+        run(_test())
+
+        assert order == ["start", "arm", "active", "attach"]
+        assert mock_app._recorder.start.call_args.kwargs == {"armed": False}
+
+    @patch("wenzi.controllers.recording_flow.capture_input_context", return_value=None)
+    @patch("PyObjCTools.AppHelper")
+    def test_sound_disabled_starts_armed_without_guard(
+        self, mock_ah, _mock_ic, flow, mock_app, mock_type_text
+    ):
+        """With sound feedback off there is no guard window: start() runs
+        armed and audio flows immediately."""
+        mock_ah.callAfter = lambda fn, *a, **kw: fn(*a, **kw)
+        mock_app._sound_manager.enabled = False
+        _text = f"[mock from {_FILE}::test_sound_disabled_starts_armed]"
+        mock_app._transcriber.transcribe.return_value = _text
+
+        async def _test():
+            await flow._handle_press("fn")
+            await asyncio.sleep(0.05)
+            flow._actions.put_nowait(Action.RELEASE)
+            await flow._current_task
+
+        run(_test())
+
+        assert mock_app._recorder.start.call_args.kwargs == {"armed": True}
+        mock_app._recorder.arm.assert_called_once()
+        mock_type_text.assert_called_once_with(
+            _text, append_newline=False, method="type"
+        )
+
+    @patch("wenzi.controllers.recording_flow.capture_input_context", return_value=None)
+    @patch("PyObjCTools.AppHelper")
+    def test_session_exception_while_start_inflight_still_closes_mic(
+        self, mock_ah, _mock_ic, flow, mock_app, monkeypatch
+    ):
+        """A crash between launching start() and awaiting it must settle
+        the in-flight start and close the mic it opened."""
+        mock_ah.callAfter = lambda fn, *a, **kw: fn(*a, **kw)
+        mock_app._sound_manager.enabled = True
+        monkeypatch.setattr(RecordingFlow, "_TAP_GRACE_SECS", 0.02)
+        monkeypatch.setattr(RecordingFlow, "_DELAYED_START_SECS", 30.0)
+
+        async def _test():
+            hold = threading.Event()
+            started = asyncio.Event()
+            loop = asyncio.get_running_loop()
+
+            def _start(*a, **kw):
+                loop.call_soon_threadsafe(started.set)
+                assert hold.wait(timeout=5)
+                mock_app._recorder.is_recording = True
+                return "MacBook Pro Microphone"
+
+            mock_app._recorder.start.side_effect = _start
+            # Grace passes normally; the warm-up-phase wait crashes while
+            # the start is still in flight.
+            monkeypatch.setattr(
+                flow, "_wait_action",
+                AsyncMock(side_effect=[None, RuntimeError("boom")]),
+            )
+            await flow._handle_press("fn")
+            await asyncio.wait_for(started.wait(), timeout=5.0)
+            hold.set()
+            await flow._current_task
+
+        run(_test())
+
+        mock_app._recorder.stop.assert_called_once()
+        assert mock_app._recorder.is_recording is False
+        mock_app._recording_indicator.hide.assert_called()
+        assert not flow.is_busy
 
 
 class TestQuickRelease:
@@ -496,6 +761,75 @@ class TestRecordAndRelease:
         mock_app._set_status.assert_any_call("statusbar.status.empty")
 
 
+class TestReleaseHidesIndicatorImmediately:
+    @patch("wenzi.controllers.recording_flow.capture_input_context", return_value=None)
+    @patch("PyObjCTools.AppHelper")
+    def test_release_hides_indicator_before_audio_shutdown(
+        self, mock_ah, _mock_ic, flow, mock_app
+    ):
+        """The orb must vanish at the moment of release — not after the
+        blocking recorder.stop() (which takes ~0.3s of engine teardown)."""
+        mock_ah.callAfter = lambda fn, *a, **kw: fn(*a, **kw)
+        mock_app._sound_manager.enabled = False
+        _text = f"[mock from {_FILE}::test_release_hides_indicator]"
+        mock_app._transcriber.transcribe.return_value = _text
+        order: list[str] = []
+        mock_app._recording_indicator.hide.side_effect = (
+            lambda: order.append("hide")
+        )
+
+        def _stop():
+            order.append("stop")
+            mock_app._recorder.is_recording = False
+            return b"fake_wav_data"
+
+        mock_app._recorder.stop.side_effect = _stop
+
+        async def _test():
+            await flow._handle_press("fn")
+            await asyncio.sleep(0.05)
+            flow._actions.put_nowait(Action.RELEASE)
+            await flow._current_task
+
+        run(_test())
+
+        assert "hide" in order and "stop" in order
+        assert order.index("hide") < order.index("stop")
+
+    @patch("wenzi.scripting.api.alert.alert")
+    @patch("wenzi.controllers.recording_flow.capture_input_context", return_value=None)
+    @patch("PyObjCTools.AppHelper")
+    def test_empty_recording_still_hides_indicator_at_release(
+        self, mock_ah, _mock_ic, _mock_alert, flow, mock_app
+    ):
+        """The empty-recording path must not keep the orb up while the
+        engine tears down."""
+        mock_ah.callAfter = lambda fn, *a, **kw: fn(*a, **kw)
+        mock_app._sound_manager.enabled = False
+        order: list[str] = []
+        mock_app._recording_indicator.hide.side_effect = (
+            lambda: order.append("hide")
+        )
+
+        def _stop_empty():
+            order.append("stop")
+            mock_app._recorder.is_recording = False
+            return None
+
+        mock_app._recorder.stop.side_effect = _stop_empty
+
+        async def _test():
+            await flow._handle_press("fn")
+            await asyncio.sleep(0.05)
+            flow._actions.put_nowait(Action.RELEASE)
+            await flow._current_task
+
+        run(_test())
+
+        assert order.index("hide") < order.index("stop")
+        assert not flow.is_busy
+
+
 class TestCancel:
     @patch("wenzi.controllers.recording_flow.capture_input_context", return_value=None)
     @patch("PyObjCTools.AppHelper")
@@ -562,7 +896,7 @@ class TestRestart:
 
         call_count = [0]
 
-        def counting_start():
+        def counting_start(*a, **kw):
             call_count[0] += 1
             mock_app._recorder.is_recording = True
             return "mic"
@@ -798,8 +1132,8 @@ class TestStartTimeout:
         mock_app._sound_manager.enabled = False
         monkeypatch.setattr(RecordingFlow, "_START_TIMEOUT", 0.1)
 
-        def hanging_start():
-            # Block until cancelled — simulates a hung PortAudio call
+        def hanging_start(*a, **kw):
+            # Block until cancelled — simulates a hung AVFoundation call
             import time
             time.sleep(5)
 
@@ -1059,7 +1393,7 @@ class TestStartFailure:
         mock_ah.callAfter = lambda fn, *a, **kw: fn(*a, **kw)
         mock_app._sound_manager.enabled = False
         # start() "fails": returns None without flipping is_recording
-        mock_app._recorder.start.side_effect = lambda: None
+        mock_app._recorder.start.side_effect = lambda *a, **kw: None
 
         flow.on_press("fn")
         flow.send_action(Action.RELEASE)  # released during startup

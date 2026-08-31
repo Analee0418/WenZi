@@ -76,6 +76,12 @@ class RecordingFlow:
     """Coroutine-based controller for the hotkey → record → output flow."""
 
     _DELAYED_START_SECS = 0.35
+    # A press shorter than this is a tap (cancel/abort): the engine is
+    # never touched, so taps reset instantly and cause no system-audio
+    # reconfiguration.  A press that survives the grace is a real
+    # recording: the mic warms up (gated) during the rest of the sound
+    # window so speech is captured from the moment the window ends.
+    _TAP_GRACE_SECS = 0.15
     _START_TIMEOUT = 5.0  # seconds to wait for Recorder.start()
 
     def __init__(self, app: WenZiApp) -> None:
@@ -103,6 +109,11 @@ class RecordingFlow:
         # Single-flight audio-shutdown task, one per recording session:
         # recorder stop + streaming cleanup run at most once, serialized.
         self._audio_shutdown_task: asyncio.Task | None = None
+        # In-flight recorder.start() executor future.  Non-None only
+        # between launching the start and awaiting it; every path that
+        # leaves that window must go through _settle_pending_start() —
+        # a dropped future would leave the microphone open.
+        self._pending_start: asyncio.Future | None = None
 
     # ------------------------------------------------------------------
     # Public properties
@@ -315,23 +326,15 @@ class RecordingFlow:
             if app._transcriber.supports_streaming:
                 AppHelper.callAfter(self._show_live_overlay, False)
 
-            # ② Sound delay — listen for early cancel/release/restart/history
-            if app._sound_manager.enabled:
-                action = await self._wait_action(
-                    Action.RELEASE, Action.CANCEL,
-                    Action.RESTART, Action.PREVIEW_HISTORY,
-                    timeout=self._DELAYED_START_SECS,
-                )
-                if action in (Action.CANCEL, Action.RELEASE):
-                    AppHelper.callAfter(self._reset_to_idle)
-                    return
-                elif action == Action.PREVIEW_HISTORY:
-                    AppHelper.callAfter(self._reset_and_show_preview)
-                    return
-                elif action == Action.RESTART:
-                    raise _RestartSession(key_name)
-
-            # ③ Start recording (blocking I/O → executor)
+            # ② Sound delay, split in two phases.  Tap grace: the engine
+            # is untouched, so a quick tap resets instantly with no
+            # engine churn and no system-audio hiccup.  Warm-up: the
+            # press is a real recording — the mic starts CONCURRENTLY
+            # with the rest of the window, gated so the start sound is
+            # never captured, and speech is caught from the first
+            # syllable after the window instead of after a full engine
+            # spin-up.  Orphan check first: a leftover engine must stop
+            # before any new start touches the hardware.
             if app._recorder.is_recording:
                 logger.warning(
                     "Recorder unexpectedly active, "
@@ -341,11 +344,42 @@ class RecordingFlow:
                     None, app._recorder.stop
                 )
 
+            if app._sound_manager.enabled:
+                action = await self._wait_action(
+                    Action.RELEASE, Action.CANCEL,
+                    Action.RESTART, Action.PREVIEW_HISTORY,
+                    timeout=self._TAP_GRACE_SECS,
+                )
+                if action is None:
+                    self._launch_recorder_start(armed=False)
+                    action = await self._wait_action(
+                        Action.RELEASE, Action.CANCEL,
+                        Action.RESTART, Action.PREVIEW_HISTORY,
+                        timeout=(
+                            self._DELAYED_START_SECS - self._TAP_GRACE_SECS
+                        ),
+                    )
+                    if action is not None:
+                        # The orb must vanish at the release, not after
+                        # the in-flight start has been settled below.
+                        AppHelper.callAfter(app._recording_indicator.hide)
+                        await self._settle_pending_start()
+                if action in (Action.CANCEL, Action.RELEASE):
+                    AppHelper.callAfter(self._reset_to_idle)
+                    return
+                elif action == Action.PREVIEW_HISTORY:
+                    AppHelper.callAfter(self._reset_and_show_preview)
+                    return
+                elif action == Action.RESTART:
+                    raise _RestartSession(key_name)
+
+            # ③ Await the warm-up start, or start now (no sound guard)
+            start_future = self._pending_start
+            if start_future is None:
+                start_future = self._launch_recorder_start(armed=True)
             try:
                 dev_name = await asyncio.wait_for(
-                    self._loop.run_in_executor(
-                        None, app._recorder.start
-                    ),
+                    asyncio.shield(start_future),
                     timeout=self._START_TIMEOUT,
                 )
             except TimeoutError:
@@ -354,6 +388,9 @@ class RecordingFlow:
                     "aborting session",
                     self._START_TIMEOUT,
                 )
+                # Clear before tainting: the taint path owns the teardown
+                # of the abandoned start, settling it again is pointless.
+                self._pending_start = None
                 app._recorder.mark_tainted()
                 AppHelper.callAfter(self._reset_to_idle)
                 return
@@ -361,8 +398,10 @@ class RecordingFlow:
                 # e.g. a concurrent start() in flight, or engine creation
                 # blowing up before the recorder could handle it.
                 logger.exception("Recorder.start() failed, aborting session")
+                self._pending_start = None
                 AppHelper.callAfter(self._reset_to_idle)
                 return
+            self._pending_start = None
             if not app._recorder.is_recording:
                 # start() reports engine/finalization failures by returning
                 # without recording — never show a live recording UI while
@@ -374,6 +413,9 @@ class RecordingFlow:
                 alert(t("alert.recording.start_failed"), duration=3.0)
                 AppHelper.callAfter(self._reset_to_idle)
                 return
+            # Sound window over and start committed: audio may flow now.
+            # A no-op when the session started armed (sound disabled).
+            app._recorder.arm()
             if dev_name and app._recording_indicator.show_device_name:
                 AppHelper.callAfter(
                     app._recording_indicator.update_device_name, dev_name
@@ -431,6 +473,10 @@ class RecordingFlow:
             # finalizes inside the same single-flight shutdown task: with
             # a non-empty wav it stops for the final text, otherwise it
             # cancels.
+            # The orb disappears NOW: keeping it up while recorder.stop()
+            # blocks (~0.3s of engine teardown) reads as the app lagging
+            # behind the key release.
+            AppHelper.callAfter(app._recording_indicator.hide)
             self._cancel_subtasks()
 
             wav_data, stream_text = await asyncio.shield(
@@ -460,9 +506,6 @@ class RecordingFlow:
                 alert(t("alert.recording.empty"), duration=2.0)
                 AppHelper.callAfter(self._reset_to_idle)
                 return
-
-            # Indicate we are busy processing (keep indicator alive for animation)
-            AppHelper.callAfter(self._stop_indicator, True)
 
             # ⑥ Transcribe (or defer to preview/direct for background STT)
             effective_preview = app._preview_enabled and not self._no_preview_override
@@ -527,6 +570,7 @@ class RecordingFlow:
             )
             return
         except asyncio.CancelledError:
+            await self._settle_pending_start()
             await self._cleanup_session_audio(streaming)
             self._cancel_subtasks()
             AppHelper.callAfter(self._reset_to_idle)
@@ -534,6 +578,7 @@ class RecordingFlow:
             logger.exception("Recording session failed")
             # Never leave the microphone or a streaming session open
             # behind a reset UI.
+            await self._settle_pending_start()
             await self._cleanup_session_audio(streaming)
             self._cancel_subtasks()
             AppHelper.callAfter(self._reset_to_idle)
@@ -1341,6 +1386,46 @@ class RecordingFlow:
                 raise primary_exc
             return None
 
+    def _launch_recorder_start(self, *, armed: bool) -> asyncio.Future:
+        """Launch recorder.start() on the executor and track the future."""
+        app = self._app
+        self._pending_start = asyncio.ensure_future(
+            self._loop.run_in_executor(
+                None, lambda: app._recorder.start(armed=armed)
+            )
+        )
+        return self._pending_start
+
+    async def _settle_pending_start(self) -> None:
+        """Await an in-flight recorder.start() and close the mic it opened.
+
+        Cancelling the future cannot stop the executor thread, so the
+        start is either awaited to completion (then shut down through the
+        session's single-flight path) or abandoned via the same taint
+        mechanism the start-timeout path uses.  No-op when no start is
+        pending.
+        """
+        fut, self._pending_start = self._pending_start, None
+        if fut is None:
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(fut), timeout=self._START_TIMEOUT
+            )
+        except TimeoutError:
+            self._app._recorder.mark_tainted()
+            return
+        except Exception:
+            # start() raised before touching the hardware (e.g. a
+            # concurrent start in flight); nothing to close.
+            return
+        if self._app._recorder.is_recording:
+            # streaming=False is accurate here: streaming only attaches
+            # after arm(), which never ran for a pending start.
+            await asyncio.shield(
+                self._ensure_audio_shutdown(False, cancel=True)
+            )
+
     async def _cleanup_session_audio(self, streaming: bool) -> None:
         """Best-effort abort cleanup via the single-flight shutdown task.
 
@@ -1412,14 +1497,6 @@ class RecordingFlow:
             LiveTranscriptionOverlay.close_all()
             self._live_overlay = None
         AppHelper.callAfter(_close)
-
-    def _stop_indicator(self, animate: bool = False) -> None:
-        """Stop level polling and optionally hide the indicator."""
-        from PyObjCTools import AppHelper
-
-        self._cancel_level_task()
-        if not animate:
-            AppHelper.callAfter(self._app._recording_indicator.hide)
 
     def _reset_to_idle(self) -> None:
         """Common cleanup: hide overlays/indicator and restore idle status."""

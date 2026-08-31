@@ -154,48 +154,66 @@ def automatic_input_device_name() -> str | None:
         return None
 
 
+_COREAUDIO_BINDINGS = None
+
+
+def _coreaudio_bindings():
+    """Load CoreAudio/CoreFoundation via ctypes once per process.
+
+    ``find_library`` walks the dyld search paths — too slow to repeat on
+    every recording start.  Assignment is idempotent, so a benign race
+    between two first callers needs no lock.
+    """
+    global _COREAUDIO_BINDINGS
+    if _COREAUDIO_BINDINGS is None:
+        import ctypes
+        import ctypes.util
+
+        # AudioObjectPropertyAddress
+        class _Addr(ctypes.Structure):
+            _fields_ = [
+                ("mSelector", ctypes.c_uint32),
+                ("mScope", ctypes.c_uint32),
+                ("mElement", ctypes.c_uint32),
+            ]
+
+        ca = ctypes.cdll.LoadLibrary(ctypes.util.find_library("CoreAudio"))
+        ca.AudioObjectGetPropertyDataSize.restype = ctypes.c_int32
+        ca.AudioObjectGetPropertyDataSize.argtypes = [
+            ctypes.c_uint32, ctypes.POINTER(_Addr),
+            ctypes.c_uint32, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32),
+        ]
+        ca.AudioObjectGetPropertyData.restype = ctypes.c_int32
+        ca.AudioObjectGetPropertyData.argtypes = [
+            ctypes.c_uint32, ctypes.POINTER(_Addr),
+            ctypes.c_uint32, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_void_p,
+        ]
+
+        cf = ctypes.cdll.LoadLibrary(ctypes.util.find_library("CoreFoundation"))
+        cf.CFStringGetLength.restype = ctypes.c_long
+        cf.CFStringGetLength.argtypes = [ctypes.c_void_p]
+        cf.CFStringGetCString.restype = ctypes.c_bool
+        cf.CFStringGetCString.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32,
+        ]
+        cf.CFRelease.restype = None
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+
+        _COREAUDIO_BINDINGS = (ca, cf, _Addr)
+    return _COREAUDIO_BINDINGS
+
+
 def _resolve_device_id(uid: str) -> int | None:
     """Find the CoreAudio AudioDeviceID for an AVCaptureDevice UID.
 
     AVAudioEngine's input node uses CoreAudio device IDs internally.
-    We bridge from AVCaptureDevice UID → AudioDeviceID via the
-    ``transportType`` + private ``_audioDeviceID`` selector, falling
-    back to a CoreAudio property lookup.
+    We bridge from AVCaptureDevice UID → AudioDeviceID via a CoreAudio
+    property lookup over all audio objects.
     """
     import ctypes
-    import ctypes.util
 
-    _ca = ctypes.cdll.LoadLibrary(ctypes.util.find_library("CoreAudio"))
-
-    # AudioObjectPropertyAddress
-    class _Addr(ctypes.Structure):
-        _fields_ = [
-            ("mSelector", ctypes.c_uint32),
-            ("mScope", ctypes.c_uint32),
-            ("mElement", ctypes.c_uint32),
-        ]
-
-    _ca.AudioObjectGetPropertyDataSize.restype = ctypes.c_int32
-    _ca.AudioObjectGetPropertyDataSize.argtypes = [
-        ctypes.c_uint32, ctypes.POINTER(_Addr),
-        ctypes.c_uint32, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32),
-    ]
-    _ca.AudioObjectGetPropertyData.restype = ctypes.c_int32
-    _ca.AudioObjectGetPropertyData.argtypes = [
-        ctypes.c_uint32, ctypes.POINTER(_Addr),
-        ctypes.c_uint32, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32),
-        ctypes.c_void_p,
-    ]
-
-    _cf = ctypes.cdll.LoadLibrary(ctypes.util.find_library("CoreFoundation"))
-    _cf.CFStringGetLength.restype = ctypes.c_long
-    _cf.CFStringGetLength.argtypes = [ctypes.c_void_p]
-    _cf.CFStringGetCString.restype = ctypes.c_bool
-    _cf.CFStringGetCString.argtypes = [
-        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32,
-    ]
-    _cf.CFRelease.restype = None
-    _cf.CFRelease.argtypes = [ctypes.c_void_p]
+    _ca, _cf, _Addr = _coreaudio_bindings()
 
     kSys = 1  # kAudioObjectSystemObject
     kDevs = 0x64657623  # 'dev#'
@@ -242,13 +260,17 @@ class _TapSession:
     one's shared state.
     """
 
-    __slots__ = ("queue", "total_bytes", "rms", "on_chunk")
+    __slots__ = ("queue", "total_bytes", "rms", "on_chunk", "armed")
 
-    def __init__(self) -> None:
+    def __init__(self, armed: bool = True) -> None:
         self.queue: queue.Queue[bytes] = queue.Queue()
         self.total_bytes = 0
         self.rms = 0.0
         self.on_chunk = None
+        # While False the tap discards every frame (see Recorder.arm()):
+        # the engine can spin up during the start-sound guard window
+        # without the sound leaking into the recording.
+        self.armed = armed
 
 
 class Recorder:
@@ -258,8 +280,11 @@ class Recorder:
     # Typical quiet room noise is ~100-300, speech is ~1000+.
     DEFAULT_SILENCE_RMS = 20
     # Reference RMS for normalizing current_level to 0.0-1.0 range.
-    # Normal speech (~1000-3000 RMS) maps to roughly 0.5-1.0.
-    _LEVEL_REFERENCE_RMS = 800.0
+    # Normal speech (~1000-3000 RMS) maps to roughly 0.4-1.0.  The
+    # reference must sit ABOVE typical speech peaks: a lower value
+    # clips speech flat at 1.0, erasing the syllable modulation the
+    # recording indicator's wave detector runs on.
+    _LEVEL_REFERENCE_RMS = 2400.0
     # Max seconds _starting may remain True before it is considered stuck
     # and forcibly reset, allowing a new start() to proceed.
     _STARTING_STALE_SECS = 10.0
@@ -274,9 +299,14 @@ class Recorder:
     ) -> None:
         self.sample_rate = sample_rate
         self.block_ms = block_ms
-        self.device = device
+        self._device = device
         self.max_session_bytes = max_session_bytes
         self.silence_rms = silence_rms
+        # Cached (configured_uid, route, dev_id) from the last committed
+        # start() with an explicitly configured device.  Automatic routes
+        # are never cached: between sessions no engine (and thus no
+        # config-change observer) exists to notice a default-device change.
+        self._route_cache: tuple[str, _InputRoute, int] | None = None
 
         self._queue: queue.Queue[bytes] = queue.Queue()
         self._engine: AVAudioEngine | None = None
@@ -304,6 +334,17 @@ class Recorder:
         self._config_observer = None
 
     @property
+    def device(self) -> str | None:
+        """Configured input device UID, or None for automatic routing."""
+        return self._device
+
+    @device.setter
+    def device(self, value: str | None) -> None:
+        self._device = value
+        # The cached route belongs to the previous device choice.
+        self._invalidate_route_cache()
+
+    @property
     def is_recording(self) -> bool:
         return self._recording
 
@@ -316,16 +357,22 @@ class Recorder:
     def current_level(self) -> float:
         """Return current audio level normalized to 0.0-1.0.
 
-        Uses ``_LEVEL_REFERENCE_RMS`` (800) as reference so normal
-        speech (~1000-3000 RMS) maps to roughly 0.5-1.0.
+        Uses ``_LEVEL_REFERENCE_RMS`` (2400) as reference so normal
+        speech (~1000-3000 RMS) maps to roughly 0.4-1.0 without
+        clipping its syllable modulation flat.
         """
         session = self._session
         if session is None:
             return 0.0
         return min(1.0, session.rms / self._LEVEL_REFERENCE_RMS)
 
-    def start(self) -> str | None:
+    def start(self, *, armed: bool = True) -> str | None:
         """Start recording. Returns the input device name, or None.
+
+        With ``armed=False`` the engine runs but the tap discards every
+        frame until :meth:`arm` is called — used to warm the microphone
+        up during the start-sound guard window without capturing the
+        sound itself.
 
         Engine creation happens **outside** the lock so that a hung
         AVFoundation call cannot deadlock subsequent ``stop()`` /
@@ -362,14 +409,26 @@ class Recorder:
         engine = None
         try:
             configured_device = self.device
-            route = _select_input_route(configured_device)
+            cached = self._route_cache
+            if cached is not None and cached[0] == configured_device:
+                # A stale cached dev_id (device replugged between
+                # sessions) fails the setDeviceID verification below,
+                # which invalidates the cache — the retry re-resolves.
+                route, cached_dev_id = cached[1], cached[2]
+            else:
+                route = _select_input_route(configured_device)
+                cached_dev_id = None
             engine = AVAudioEngine.alloc().init()
             input_node = engine.inputNode()
 
             if route.bind:
                 if not route.uid:
                     raise RuntimeError("Selected input device has no UID")
-                dev_id = _resolve_device_id(route.uid)
+                dev_id = (
+                    cached_dev_id
+                    if cached_dev_id is not None
+                    else _resolve_device_id(route.uid)
+                )
                 if dev_id is None:
                     raise RuntimeError(
                         f"Input device uid={route.uid!r} was not found"
@@ -406,7 +465,7 @@ class Recorder:
             # tap closure: audio, rms, byte counts and the chunk callback
             # of a zombie engine can only ever land in its own session —
             # never a newer one's.
-            session = _TapSession()
+            session = _TapSession(armed=armed)
 
             # Install tap on input node at its native format; resampling
             # happens in _tap_callback with the closure-captured ratio.
@@ -424,6 +483,7 @@ class Recorder:
             ok, err = engine.startAndReturnError_(None)
             if not ok:
                 logger.error("AVAudioEngine start failed: %s", err)
+                self._invalidate_route_cache()
                 self._teardown_engine(engine, None)
                 with self._lock:
                     if gen == self._start_gen:
@@ -432,6 +492,7 @@ class Recorder:
 
         except Exception:
             logger.error("Failed to create audio engine", exc_info=True)
+            self._invalidate_route_cache()
             # The tap may already be installed or the engine started —
             # tear down whatever exists so the mic cannot stay open.
             if engine is not None:
@@ -471,6 +532,8 @@ class Recorder:
                     self._starting_since = None
                     self._last_device_name = device_name
                     self._config_observer = observer
+                    if configured_device and route.bind and dev_id is not None:
+                        self._route_cache = (configured_device, route, dev_id)
                     logger.info(
                         "Recording started (sr=%d, hw=%.0f Hz, device=%s)",
                         self.sample_rate,
@@ -493,8 +556,21 @@ class Recorder:
             "start() did not commit (abandoned/superseded/failed); "
             "tearing down engine"
         )
+        self._invalidate_route_cache()
         self._teardown_engine(engine, observer)
         return None
+
+    def arm(self) -> None:
+        """Open the sound-feedback gate on the committed session.
+
+        Contract: only call after start() has returned with
+        ``is_recording`` True — the committed session is then the one
+        the caller warmed up.  Arming earlier would silently record
+        nothing (there is no session yet to arm).
+        """
+        session = self._session
+        if session is not None:
+            session.armed = True
 
     def stop(self) -> bytes | None:
         """Stop recording and return WAV data as bytes, or None if nothing recorded."""
@@ -605,6 +681,12 @@ class Recorder:
         try:
             if not self._recording or gen != self._active_gen:
                 return
+            if not session.armed:
+                # Sound-guard window: these frames contain the start
+                # sound and must not reach rms, the buffers or on_chunk.
+                # Plain attribute read — GIL-atomic against arm()'s
+                # write; one boundary frame either way is fine.
+                return
 
             in_frames = buffer.frameLength()
             if in_frames == 0:
@@ -701,9 +783,13 @@ class Recorder:
             except Exception as e:
                 logger.warning("Error removing observer: %s", e)
 
+    def _invalidate_route_cache(self) -> None:
+        self._route_cache = None
+
     def _on_config_change(self) -> None:
         """Handle AVAudioEngine configuration change (device added/removed)."""
         logger.info("Audio engine configuration changed")
+        self._invalidate_route_cache()
         # If not recording, nothing to do — next start() creates a fresh engine.
         # If recording, the engine has already stopped; we cannot seamlessly
         # restart mid-session without losing audio.  Log it and let the

@@ -1,40 +1,111 @@
-"""Tests for the lightweight recording orb."""
+"""Tests for the lightweight recording indicator (black hole)."""
 
 import math
-import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+import wenzi.audio.recording_indicator as ri
 from wenzi.audio.recording_indicator import (
-    _CORONA_POINT_COUNT,
-    _CORONA_STROKE_WIDTHS,
+    _ACTIVITY_HANDOFF_DURATION,
+    _BH_CENTER_X,
+    _BH_CENTER_Y,
+    _DISK_BAND_RADIUS,
+    _DISK_BAND_SQUASH,
+    _DISK_FIRE_EMBER_STOP,
+    _DISK_FIRE_RADIUS,
+    _DISK_POINT_COUNT,
+    _DISK_STREAK_WIDTHS,
+    _DOME_BOTTOM_INNER_STOP,
+    _DOME_BOTTOM_JITTER_X,
+    _DOME_BOTTOM_JITTER_X_RATE,
+    _DOME_BOTTOM_JITTER_Y,
+    _DOME_BOTTOM_RADIUS,
+    _DOME_BOTTOM_SQUASH,
+    _DOME_BOTTOM_WOBBLE,
+    _DOME_LEVEL_GAIN,
+    _DOME_PULSE,
+    _DOME_PULSE_B,
+    _DOME_PULSE_RATE,
+    _DOME_PULSE_RATE_B,
+    _DOME_TOP_INNER_STOP,
+    _DOME_TOP_RADIUS,
+    _DOME_TOP_SQUASH,
+    _DOME_WOBBLE,
     _ENTRY_DURATION,
-    _ORB_CENTER_X,
-    _ORB_CENTER_Y,
-    _OUTLINE_POINT_COUNT,
+    _ENTRY_SCALE_FROM,
+    _EXIT_DURATION,
+    _EXIT_SCALE_TO,
+    _FLOW_BASE_SPEED,
+    _FLOW_LEVEL_GAIN,
+    _INFALL_RATE,
     _PANEL_CENTER_X,
     _PANEL_CENTER_Y,
     _PANEL_HEIGHT,
     _PANEL_WIDTH,
-    _WAVE_BASE_Y,
-    _WAVE_CLIP_HEIGHT,
-    _WAVE_OFFSETS,
-    _WAVE_POINT_COUNT,
-    _WAVE_STROKE_WIDTHS,
+    _REFRESH_INTERVAL,
+    _RIM_RADIUS,
+    _SCREEN_VERTICAL_BIAS,
+    _SHADOW_CORE_STOP,
+    _SHADOW_LEVEL_GAIN,
+    _SHADOW_RADIUS,
     RecordingIndicatorPanel,
     RecordingIndicatorView,
-    _corona_points,
-    _entry_scale,
-    _exit_scale,
+    _center_scale_transform,
+    _disk_points,
     _gravity_pull,
-    _halo_radius,
-    _orb_outline_points,
-    _orb_scale,
-    _rim_widths,
-    _wave_points,
+    _handoff_activity,
 )
+
+# The module binds its PyObjC symbols at import time; tests replace the
+# bound names with fake namespaces instead of patching sys.modules.
+_APPKIT_NAMES = (
+    "NSAnimationContext",
+    "NSBezierPath",
+    "NSColor",
+    "NSColorSpace",
+    "NSGradient",
+    "NSGraphicsContext",
+    "NSPanel",
+    "NSRectClip",
+    "NSScreen",
+    "NSStatusWindowLevel",
+)
+_FOUNDATION_NAMES = (
+    "NSMakePoint",
+    "NSMakeRect",
+    "NSRunLoop",
+    "NSRunLoopCommonModes",
+    "NSTimer",
+    "NSValue",
+)
+_QUARTZ_NAMES = (
+    "CABasicAnimation",
+    "CAMediaTimingFunction",
+    "CATransform3DMakeTranslation",
+    "CATransform3DScale",
+    "CATransform3DTranslate",
+    "kCAFillModeForwards",
+    "kCAMediaTimingFunctionEaseIn",
+    "kCAMediaTimingFunctionEaseOut",
+)
+
+
+def _install_fake_native(monkeypatch):
+    """Bind the module's native names to fake AppKit/Foundation/Quartz."""
+    appkit = MagicMock(name="AppKit")
+    appkit.NSStatusWindowLevel = 100
+    foundation = MagicMock(name="Foundation")
+    quartz = MagicMock(name="Quartz")
+    for name in _APPKIT_NAMES:
+        monkeypatch.setattr(ri, name, getattr(appkit, name))
+    for name in _FOUNDATION_NAMES:
+        monkeypatch.setattr(ri, name, getattr(foundation, name))
+    for name in _QUARTZ_NAMES:
+        monkeypatch.setattr(ri, name, getattr(quartz, name))
+    monkeypatch.setattr(ri, "_IndicatorNSView", appkit._IndicatorNSView)
+    return appkit, foundation, quartz
 
 
 def _average_distance(first, second):
@@ -71,61 +142,37 @@ def _curve_extent_points(points, *, closed):
     return extent_points
 
 
-def _scale_about(point, scale, center):
-    return (
-        center[0] + (point[0] - center[0]) * scale,
-        center[1] + (point[1] - center[1]) * scale,
-    )
-
-
 def _install_mock_resources(view):
     """Install a complete prewarmed cache without allocating AppKit objects."""
-    view._halo_gradient = MagicMock(name="halo_gradient")
-    view._orb_body_gradient = MagicMock(name="orb_body_gradient")
-    view._orb_accent_gradients = (
-        MagicMock(name="orb_accent_0"),
-        MagicMock(name="orb_accent_1"),
-    )
-    view._orb_depth_gradient = MagicMock(name="orb_depth_gradient")
-    view._orb_bloom_gradient = MagicMock(name="orb_bloom_gradient")
-    view._orb_path = MagicMock(name="orb_path")
-    view._rim_colors = tuple(MagicMock(name=f"rim_color_{index}") for index in range(3))
-    view._corona_paths = tuple(MagicMock(name=f"corona_path_{index}") for index in range(3))
-    view._corona_colors = tuple(
+    view._glow_gradient = MagicMock(name="glow_gradient")
+    view._band_gradient = MagicMock(name="band_gradient")
+    view._shadow_gradient = MagicMock(name="shadow_gradient")
+    view._rim_gradient = MagicMock(name="rim_gradient")
+    view._dome_top_gradient = MagicMock(name="dome_top_gradient")
+    view._dome_bottom_gradient = MagicMock(name="dome_bottom_gradient")
+    view._disk_fire_gradient = MagicMock(name="disk_fire_gradient")
+    view._disk_paths = tuple(MagicMock(name=f"disk_path_{index}") for index in range(3))
+    view._disk_colors = tuple(
         (
-            MagicMock(name=f"corona_far_glow_{index}"),
-            MagicMock(name=f"corona_near_glow_{index}"),
-            MagicMock(name=f"corona_core_{index}"),
+            MagicMock(name=f"disk_halo_{index}"),
+            MagicMock(name=f"disk_core_{index}"),
         )
         for index in range(3)
     )
-    view._wave_paths = tuple(MagicMock(name=f"wave_path_{index}") for index in range(3))
-    view._wave_colors = tuple(
-        (
-            MagicMock(name=f"wave_far_glow_{index}"),
-            MagicMock(name=f"wave_near_glow_{index}"),
-            MagicMock(name=f"wave_core_{index}"),
-        )
-        for index in range(3)
-    )
-    view._wave_edge_gradient = MagicMock(name="wave_edge_gradient")
     return view
 
 
 def _cached_resources(view):
     return (
-        view._halo_gradient,
-        view._orb_body_gradient,
-        view._orb_accent_gradients,
-        view._orb_depth_gradient,
-        view._orb_bloom_gradient,
-        view._orb_path,
-        view._rim_colors,
-        view._corona_paths,
-        view._corona_colors,
-        view._wave_paths,
-        view._wave_colors,
-        view._wave_edge_gradient,
+        view._glow_gradient,
+        view._band_gradient,
+        view._shadow_gradient,
+        view._rim_gradient,
+        view._dome_top_gradient,
+        view._dome_bottom_gradient,
+        view._disk_fire_gradient,
+        view._disk_paths,
+        view._disk_colors,
     )
 
 
@@ -144,218 +191,173 @@ class TestRecordingIndicatorView:
         view = RecordingIndicatorView()
 
         assert view._recording_active is False
+        assert view._recording_active_at is None
         assert view._level == 0.0
-        assert view._exit_started_at is None
+        assert view._flow_phase == 0.0
+        assert view._last_flow_time is None
 
-    def test_outline_has_exactly_24_finite_points(self):
-        points = _orb_outline_points(1.0, 0.5, 0.5)
+    def test_reset_session_restores_idle_state_and_restarts_clock(self):
+        view = RecordingIndicatorView()
+        view._level = 0.7
+        view._recording_active = True
+        view._recording_active_at = 5.0
+        view._start_time = 5.0
+        view._flow_phase = 9.5
+        view._last_flow_time = 6.0
 
-        assert len(points) == _OUTLINE_POINT_COUNT == 24
-        assert all(math.isfinite(coordinate) for point in points for coordinate in point)
-        assert all(math.hypot(x - _ORB_CENTER_X, y - _ORB_CENTER_Y) > 0.0 for x, y in points)
-
-    def test_noise_stays_quiet_while_speech_has_clear_visual_response(self):
-        idle = _orb_outline_points(1.0, 0.0, 0.5)
-        room_noise = _orb_outline_points(1.0, 0.22, 0.5)
-        speech = _orb_outline_points(1.0, 0.6, 0.5)
-
-        noise_deformation = (
-            sum(math.dist(idle_point, noise_point) for idle_point, noise_point in zip(idle, room_noise, strict=True)) / _OUTLINE_POINT_COUNT
-        )
-        speech_deformation = (
-            sum(math.dist(idle_point, speech_point) for idle_point, speech_point in zip(idle, speech, strict=True)) / _OUTLINE_POINT_COUNT
-        )
-
-        assert noise_deformation == pytest.approx(0.0)
-        assert speech_deformation >= 3.0
-        assert _orb_scale(0.22) == 1.0
-        assert _orb_scale(0.6) > 1.05
-        for idle_width, noise_width, speech_width in zip(
-            _rim_widths(0.0),
-            _rim_widths(0.22),
-            _rim_widths(0.6),
-            strict=True,
+        with patch(
+            "wenzi.audio.recording_indicator.time.monotonic",
+            return_value=42.0,
         ):
-            assert idle_width == noise_width
-            assert speech_width > idle_width
+            view.reset_session()
 
-    def test_idle_breath_visibly_expands_orb_and_halo(self):
-        contracted = _orb_outline_points(1.0, 0.0, 0.0)
-        expanded = _orb_outline_points(1.0, 0.0, 1.0)
+        assert view._level == 0.0
+        assert view._recording_active is False
+        assert view._recording_active_at is None
+        assert view._start_time == 42.0
+        assert view._flow_phase == 0.0
+        assert view._last_flow_time is None
 
-        assert _average_distance(contracted, expanded) == pytest.approx(1.6)
-        assert _halo_radius(0.0, 1.0) - _halo_radius(0.0, 0.0) == pytest.approx(4.0)
+    def test_disk_rings_are_flattened_finite_and_distinct(self):
+        rings = tuple(_disk_points(index, 1.0, 0.5) for index in range(3))
 
-    @pytest.mark.parametrize("elapsed", (0.0, 1.0))
-    def test_wave_and_corona_geometry_is_distinct_and_audio_reactive(self, elapsed):
-        idle_waves = tuple(_wave_points(index, elapsed, 0.0) for index in range(3))
-        speech_waves = tuple(_wave_points(index, elapsed, 0.4375) for index in range(3))
+        for ring in rings:
+            assert len(ring) == _DISK_POINT_COUNT == 28
+            assert all(math.isfinite(coordinate) for point in ring for coordinate in point)
+            width = max(x for x, _ in ring) - min(x for x, _ in ring)
+            height = max(y for _, y in ring) - min(y for _, y in ring)
+            # Edge-on accretion disk: much wider than tall.
+            assert width > height * 3.0
+        assert all(
+            _average_distance(rings[first], rings[second]) >= 10.0
+            for first, second in ((0, 1), (0, 2), (1, 2))
+        )
 
-        assert all(len(points) == _WAVE_POINT_COUNT == 24 for points in idle_waves)
-        assert all(all(math.isfinite(coordinate) for point in points for coordinate in point) for points in (*idle_waves, *speech_waves))
-        for index, (idle, speech) in enumerate(zip(idle_waves, speech_waves, strict=True)):
-            baseline = _WAVE_BASE_Y + _WAVE_OFFSETS[index]
-            assert [point[0] for point in speech] == sorted(point[0] for point in speech)
-            assert speech[0][1] == pytest.approx(baseline)
-            assert speech[-1][1] == pytest.approx(baseline)
-            idle_span = max(point[1] for point in idle) - min(point[1] for point in idle)
-            speech_span = max(point[1] for point in speech) - min(point[1] for point in speech)
-            assert idle_span >= 2.0
-            assert (
-                _average_distance(
-                    idle,
-                    _wave_points(index, elapsed + 0.25, 0.0),
-                )
-                >= 0.12
-            )
-            assert speech_span - idle_span >= 8.0
-            assert (
-                _average_distance(
-                    speech,
-                    _wave_points(index, elapsed + 0.05, 0.4375),
-                )
-                >= 0.1
-            )
-
-        assert all(_average_distance(speech_waves[first], speech_waves[second]) >= 3.0 for first, second in ((0, 1), (0, 2), (1, 2)))
-
+    def test_disk_ripple_grows_with_voice_and_ignores_room_noise(self):
         for index in range(3):
-            idle = _corona_points(index, elapsed, 0.0)
-            noise = _corona_points(index, elapsed, 0.22)
-            speech = _corona_points(index, elapsed, 0.4375)
-            idle_radii = tuple(math.hypot(x - _ORB_CENTER_X, y - _ORB_CENTER_Y) for x, y in idle)
-            radii = tuple(math.hypot(x - _ORB_CENTER_X, y - _ORB_CENTER_Y) for x, y in speech)
+            idle = _disk_points(index, 1.0, 0.0)
+            noise = _disk_points(index, 1.0, 0.22)
+            speech = _disk_points(index, 1.0, 1.0)
 
-            assert len(speech) == _CORONA_POINT_COUNT == 20
-            assert _average_distance(noise, idle) == pytest.approx(0.0)
-            assert max(idle_radii) - min(idle_radii) >= 1.25
-            assert (
-                _average_distance(
-                    idle,
-                    _corona_points(index, elapsed + 0.25, 0.0),
-                )
-                >= 0.12
-            )
-            assert _average_distance(idle, speech) >= 0.9
-            assert max(radii) - min(radii) >= 4.0
-            assert (
-                _average_distance(
-                    speech,
-                    _corona_points(index, elapsed + 0.05, 0.4375),
-                )
-                >= 0.025
-            )
+            assert _average_distance(idle, noise) == pytest.approx(0.0)
+            assert _average_distance(idle, speech) >= 1.0
 
-    def test_all_curves_and_strokes_stay_inside_rectangular_host(self):
-        activities = (0.0, 0.22, 0.25, 0.375, 0.55, 1.0)
-        maximum_entry_scale = max(_entry_scale(step * _ENTRY_DURATION / 1000.0) for step in range(1001))
-        panel_center = (_PANEL_CENTER_X, _PANEL_CENTER_Y)
-        orb_center = (_ORB_CENTER_X, _ORB_CENTER_Y)
-        bounds = {name: [math.inf, math.inf, -math.inf, -math.inf] for name in ("orb", "corona", "waves", "halo")}
-        minimum_wave_gap = math.inf
-        maximum_wave_top = -math.inf
+    def test_flow_phase_moves_the_streaks(self):
+        for index in range(3):
+            before = _disk_points(index, 0.0, 0.0)
+            after = _disk_points(index, 0.8, 0.0)
+            assert _average_distance(before, after) >= 0.15
 
-        def _record(name, points, padding):
-            component = bounds[name]
-            component[0] = min(component[0], min(x for x, _ in points) - padding)
-            component[1] = min(component[1], min(y for _, y in points) - padding)
-            component[2] = max(component[2], max(x for x, _ in points) + padding)
-            component[3] = max(component[3], max(y for _, y in points) + padding)
-
-        for activity in activities:
-            voice_scale = _orb_scale(activity)
-            rim_padding = max(_rim_widths(activity)) * voice_scale * maximum_entry_scale / 2.0
-            for breathe in (0.0, 0.5, 1.0):
-                for step in range(401):
-                    elapsed = step * 0.25
-                    orb_points = tuple(
-                        _scale_about(
-                            _scale_about(point, voice_scale, orb_center),
-                            maximum_entry_scale,
-                            panel_center,
-                        )
-                        for point in _curve_extent_points(
-                            _orb_outline_points(elapsed, activity, breathe),
-                            closed=True,
-                        )
-                    )
-                    _record("orb", orb_points, rim_padding)
-
-                    wave_top = -math.inf
-                    for index in range(3):
-                        corona_points = tuple(
-                            _scale_about(
-                                point,
-                                maximum_entry_scale,
-                                panel_center,
-                            )
-                            for point in _curve_extent_points(
-                                _corona_points(index, elapsed, activity),
-                                closed=True,
-                            )
-                        )
-                        corona_padding = max(_CORONA_STROKE_WIDTHS[index]) * maximum_entry_scale / 2.0
-                        _record("corona", corona_points, corona_padding)
-
-                        wave_points = tuple(
-                            _scale_about(
-                                point,
-                                maximum_entry_scale,
-                                panel_center,
-                            )
-                            for point in _curve_extent_points(
-                                _wave_points(index, elapsed, activity),
-                                closed=False,
-                            )
-                        )
-                        wave_padding = max(_WAVE_STROKE_WIDTHS[index]) * maximum_entry_scale / 2.0
-                        _record("waves", wave_points, wave_padding)
-                        wave_top = max(
-                            wave_top,
-                            max(y for _, y in wave_points) + wave_padding,
-                        )
-                        maximum_wave_top = max(
-                            maximum_wave_top,
-                            max(y for _, y in wave_points) + wave_padding,
-                        )
-                    orb_bottom = min(y for _, y in orb_points) - rim_padding
-                    minimum_wave_gap = min(
-                        minimum_wave_gap,
-                        orb_bottom - wave_top,
-                    )
-
-            transformed_center = _scale_about(
-                orb_center,
-                maximum_entry_scale,
-                panel_center,
-            )
-            halo_extent = _halo_radius(activity, 1.0) * maximum_entry_scale
-            _record(
-                "halo",
-                (
-                    (
-                        transformed_center[0] - halo_extent,
-                        transformed_center[1] - halo_extent,
-                    ),
-                    (
-                        transformed_center[0] + halo_extent,
-                        transformed_center[1] + halo_extent,
-                    ),
+    def test_voice_accelerates_the_flow(self):
+        def _advance(view):
+            with (
+                patch.object(view, "_draw_black_hole"),
+                patch(
+                    "wenzi.audio.recording_indicator.time.monotonic",
+                    side_effect=(10.0, 10.05),
                 ),
-                0.0,
-            )
+            ):
+                view.draw(None)
+                view.draw(None)
+            return view._flow_phase
 
-        for name, (left, bottom, right, top) in bounds.items():
-            assert left >= 1.0, f"{name} clips the left edge: {left}"
-            assert bottom >= 1.0, f"{name} clips the bottom edge: {bottom}"
-            assert right <= _PANEL_WIDTH - 1.0, f"{name} clips the right edge: {right}"
-            assert top <= _PANEL_HEIGHT - 1.0, f"{name} clips the top edge: {top}"
-        assert minimum_wave_gap >= 1.0
-        assert maximum_wave_top <= _WAVE_CLIP_HEIGHT
+        quiet = RecordingIndicatorView()
+        quiet._start_time = 10.0
+        quiet_phase = _advance(quiet)
+
+        loud = RecordingIndicatorView()
+        loud._start_time = 10.0
+        loud._recording_active = True
+        loud._recording_active_at = None
+        loud.set_level(1.0)
+        loud_phase = _advance(loud)
+
+        assert quiet_phase == pytest.approx(_FLOW_BASE_SPEED * 0.05)
+        assert loud_phase == pytest.approx(
+            _FLOW_BASE_SPEED * (1.0 + _FLOW_LEVEL_GAIN) * 0.05
+        )
+        assert loud_phase > quiet_phase
+
+    def test_initial_activity_handoff_advances_smoothly_through_response_band(self):
+        pulls = tuple(_gravity_pull(_handoff_activity(1.0, step / 6.0)) for step in range(7))
+
+        assert pulls == tuple(sorted(pulls))
+        assert pulls[0] == 0.0
+        assert pulls[-1] == 1.0
+        assert _gravity_pull(_handoff_activity(0.2, 0.5)) == 0.0
+        assert _handoff_activity(0.4, 1.0) == 0.4
+        assert _handoff_activity(1.0, -1.0) == pytest.approx(0.22)
+        assert _handoff_activity(1.0, 2.0) == 1.0
+
+    def test_recording_activation_handoff_is_timed_and_idempotent(self):
+        view = RecordingIndicatorView()
+        view._start_time = 10.0
+        view.set_level(1.0)
+
+        with patch(
+            "wenzi.audio.recording_indicator.time.monotonic",
+            side_effect=(10.4, 10.6),
+        ) as now:
+            view.activate_recording()
+            view.activate_recording()
+
+        assert now.call_count == 1
+        assert _ACTIVITY_HANDOFF_DURATION == pytest.approx(0.30)
+        assert _gravity_pull(view._effective_activity(0.4)) == 0.0
+        assert _gravity_pull(
+            view._effective_activity(
+                0.4 + _ACTIVITY_HANDOFF_DURATION / 2.0,
+            )
+        ) == pytest.approx(0.5)
+        assert _gravity_pull(view._effective_activity(0.4 + _ACTIVITY_HANDOFF_DURATION)) == 1.0
+        assert view._recording_active_at is None
+
+    def test_all_elements_stay_inside_rectangular_host(self):
+        # The entry/exit layer scale is always <= 1.0, so the resting
+        # geometry sampled here is the worst case for the host bounds.
+        margin = 1.0
+        for activity in (0.0, 0.22, 0.375, 0.55, 1.0):
+            for step in range(40):
+                phase = step * 0.37
+                for index in range(3):
+                    points = _curve_extent_points(
+                        _disk_points(index, phase, activity),
+                        closed=True,
+                    )
+                    padding = max(_DISK_STREAK_WIDTHS) / 2.0
+                    assert min(x for x, _ in points) - padding >= margin
+                    assert min(y for _, y in points) - padding >= margin
+                    assert max(x for x, _ in points) + padding <= _PANEL_WIDTH - margin
+                    assert max(y for _, y in points) + padding <= _PANEL_HEIGHT - margin
+
+        # Static elements at the maximum voice gain (gradient rings fade
+        # to zero alpha AT their radius, so the radius is the extent).
+        shadow_extent = max(_SHADOW_RADIUS, _RIM_RADIUS) * (1.0 + _SHADOW_LEVEL_GAIN)
+        top_extent = (
+            _DOME_TOP_RADIUS
+            * (1.0 + _DOME_LEVEL_GAIN)
+            * (1.0 + _DOME_PULSE + _DOME_PULSE_B)
+        )
+        bottom_extent = _DOME_BOTTOM_RADIUS * (1.0 + _DOME_LEVEL_GAIN)
+        horizontal_extent = max(
+            shadow_extent,
+            top_extent,
+            bottom_extent + _DOME_BOTTOM_JITTER_X,
+            _DISK_BAND_RADIUS,
+        )
+        assert _BH_CENTER_X - horizontal_extent >= margin
+        assert _BH_CENTER_X + horizontal_extent <= _PANEL_WIDTH - margin
+        vertical_extent = max(
+            shadow_extent,
+            top_extent * _DOME_TOP_SQUASH * (1.0 + _DOME_WOBBLE),
+            bottom_extent * _DOME_BOTTOM_SQUASH * (1.0 + _DOME_BOTTOM_WOBBLE)
+            + _DOME_BOTTOM_JITTER_Y,
+            _DISK_BAND_RADIUS * _DISK_BAND_SQUASH,
+        )
+        assert _BH_CENTER_Y - vertical_extent >= margin
+        assert _BH_CENTER_Y + vertical_extent <= _PANEL_HEIGHT - margin
 
     def test_audio_helpers_clamp_and_remain_monotonic(self):
-        assert _halo_radius(-1.0, -1.0) == 72.0
-        assert _halo_radius(4.0, 4.0) == 87.0
         assert _gravity_pull(-1.0) == 0.0
         assert _gravity_pull(0.0) == 0.0
         assert _gravity_pull(0.22) == 0.0
@@ -365,49 +367,71 @@ class TestRecordingIndicatorView:
         assert _gravity_pull(2.0) == 1.0
         assert _gravity_pull(0.02) < _gravity_pull(0.45) < 1.0
 
-    def test_entry_and_exit_scales_are_bounded(self):
-        assert abs(_entry_scale(0.0) - 0.78) < 0.001
-        assert 1.0 < _entry_scale(0.14) < 1.03
-        assert _entry_scale(1.0) == 1.0
-        assert _exit_scale(0.0) == 1.0
-        assert abs(_exit_scale(1.0) - 0.76) < 0.001
+    def test_entry_and_exit_animation_constants(self):
+        assert _ENTRY_DURATION == pytest.approx(0.22)
+        assert _ENTRY_SCALE_FROM == pytest.approx(0.86)
+        assert _EXIT_DURATION == pytest.approx(0.20)
+        assert _EXIT_SCALE_TO == pytest.approx(0.76)
+        assert _REFRESH_INTERVAL == pytest.approx(1.0 / 30.0)
 
-    def test_begin_exit_is_idempotent(self):
-        view = RecordingIndicatorView()
+    def test_center_scale_transform_composes_about_panel_center(self, monkeypatch):
+        _appkit, foundation, quartz = _install_fake_native(monkeypatch)
 
-        with patch("wenzi.audio.recording_indicator.time.monotonic") as now:
-            now.side_effect = [10.0, 20.0]
-            view.begin_exit()
-            view.begin_exit()
+        result = _center_scale_transform(0.86)
 
-        assert view._exit_started_at == 10.0
-        now.assert_called_once()
+        quartz.CATransform3DMakeTranslation.assert_called_once_with(
+            _PANEL_CENTER_X, _PANEL_CENTER_Y, 0.0
+        )
+        quartz.CATransform3DScale.assert_called_once_with(
+            quartz.CATransform3DMakeTranslation.return_value, 0.86, 0.86, 1.0
+        )
+        quartz.CATransform3DTranslate.assert_called_once_with(
+            quartz.CATransform3DScale.return_value,
+            -_PANEL_CENTER_X,
+            -_PANEL_CENTER_Y,
+            0.0,
+        )
+        foundation.NSValue.valueWithCATransform3D_.assert_called_once_with(
+            quartz.CATransform3DTranslate.return_value
+        )
+        assert result is foundation.NSValue.valueWithCATransform3D_.return_value
 
-    def test_prepare_for_display_caches_gradients_colors_and_mutable_path(self):
+    def test_center_scale_transform_returns_nsvalue_for_core_animation(self):
+        # REAL PyObjC, no fakes: CABasicAnimation from/to values must be
+        # NSValue-wrapped — a raw PyObjC struct bridges as OC_PythonObject
+        # and crashes the app at the next CATransaction commit
+        # (CA_prepareRenderValue → unrecognized selector).
+        value = _center_scale_transform(0.86)
+
+        transform = value.CATransform3DValue()
+        assert transform.m11 == pytest.approx(0.86)
+        assert transform.m22 == pytest.approx(0.86)
+        assert transform.m33 == pytest.approx(1.0)
+        # Scaling about the panel center leaves tx = cx·(1−s), ty = cy·(1−s)
+        assert transform.m41 == pytest.approx(_PANEL_CENTER_X * (1.0 - 0.86))
+        assert transform.m42 == pytest.approx(_PANEL_CENTER_Y * (1.0 - 0.86))
+
+    def test_prepare_for_display_caches_paths_colors_and_gradient(self):
         view = RecordingIndicatorView()
 
         view.prepare_for_display()
         initial_resources = _cached_resources(view)
         view.prepare_for_display()
 
-        assert len(view._orb_accent_gradients) == 2
-        assert view._orb_depth_gradient is not None
-        assert len(view._rim_colors) == 3
-        assert len(view._corona_paths) == len(view._corona_colors) == 3
-        assert len(view._wave_paths) == len(view._wave_colors) == 3
-        assert view._wave_edge_gradient is not None
-        assert tuple(tuple(round(color.alphaComponent(), 3) for color in layers) for layers in view._corona_colors) == (
-            (0.08, 0.26, 0.74),
-            (0.07, 0.23, 0.66),
-            (0.06, 0.20, 0.60),
-        )
+        assert len(view._disk_paths) == len(view._disk_colors) == 3
+        assert view._shadow_gradient is not None
+        assert view._rim_gradient is not None
+        assert view._band_gradient is not None
+        assert view._dome_top_gradient is not None
+        assert view._dome_bottom_gradient is not None
+        assert view._disk_fire_gradient is not None
+        assert view._glow_gradient is not None
         assert tuple(
-            tuple(round(component, 2) for component in (layers[-1].redComponent(), layers[-1].greenComponent(), layers[-1].blueComponent()))
-            for layers in view._corona_colors
+            tuple(round(color.alphaComponent(), 3) for color in layers) for layers in view._disk_colors
         ) == (
-            (1.0, 0.91, 0.64),
-            (1.0, 0.53, 0.62),
-            (1.0, 0.48, 0.82),
+            (0.10, 0.38),
+            (0.09, 0.34),
+            (0.08, 0.30),
         )
         assert all(resource is not None for resource in initial_resources)
         for current, initial in zip(
@@ -417,203 +441,39 @@ class TestRecordingIndicatorView:
         ):
             assert current is initial
 
-    def test_path_prewarm_failure_retries_without_partial_cache(self):
+    def test_path_prewarm_failure_retries_without_partial_cache(self, monkeypatch):
+        appkit, _foundation, _quartz = _install_fake_native(monkeypatch)
         view = RecordingIndicatorView()
-        appkit = MagicMock()
         native_path = MagicMock()
         appkit.NSBezierPath.alloc.return_value.init.return_value = native_path
         native_path.setLineJoinStyle_.side_effect = RuntimeError("path setup failed")
 
-        with patch.dict(sys.modules, {"AppKit": appkit}):
-            with pytest.raises(RuntimeError, match="path setup failed"):
-                view.prepare_for_display()
-
-            assert view._halo_gradient is None
-            assert view._orb_body_gradient is None
-            assert view._orb_accent_gradients is None
-            assert view._orb_depth_gradient is None
-            assert view._orb_bloom_gradient is None
-            assert view._orb_path is None
-            assert view._rim_colors is None
-            assert view._corona_paths is None
-            assert view._corona_colors is None
-            assert view._wave_paths is None
-            assert view._wave_colors is None
-            assert view._wave_edge_gradient is None
-
-            native_path.setLineJoinStyle_.side_effect = None
+        with pytest.raises(RuntimeError, match="path setup failed"):
             view.prepare_for_display()
 
-        # The failed orb allocation is followed by a complete seven-path retry.
-        assert appkit.NSBezierPath.alloc.call_count == 8
-        assert view._orb_path is native_path
-        assert view._orb_body_gradient is not None
-        assert view._orb_depth_gradient is not None
-        assert len(view._orb_accent_gradients) == 2
-        assert len(view._rim_colors) == 3
-        assert len(view._corona_paths) == 3
-        assert len(view._wave_paths) == 3
-        assert view._wave_edge_gradient is not None
+        assert view._glow_gradient is None
+        assert view._band_gradient is None
+        assert view._shadow_gradient is None
+        assert view._rim_gradient is None
+        assert view._dome_top_gradient is None
+        assert view._dome_bottom_gradient is None
+        assert view._disk_fire_gradient is None
+        assert view._disk_paths is None
+        assert view._disk_colors is None
 
-    def test_idle_first_frame_uses_full_color_orb(self):
-        view = RecordingIndicatorView()
-        view._start_time = 10.0
-        appkit = MagicMock()
+        native_path.setLineJoinStyle_.side_effect = None
+        view.prepare_for_display()
 
-        with (
-            patch.dict(sys.modules, {"AppKit": appkit}),
-            patch(
-                "wenzi.audio.recording_indicator.time.monotonic",
-                return_value=10.0,
-            ),
-            patch.object(view, "_draw_active_orb") as draw_active,
-        ):
-            view.draw(None)
-
-        draw_active.assert_called_once_with(0.0, 0.5)
-        applied_scale = appkit.NSAffineTransform.transform.return_value.scaleBy_.call_args.args[0]
-        assert abs(applied_scale - 0.78) < 0.001
-        appkit.NSAffineTransform.transform.return_value.translateXBy_yBy_.assert_has_calls(
-            [
-                call(_PANEL_CENTER_X, _PANEL_CENTER_Y),
-                call(-_PANEL_CENTER_X, -_PANEL_CENTER_Y),
-            ]
-        )
-        appkit.NSGraphicsContext.restoreGraphicsState.assert_called_once()
-
-    def test_layer_order_keeps_waves_and_corona_outside_voice_transform(self):
-        view = _install_mock_resources(RecordingIndicatorView())
-        view._recording_active = True
-        view.set_level(1.0)
-
-        state_depth = [0]
-        events = []
-        rim_count = [0]
-
-        def _save_state():
-            state_depth[0] += 1
-
-        def _restore_state():
-            state_depth[0] -= 1
-
-        view._halo_gradient.drawFromCenter_radius_toCenter_radius_options_.side_effect = lambda *args: events.append("halo")
-        view._orb_path.addClip.side_effect = lambda: events.append("clip")
-        view._orb_body_gradient.drawFromCenter_radius_toCenter_radius_options_.side_effect = lambda *args: events.append("body")
-        for index, gradient in enumerate(view._orb_accent_gradients):
-            gradient.drawFromCenter_radius_toCenter_radius_options_.side_effect = lambda *args, layer=index: events.append(
-                f"accent-{layer}"
-            )
-        view._orb_depth_gradient.drawFromCenter_radius_toCenter_radius_options_.side_effect = lambda *args: events.append("depth")
-        view._orb_bloom_gradient.drawFromCenter_radius_toCenter_radius_options_.side_effect = lambda *args: events.append("bloom")
-        view._wave_edge_gradient.drawFromPoint_toPoint_options_.side_effect = lambda *args: events.append("wave-mask")
-        for index, path in enumerate(view._wave_paths):
-            path.stroke.side_effect = lambda layer=index: events.append(f"wave-{layer}")
-        corona_counts = [0, 0, 0]
-
-        def _record_corona(path_index):
-            def _stroke():
-                events.append(f"corona-{corona_counts[path_index]}-{path_index}")
-                corona_counts[path_index] += 1
-
-            return _stroke
-
-        for index, path in enumerate(view._corona_paths):
-            path.stroke.side_effect = _record_corona(index)
-
-        def _stroke():
-            events.append(f"rim-{rim_count[0]}")
-            rim_count[0] += 1
-
-        view._orb_path.stroke.side_effect = _stroke
-
-        appkit = MagicMock()
-        appkit.NSGraphicsContext.saveGraphicsState.side_effect = _save_state
-        appkit.NSGraphicsContext.restoreGraphicsState.side_effect = _restore_state
-        appkit.NSAffineTransform.transform.return_value.concat.side_effect = lambda: events.append("voice-transform")
-        foundation = MagicMock()
-        foundation.NSMakePoint.side_effect = lambda x, y: SimpleNamespace(x=x, y=y)
-        foundation.NSMakeRect.side_effect = lambda x, y, width, height: SimpleNamespace(
-            x=x,
-            y=y,
-            width=width,
-            height=height,
-        )
-
-        with patch.dict(
-            sys.modules,
-            {"AppKit": appkit, "Foundation": foundation},
-        ):
-            view._draw_active_orb(elapsed=1.0, breathe=0.5)
-
-        assert state_depth[0] == 0
-        wave_events = [index for index, event in enumerate(events) if event.startswith("wave-") and event != "wave-mask"]
-        corona_events = [index for index, event in enumerate(events) if event.startswith("corona-")]
-        rim_events = [index for index, event in enumerate(events) if event.startswith("rim-")]
-        assert len(wave_events) == 9
-        assert len(corona_events) == 9
-        assert len(rim_events) == 3
-        assert [events[index] for index in corona_events] == [
-            "corona-0-2",
-            "corona-0-1",
-            "corona-0-0",
-            "corona-1-2",
-            "corona-1-1",
-            "corona-1-0",
-            "corona-2-2",
-            "corona-2-1",
-            "corona-2-0",
-        ]
-        assert max(wave_events) < events.index("wave-mask") < events.index("halo")
-        appkit.NSRectClip.assert_called_once_with(SimpleNamespace(x=0.0, y=0.0, width=_PANEL_WIDTH, height=_WAVE_CLIP_HEIGHT))
-        appkit.NSGraphicsContext.currentContext.return_value.setCompositingOperation_.assert_called_once_with(
-            appkit.NSCompositingOperationDestinationIn
-        )
-        view._wave_edge_gradient.drawFromPoint_toPoint_options_.assert_called_once_with(
-            SimpleNamespace(x=15.0, y=_WAVE_BASE_Y),
-            SimpleNamespace(x=205.0, y=_WAVE_BASE_Y),
-            appkit.NSGradientDrawsBeforeStartingLocation | appkit.NSGradientDrawsAfterEndingLocation,
-        )
-        assert events.index("halo") < min(corona_events)
-        assert max(corona_events) < events.index("voice-transform")
-        assert events.index("voice-transform") < events.index("body")
-        assert events.index("body") < events.index("depth")
-        assert events.index("depth") < events.index("bloom")
-        assert events.index("bloom") < min(rim_events)
-        view._orb_path.addClip.assert_called_once_with()
-        view._orb_path.setLineWidth_.assert_has_calls([call(width) for width in _rim_widths(1.0)])
-        assert view._orb_path.stroke.call_count == 3
-        view._orb_path.fill.assert_not_called()
-        appkit.NSRectFill.assert_not_called()
-        assert not appkit.CIFilter.mock_calls
-        for color in view._rim_colors:
-            color.setStroke.assert_called_once_with()
-
-        depth_center = view._orb_depth_gradient.drawFromCenter_radius_toCenter_radius_options_.call_args.args[0]
-        bloom_center = view._orb_bloom_gradient.drawFromCenter_radius_toCenter_radius_options_.call_args_list[0].args[0]
-        assert depth_center.x > _ORB_CENTER_X
-        assert depth_center.y < _ORB_CENTER_Y
-        assert bloom_center.x < _ORB_CENTER_X
-        assert bloom_center.y > _ORB_CENTER_Y
-        assert (
-            math.dist(
-                (depth_center.x, depth_center.y),
-                (bloom_center.x, bloom_center.y),
-            )
-            >= 45.0
-        )
-        voice_transform = appkit.NSAffineTransform.transform.return_value
-        voice_transform.translateXBy_yBy_.assert_has_calls(
-            [
-                call(_ORB_CENTER_X, _ORB_CENTER_Y),
-                call(-_ORB_CENTER_X, -_ORB_CENTER_Y),
-            ]
-        )
-        voice_transform.scaleBy_.assert_called_once_with(_orb_scale(1.0))
+        # The failed attempt allocated the three disk paths; the retry
+        # allocates them again (the other elements are gradients).
+        assert appkit.NSBezierPath.alloc.call_count == 6
+        assert view._glow_gradient is not None
+        assert len(view._disk_paths) == 3
+        assert view._band_gradient is not None
 
     def test_rebuild_path_uses_closed_catmull_rom_sequence(self):
-        view = RecordingIndicatorView()
-        view._orb_path = MagicMock()
-        points = _orb_outline_points(1.0, 0.5, 0.5)
+        path = MagicMock()
+        points = _disk_points(0, 1.0, 0.5)
         expected_calls = [
             call.removeAllPoints(),
             call.moveToPoint_(points[0]),
@@ -640,24 +500,228 @@ class TestRecordingIndicatorView:
             )
         expected_calls.append(call.closePath())
 
-        view._rebuild_orb_path(points)
+        RecordingIndicatorView._rebuild_closed_path(path, points)
 
-        assert view._orb_path.mock_calls == expected_calls
-        assert view._orb_path.curveToPoint_controlPoint1_controlPoint2_.call_count == _OUTLINE_POINT_COUNT
+        assert path.mock_calls == expected_calls
+        assert path.curveToPoint_controlPoint1_controlPoint2_.call_count == _DISK_POINT_COUNT
 
-    def test_draw_loop_reuses_path_and_allocates_no_native_resources(self):
+    def test_idle_first_frame_draws_resting_black_hole(self, monkeypatch):
+        appkit, _foundation, _quartz = _install_fake_native(monkeypatch)
+        view = RecordingIndicatorView()
+        view._start_time = 10.0
+
+        with (
+            patch(
+                "wenzi.audio.recording_indicator.time.monotonic",
+                return_value=10.0,
+            ),
+            patch.object(view, "_draw_black_hole") as draw_black_hole,
+        ):
+            view.draw(None)
+
+        draw_black_hole.assert_called_once_with(0.0, 0.0)
+        # The very first frame has no dt yet — the flow starts from rest.
+        assert view._flow_phase == 0.0
+        appkit.NSGraphicsContext.saveGraphicsState.assert_not_called()
+
+    def test_draw_uses_handoff_activity_during_microphone_takeover(self):
+        view = RecordingIndicatorView()
+        view._start_time = 10.0
+        view._recording_active = True
+        view._recording_active_at = 10.4
+        view.set_level(1.0)
+        expected_activity = _handoff_activity(1.0, 0.5)
+
+        with (
+            patch(
+                "wenzi.audio.recording_indicator.time.monotonic",
+                return_value=10.55,
+            ),
+            patch.object(view, "_draw_black_hole") as draw_black_hole,
+        ):
+            view.draw(None)
+
+        draw_black_hole.assert_called_once()
+        activity, pull = draw_black_hole.call_args.args
+        assert activity == pytest.approx(expected_activity)
+        assert pull == pytest.approx(_gravity_pull(expected_activity))
+
+    def test_draw_order_layers_disk_behind_then_in_front_of_the_hole(self, monkeypatch):
+        appkit, foundation, _quartz = _install_fake_native(monkeypatch)
+        view = _install_mock_resources(RecordingIndicatorView())
+        view._recording_active = True
+        view.set_level(1.0)
+        # A phase where every infall ring is fully faded in.
+        view._flow_phase = 2.0
+
+        state_depth = [0]
+        events = []
+
+        appkit.NSGraphicsContext.saveGraphicsState.side_effect = lambda: state_depth.__setitem__(0, state_depth[0] + 1)
+        appkit.NSGraphicsContext.restoreGraphicsState.side_effect = lambda: state_depth.__setitem__(0, state_depth[0] - 1)
+        appkit.NSRectClip.side_effect = lambda rect: events.append("clip")
+        foundation.NSMakePoint.side_effect = lambda x, y: SimpleNamespace(x=x, y=y)
+        foundation.NSMakeRect.side_effect = lambda x, y, width, height: SimpleNamespace(
+            x=x,
+            y=y,
+            width=width,
+            height=height,
+        )
+
+        view._glow_gradient.drawFromCenter_radius_toCenter_radius_options_.side_effect = lambda *args: events.append("glow")
+        view._band_gradient.drawFromCenter_radius_toCenter_radius_options_.side_effect = lambda *args: events.append("band")
+        view._shadow_gradient.drawFromCenter_radius_toCenter_radius_options_.side_effect = lambda *args: events.append("shadow")
+        view._rim_gradient.drawFromCenter_radius_toCenter_radius_options_.side_effect = lambda *args: events.append("rim")
+        view._dome_top_gradient.drawFromCenter_radius_toCenter_radius_options_.side_effect = lambda *args: events.append("dome-top")
+        view._dome_bottom_gradient.drawFromCenter_radius_toCenter_radius_options_.side_effect = lambda *args: events.append("dome-bottom")
+        view._disk_fire_gradient.drawFromCenter_radius_toCenter_radius_options_.side_effect = lambda *args: events.append("fire")
+        for index, path in enumerate(view._disk_paths):
+            path.stroke.side_effect = lambda ring=index: events.append(f"disk-{ring}")
+
+        view._draw_black_hole(activity=1.0, pull=1.0)
+
+        assert state_depth[0] == 0
+        band_events = [index for index, event in enumerate(events) if event == "band"]
+        disk_events = [index for index, event in enumerate(events) if event.startswith("disk-")]
+        shadow_index = events.index("shadow")
+
+        # Painter's algorithm: far half of the disk, void, upper rim
+        # glow, domes, then the near half of the disk over everything.
+        assert len(band_events) == 2
+        assert len(disk_events) == 12
+        assert events.count("shadow") == 1
+        assert events.count("rim") == 1
+        assert events.count("clip") == 5  # far half, rim, dome ×2, near half
+        assert events.count("dome-top") == events.count("dome-bottom") == 1
+        # The fire collar is part of BOTH disk passes — over the far
+        # streaks (then swallowed by the void) and over the near ones.
+        fire_events = [index for index, event in enumerate(events) if event == "fire"]
+        assert len(fire_events) == 2
+        assert events.index("glow") < band_events[0] < disk_events[0]
+        # Far half of the disk is under the void...
+        assert disk_events[5] < fire_events[0] < shadow_index
+        # ...the rim glow wraps the void from above...
+        assert shadow_index < events.index("rim")
+        # ...the bent-light domes dissolve it into the disk...
+        assert events.index("rim") < events.index("dome-top") < events.index("dome-bottom")
+        # ...and the near half of the disk crosses in front of it all,
+        # its inner edge burning around the hole.
+        assert events.index("dome-bottom") < band_events[1] < disk_events[6]
+        assert disk_events[11] < fire_events[1]
+
+        # Voice pushes the void, its rim and the domes outward; the top
+        # halo additionally pulses with the flow phase.
+        shadow_radius = view._shadow_gradient.drawFromCenter_radius_toCenter_radius_options_.call_args.args[3]
+        assert shadow_radius == pytest.approx(_SHADOW_RADIUS * (1.0 + _SHADOW_LEVEL_GAIN))
+        rim_radius = view._rim_gradient.drawFromCenter_radius_toCenter_radius_options_.call_args.args[3]
+        assert rim_radius == pytest.approx(_RIM_RADIUS * (1.0 + _SHADOW_LEVEL_GAIN))
+        dome_radius = view._dome_top_gradient.drawFromCenter_radius_toCenter_radius_options_.call_args.args[3]
+        expected_dome_radius = (
+            _DOME_TOP_RADIUS
+            * (1.0 + _DOME_LEVEL_GAIN)
+            * (
+                1.0
+                + _DOME_PULSE * math.sin(2.0 * _DOME_PULSE_RATE)
+                + _DOME_PULSE_B * math.sin(2.0 * _DOME_PULSE_RATE_B + 1.7)
+            )
+        )
+        assert dome_radius == pytest.approx(expected_dome_radius)
+        # The bottom halo TREMBLES with the voice instead of swelling:
+        # no pulse on its radius, but the center jitters (pull is 1
+        # here, so the full amplitude applies).
+        bottom_call = view._dome_bottom_gradient.drawFromCenter_radius_toCenter_radius_options_.call_args
+        assert bottom_call.args[3] == pytest.approx(
+            _DOME_BOTTOM_RADIUS * (1.0 + _DOME_LEVEL_GAIN)
+        )
+        assert bottom_call.args[0].x == pytest.approx(
+            _BH_CENTER_X
+            + _DOME_BOTTOM_JITTER_X * math.sin(2.0 * _DOME_BOTTOM_JITTER_X_RATE + 0.7)
+        )
+        # The fire collar breathes with the void, like the rim.
+        fire_radius = view._disk_fire_gradient.drawFromCenter_radius_toCenter_radius_options_.call_args.args[3]
+        assert fire_radius == pytest.approx(_DISK_FIRE_RADIUS * (1.0 + _SHADOW_LEVEL_GAIN))
+
+    def test_streak_rings_spiral_into_the_hole(self):
+        """The rings fall from the outer disk to the rim (accelerating)
+        and end up small enough for the shadow to swallow them."""
+        rate_phase = 1.0 / _INFALL_RATE  # one full infall cycle for ring 0
+
+        def extent(cycle):
+            points = _disk_points(0, cycle * rate_phase, 0.0)
+            return max(abs(x - _BH_CENTER_X) for x, _ in points)
+
+        extents = [extent(cycle) for cycle in (0.05, 0.3, 0.6, 0.9)]
+        assert extents == sorted(extents, reverse=True)
+        # Accelerating: the drop over the last third beats the first third
+        assert (extents[2] - extents[3]) > (extents[0] - extents[1])
+        # Swallowed: by the end of the cycle the ring is inside the rim
+        assert extent(0.97) < _RIM_RADIUS
+
+    def test_halo_hollows_clear_the_black_core(self):
+        """The transparent middles of both halos must be at least as
+        large as the black core on BOTH axes — otherwise their glow
+        bleeds inside the void.  For the top halo the binding case is
+        the pulse/wobble MINIMUM."""
+        core = _SHADOW_RADIUS * _SHADOW_CORE_STOP
+
+        # The bottom halo trembles (center jitter + aspect wobble); the
+        # hollow must clear the core even at the jittered extreme.
+        bottom_inner = _DOME_BOTTOM_RADIUS * _DOME_BOTTOM_INNER_STOP
+        assert bottom_inner - _DOME_BOTTOM_JITTER_X >= core
+        assert (
+            bottom_inner * _DOME_BOTTOM_SQUASH * (1.0 - _DOME_BOTTOM_WOBBLE)
+            - _DOME_BOTTOM_JITTER_Y
+            >= core
+        )
+
+        top_inner_worst = (
+            _DOME_TOP_RADIUS
+            * _DOME_TOP_INNER_STOP
+            * (1.0 - _DOME_PULSE - _DOME_PULSE_B)
+        )
+        assert top_inner_worst >= core
+        assert top_inner_worst * _DOME_TOP_SQUASH * (1.0 - _DOME_WOBBLE) >= core
+
+        # The domes grow at least as fast as the shadow with the voice,
+        # so voice gain can never invert the clearance.
+        assert _DOME_LEVEL_GAIN >= _SHADOW_LEVEL_GAIN
+
+    def test_disk_fire_collar_clears_the_swollen_core(self):
+        """The fire collar on the disk's inner edge may ride the core's
+        feathered edge (like the top rim's ember does) but must stay
+        outside the OPAQUE black — deeper in, the near pass paints a
+        fire ring floating on the void's face.  It breathes in lockstep
+        with the void (same gain, asserted in the draw-order test), so
+        the resting geometry is the only case."""
+        ember = _DISK_FIRE_RADIUS * _DISK_FIRE_EMBER_STOP
+        assert ember >= _SHADOW_RADIUS * _SHADOW_CORE_STOP
+        # And the collar never outgrows the band it lives on.
+        assert _DISK_FIRE_RADIUS <= _DISK_BAND_RADIUS
+
+    def test_ring_dissolves_before_entering_the_shadow(self, monkeypatch):
+        """A ring at the very end of its infall must not be stroked at
+        all — the near-disk pass would otherwise show it hovering over
+        the void."""
+        _appkit, foundation, _quartz = _install_fake_native(monkeypatch)
+        view = _install_mock_resources(RecordingIndicatorView())
+        foundation.NSMakePoint.side_effect = lambda x, y: SimpleNamespace(x=x, y=y)
+        view._flow_phase = 0.995 / _INFALL_RATE  # ring 0 nearly swallowed
+
+        view._draw_black_hole(activity=0.0, pull=0.0)
+
+        assert view._disk_paths[0].stroke.call_count == 0
+        assert view._disk_paths[1].stroke.call_count == 4
+        assert view._disk_paths[2].stroke.call_count == 4
+
+    def test_draw_loop_reuses_paths_and_allocates_no_native_resources(self, monkeypatch):
+        appkit, foundation, _quartz = _install_fake_native(monkeypatch)
         view = _install_mock_resources(RecordingIndicatorView())
         initial_resources = _cached_resources(view)
-
-        appkit = MagicMock()
-        foundation = MagicMock()
         foundation.NSMakePoint.side_effect = lambda x, y: SimpleNamespace(x=x, y=y)
-        with patch.dict(
-            sys.modules,
-            {"AppKit": appkit, "Foundation": foundation},
-        ):
-            view._draw_active_orb(elapsed=1.0, breathe=0.5)
-            view._draw_active_orb(elapsed=1.05, breathe=0.55)
+
+        view._flow_phase = 2.0  # every infall ring fully faded in
+        view._draw_black_hole(activity=0.5, pull=_gravity_pull(0.5))
+        view._draw_black_hole(activity=0.55, pull=_gravity_pull(0.55))
 
         for current, initial in zip(
             _cached_resources(view),
@@ -670,181 +734,106 @@ class TestRecordingIndicatorView:
         assert not appkit.NSBezierPath.mock_calls
         assert not appkit.NSShadow.mock_calls
         assert not appkit.CIFilter.mock_calls
-        assert view._orb_path.removeAllPoints.call_count == 2
-        assert view._orb_path.moveToPoint_.call_count == 2
-        assert view._orb_path.curveToPoint_controlPoint1_controlPoint2_.call_count == _OUTLINE_POINT_COUNT * 2
-        assert view._orb_path.closePath.call_count == 2
-        assert view._orb_path.addClip.call_count == 2
-        assert view._orb_path.stroke.call_count == 6
 
-        for path in view._corona_paths:
+        # Only the disk streak rings are rebuilt per frame (once each,
+        # then stroked in both the far and near passes).
+        for path in view._disk_paths:
             assert path.removeAllPoints.call_count == 2
             assert path.moveToPoint_.call_count == 2
-            assert path.curveToPoint_controlPoint1_controlPoint2_.call_count == _CORONA_POINT_COUNT * 2
+            assert path.curveToPoint_controlPoint1_controlPoint2_.call_count == _DISK_POINT_COUNT * 2
             assert path.closePath.call_count == 2
-            assert path.stroke.call_count == 6
-        for path in view._wave_paths:
-            assert path.removeAllPoints.call_count == 2
-            assert path.moveToPoint_.call_count == 2
-            assert path.curveToPoint_controlPoint1_controlPoint2_.call_count == (_WAVE_POINT_COUNT - 1) * 2
-            path.closePath.assert_not_called()
-            assert path.stroke.call_count == 6
+            assert path.stroke.call_count == 8  # halo+core × 2 passes × 2 frames
+        assert view._glow_gradient.drawFromCenter_radius_toCenter_radius_options_.call_count == 2
+        assert view._band_gradient.drawFromCenter_radius_toCenter_radius_options_.call_count == 4
+        assert view._shadow_gradient.drawFromCenter_radius_toCenter_radius_options_.call_count == 2
+        assert view._rim_gradient.drawFromCenter_radius_toCenter_radius_options_.call_count == 2
+        assert view._dome_top_gradient.drawFromCenter_radius_toCenter_radius_options_.call_count == 2
+        assert view._dome_bottom_gradient.drawFromCenter_radius_toCenter_radius_options_.call_count == 2
+        assert view._disk_fire_gradient.drawFromCenter_radius_toCenter_radius_options_.call_count == 4
 
-        assert view._wave_edge_gradient.drawFromPoint_toPoint_options_.call_count == 2
-        assert appkit.NSRectClip.call_count == 2
+        path_segments_per_frame = len(view._disk_paths) * _DISK_POINT_COUNT
+        strokes_per_frame = 12  # wave halo+core × 3 rings × 2 passes
+        # glow + (band + fire collar)×2 + void + rim + domes
+        gradient_draws_per_frame = 1 + 4 + 1 + 1 + 2
+        assert path_segments_per_frame == 84
+        assert strokes_per_frame == 12
+        assert gradient_draws_per_frame == 9
 
-        path_segments_per_frame = (
-            _OUTLINE_POINT_COUNT + len(view._corona_paths) * _CORONA_POINT_COUNT + len(view._wave_paths) * (_WAVE_POINT_COUNT - 1)
-        )
-        strokes_per_frame = 3 + len(view._corona_paths) * 3 + len(view._wave_paths) * 3
-        assert path_segments_per_frame == 153
-        assert path_segments_per_frame <= 160
-        assert strokes_per_frame == 21
-
-    def test_wave_mask_failure_restores_graphics_state(self):
+    def test_clipped_dome_failure_restores_graphics_state(self, monkeypatch):
+        appkit, foundation, _quartz = _install_fake_native(monkeypatch)
         view = _install_mock_resources(RecordingIndicatorView())
-        view._wave_edge_gradient.drawFromPoint_toPoint_options_.side_effect = RuntimeError("mask failed")
         state_depth = [0]
 
-        appkit = MagicMock()
         appkit.NSGraphicsContext.saveGraphicsState.side_effect = lambda: state_depth.__setitem__(0, state_depth[0] + 1)
         appkit.NSGraphicsContext.restoreGraphicsState.side_effect = lambda: state_depth.__setitem__(0, state_depth[0] - 1)
-        foundation = MagicMock()
+        appkit.NSRectClip.side_effect = RuntimeError("clip failed")
         foundation.NSMakePoint.side_effect = lambda x, y: SimpleNamespace(x=x, y=y)
 
-        with (
-            patch.dict(
-                sys.modules,
-                {"AppKit": appkit, "Foundation": foundation},
-            ),
-            pytest.raises(RuntimeError, match="mask failed"),
-        ):
-            view._draw_bottom_waves(elapsed=1.0, activity=0.5)
+        with pytest.raises(RuntimeError, match="clip failed"):
+            view._draw_black_hole(activity=0.5, pull=0.5)
 
         assert state_depth[0] == 0
-        assert sum(path.stroke.call_count for path in view._wave_paths) == 9
 
-    def test_clipped_body_failure_restores_body_and_outer_graphics_state(self):
+    def test_failed_disk_rebuild_recovers_next_frame(self, monkeypatch):
+        _appkit, foundation, _quartz = _install_fake_native(monkeypatch)
         view = _install_mock_resources(RecordingIndicatorView())
-        view._orb_body_gradient.drawFromCenter_radius_toCenter_radius_options_.side_effect = RuntimeError("body failed")
         view._start_time = 10.0
-
-        state_depth = [0]
-        state_events = []
-
-        def _save_state():
-            state_depth[0] += 1
-            state_events.append(("save", state_depth[0]))
-
-        def _restore_state():
-            state_events.append(("restore", state_depth[0]))
-            state_depth[0] -= 1
-
-        appkit = MagicMock()
-        appkit.NSGraphicsContext.saveGraphicsState.side_effect = _save_state
-        appkit.NSGraphicsContext.restoreGraphicsState.side_effect = _restore_state
-        foundation = MagicMock()
+        view._flow_phase = 2.0  # every infall ring fully faded in
         foundation.NSMakePoint.side_effect = lambda x, y: SimpleNamespace(x=x, y=y)
+        failing_path = view._disk_paths[0]
+        failing_path.curveToPoint_controlPoint1_controlPoint2_.side_effect = RuntimeError("curve failed")
 
-        with (
-            patch.dict(
-                sys.modules,
-                {"AppKit": appkit, "Foundation": foundation},
-            ),
-            patch(
-                "wenzi.audio.recording_indicator.time.monotonic",
-                return_value=11.0,
-            ),
-            pytest.raises(RuntimeError, match="body failed"),
-        ):
-            view.draw(None)
-
-        assert state_depth[0] == 0
-        assert sum(event[0] == "save" for event in state_events) == sum(event[0] == "restore" for event in state_events)
-        view._orb_path.addClip.assert_called_once_with()
-        view._orb_path.stroke.assert_not_called()
-
-    def test_rim_failure_restores_rim_and_outer_graphics_state(self):
-        view = _install_mock_resources(RecordingIndicatorView())
-        view._orb_path.stroke.side_effect = [None, RuntimeError("rim failed")]
-        view._start_time = 10.0
-
-        state_depth = [0]
-        state_events = []
-
-        def _save_state():
-            state_depth[0] += 1
-            state_events.append(("save", state_depth[0]))
-
-        def _restore_state():
-            state_events.append(("restore", state_depth[0]))
-            state_depth[0] -= 1
-
-        appkit = MagicMock()
-        appkit.NSGraphicsContext.saveGraphicsState.side_effect = _save_state
-        appkit.NSGraphicsContext.restoreGraphicsState.side_effect = _restore_state
-        foundation = MagicMock()
-        foundation.NSMakePoint.side_effect = lambda x, y: SimpleNamespace(x=x, y=y)
-
-        with (
-            patch.dict(
-                sys.modules,
-                {"AppKit": appkit, "Foundation": foundation},
-            ),
-            patch(
-                "wenzi.audio.recording_indicator.time.monotonic",
-                return_value=11.0,
-            ),
-            pytest.raises(RuntimeError, match="rim failed"),
-        ):
-            view.draw(None)
-
-        assert state_depth[0] == 0
-        assert sum(event[0] == "save" for event in state_events) == sum(event[0] == "restore" for event in state_events)
-        view._orb_path.addClip.assert_called_once_with()
-        assert view._orb_path.stroke.call_count == 2
-
-    def test_failed_path_rebuild_clears_again_and_recovers_next_frame(self):
-        view = _install_mock_resources(RecordingIndicatorView())
-        view._orb_path.curveToPoint_controlPoint1_controlPoint2_.side_effect = RuntimeError("curve failed")
-        view._start_time = 10.0
-
-        state_depth = [0]
-
-        def _save_state():
-            state_depth[0] += 1
-
-        def _restore_state():
-            state_depth[0] -= 1
-
-        appkit = MagicMock()
-        appkit.NSGraphicsContext.saveGraphicsState.side_effect = _save_state
-        appkit.NSGraphicsContext.restoreGraphicsState.side_effect = _restore_state
-        foundation = MagicMock()
-        foundation.NSMakePoint.side_effect = lambda x, y: SimpleNamespace(x=x, y=y)
-
-        with (
-            patch.dict(
-                sys.modules,
-                {"AppKit": appkit, "Foundation": foundation},
-            ),
-            patch(
-                "wenzi.audio.recording_indicator.time.monotonic",
-                return_value=11.0,
-            ),
+        with patch(
+            "wenzi.audio.recording_indicator.time.monotonic",
+            return_value=11.0,
         ):
             with pytest.raises(RuntimeError, match="curve failed"):
                 view.draw(None)
 
-            assert state_depth[0] == 0
-            view._orb_path.curveToPoint_controlPoint1_controlPoint2_.side_effect = None
+            # The rebuild died before any disk stroke or the shadow draw.
+            assert all(path.stroke.call_count == 0 for path in view._disk_paths)
+            view._shadow_gradient.drawFromCenter_radius_toCenter_radius_options_.assert_not_called()
+
+            failing_path.curveToPoint_controlPoint1_controlPoint2_.side_effect = None
             view.draw(None)
 
-        assert state_depth[0] == 0
-        assert view._orb_path.removeAllPoints.call_count == 2
-        assert view._orb_path.closePath.call_count == 1
-        view._orb_path.addClip.assert_called_once_with()
-        assert view._orb_path.stroke.call_count == 3
+        assert failing_path.removeAllPoints.call_count == 2
+        assert view._shadow_gradient.drawFromCenter_radius_toCenter_radius_options_.call_count == 1
+        assert all(path.stroke.call_count == 4 for path in view._disk_paths)
+
+
+def _host_mocks(appkit, foundation):
+    """Prepare fake NSPanel/NSScreen/NSTimer plumbing for panel tests."""
+    native_panel = MagicMock(name="native_panel")
+    timer = MagicMock(name="timer")
+    appkit.NSPanel.alloc.return_value.initWithContentRect_styleMask_backing_defer_.return_value = native_panel
+    screen_frame = SimpleNamespace(
+        origin=SimpleNamespace(x=100.0, y=50.0),
+        size=SimpleNamespace(width=1000.0, height=700.0),
+    )
+    appkit.NSScreen.mainScreen.return_value.visibleFrame.return_value = screen_frame
+    foundation.NSMakeRect.side_effect = lambda *args: args
+    foundation.NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_.return_value = timer
+    return native_panel, timer
+
+
+def _patched_view(indicator):
+    """Patch RecordingIndicatorView natives so a real view instance is used."""
+
+    def _create_view(indicator_view, width, height):
+        indicator_view._view = indicator
+        indicator._indicator = indicator_view
+        return indicator
+
+    return (
+        patch.object(RecordingIndicatorView, "prepare_for_display"),
+        patch.object(
+            RecordingIndicatorView,
+            "create_view",
+            autospec=True,
+            side_effect=_create_view,
+        ),
+    )
 
 
 class TestRecordingIndicatorPanel:
@@ -855,6 +844,8 @@ class TestRecordingIndicatorPanel:
         assert panel.show_device_name is False
         assert panel._panel is None
         assert panel._timer is None
+        assert panel._visible is False
+        assert panel._show_gen == 0
 
     def test_enabled_and_show_device_name_toggles(self):
         panel = RecordingIndicatorPanel()
@@ -864,55 +855,28 @@ class TestRecordingIndicatorPanel:
         panel.enabled = False
         assert panel.enabled is False
 
-    def test_show_builds_only_a_transparent_centered_indicator_host(self):
+    def test_show_builds_transparent_host_and_runs_entry_animation(self, monkeypatch):
+        appkit, foundation, quartz = _install_fake_native(monkeypatch)
         panel = RecordingIndicatorPanel()
-        native_panel = MagicMock()
-        timer = MagicMock()
-        indicator = MagicMock()
-
-        appkit = MagicMock()
-        appkit.NSStatusWindowLevel = 100
-        appkit.NSPanel.alloc.return_value.initWithContentRect_styleMask_backing_defer_.return_value = native_panel
-        screen_frame = SimpleNamespace(
-            origin=SimpleNamespace(x=100.0, y=50.0),
-            size=SimpleNamespace(width=1000.0, height=700.0),
-        )
-        appkit.NSScreen.mainScreen.return_value.visibleFrame.return_value = screen_frame
-
-        foundation = MagicMock()
-        foundation.NSMakeRect.side_effect = lambda *args: args
-        foundation.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_.return_value = timer
+        native_panel, timer = _host_mocks(appkit, foundation)
+        indicator = MagicMock(name="indicator_ns_view")
+        layer = indicator.layer.return_value
 
         events = []
         native_panel.setContentView_.side_effect = lambda view: events.append("content")
         native_panel.setAlphaValue_.side_effect = lambda value: events.append(f"alpha-{value}")
+        native_panel.animator.return_value.setAlphaValue_.side_effect = lambda value: events.append(f"alpha-animator-{value}")
         indicator.setNeedsDisplay_.side_effect = lambda value: events.append("needs-display")
         indicator.displayIfNeededIgnoringOpacity.side_effect = lambda: events.append("first-frame")
         native_panel.orderFront_.side_effect = lambda sender: events.append("order-front")
-        foundation.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_.side_effect = lambda *args: (
+        layer.addAnimation_forKey_.side_effect = lambda anim, key: events.append(f"layer-{key}")
+        foundation.NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_.side_effect = lambda *args: (
             events.append("timer") or timer
         )
 
-        with (
-            patch.dict(
-                sys.modules,
-                {"AppKit": appkit, "Foundation": foundation},
-            ),
-            patch.object(
-                RecordingIndicatorView,
-                "prepare_for_display",
-                side_effect=lambda: events.append("prepare"),
-            ) as prepare,
-            patch.object(
-                RecordingIndicatorView,
-                "create_view",
-                return_value=indicator,
-            ) as create_view,
-            patch.object(
-                RecordingIndicatorPanel,
-                "_animate_alpha",
-            ) as animate_alpha,
-        ):
+        prepare_patch, create_patch = _patched_view(indicator)
+        with prepare_patch as prepare, create_patch as create_view:
+            prepare.side_effect = lambda: events.append("prepare")
             panel.show("MacBook Pro Microphone", "Proofread")
 
         prepare.assert_called_once()
@@ -923,15 +887,19 @@ class TestRecordingIndicatorPanel:
         native_panel.setBackgroundColor_.assert_called_once_with(appkit.NSColor.clearColor.return_value)
         native_panel.setIgnoresMouseEvents_.assert_called_once_with(True)
         native_panel.setHasShadow_.assert_called_once_with(False)
-        native_panel.setFrameOrigin_.assert_called_once_with((490.0, 296.0))
-        create_view.assert_called_once_with(_PANEL_WIDTH, _PANEL_HEIGHT)
+        native_panel.setFrameOrigin_.assert_called_once_with(
+            (480.0, 50.0 + (700.0 - _PANEL_HEIGHT) * _SCREEN_VERTICAL_BIAS)
+        )
+        assert create_view.call_args.args[1:] == (_PANEL_WIDTH, _PANEL_HEIGHT)
         native_panel.setContentView_.assert_called_once_with(indicator)
         indicator.setNeedsDisplay_.assert_called_once_with(True)
         indicator.displayIfNeededIgnoringOpacity.assert_called_once_with()
-        assert native_panel.setAlphaValue_.call_args_list == [
-            ((0.0,), {}),
-            ((0.62,), {}),
-        ]
+        native_panel.orderOut_.assert_not_called()
+
+        # The hard alpha cut is gone: 0.0 is set directly, 1.0 only ever
+        # through the animator inside the entry animation.
+        assert native_panel.setAlphaValue_.call_args_list == [((0.0,), {})]
+        native_panel.animator.return_value.setAlphaValue_.assert_called_once_with(1.0)
         assert events == [
             "prepare",
             "content",
@@ -939,14 +907,32 @@ class TestRecordingIndicatorPanel:
             "order-front",
             "needs-display",
             "first-frame",
-            "alpha-0.62",
+            "layer-wenzi.entry",
+            "alpha-animator-1.0",
             "timer",
         ]
-        animate_alpha.assert_called_once_with(native_panel, 1.0, duration=0.18)
-        foundation.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_.assert_called_once_with(
-            0.05, indicator, b"refresh:", None, True
+
+        layer.removeAllAnimations.assert_called_once_with()
+        quartz.CABasicAnimation.animationWithKeyPath_.assert_called_once_with("transform")
+        entry = quartz.CABasicAnimation.animationWithKeyPath_.return_value
+        entry.setFromValue_.assert_called_once_with(
+            foundation.NSValue.valueWithCATransform3D_.return_value
         )
-        timer.setTolerance_.assert_called_once_with(0.01)
+        entry.setDuration_.assert_called_once_with(pytest.approx(_ENTRY_DURATION))
+        quartz.CAMediaTimingFunction.functionWithName_.assert_called_with(quartz.kCAMediaTimingFunctionEaseOut)
+        appkit.NSAnimationContext.currentContext.return_value.setDuration_.assert_called_once_with(
+            pytest.approx(_ENTRY_DURATION)
+        )
+
+        foundation.NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_.assert_called_once_with(
+            pytest.approx(_REFRESH_INTERVAL), indicator, b"refresh:", None, True
+        )
+        timer.setTolerance_.assert_called_once_with(pytest.approx(_REFRESH_INTERVAL * 0.2))
+        foundation.NSRunLoop.currentRunLoop.return_value.addTimer_forMode_.assert_called_once_with(
+            timer, foundation.NSRunLoopCommonModes
+        )
+        assert panel._visible is True
+        assert panel._show_gen == 1
         assert panel._mode_name == "Proofread"
         assert panel._device_name == "MacBook Pro Microphone"
 
@@ -961,105 +947,280 @@ class TestRecordingIndicatorPanel:
         assert panel._timer is None
         view_type.assert_not_called()
 
-    def test_first_frame_failure_closes_invisible_panel_without_timer(self):
+    def test_prewarm_builds_panel_and_palette_without_ordering_front(self, monkeypatch):
+        appkit, foundation, _quartz = _install_fake_native(monkeypatch)
         panel = RecordingIndicatorPanel()
-        native_panel = MagicMock()
-        indicator = MagicMock()
+        native_panel, _timer = _host_mocks(appkit, foundation)
+        indicator = MagicMock(name="indicator_ns_view")
+
+        prepare_patch, create_patch = _patched_view(indicator)
+        with prepare_patch as prepare, create_patch:
+            panel.prewarm()
+
+        prepare.assert_called_once()
+        assert panel._panel is native_panel
+        assert panel._indicator_view is not None
+        assert panel._visible is False
+        assert panel.current_frame is None
+        native_panel.orderFront_.assert_not_called()
+        native_panel.setAlphaValue_.assert_not_called()
+        foundation.NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_.assert_not_called()
+
+    def test_prewarm_failure_leaves_clean_state_for_cold_show(self, monkeypatch):
+        appkit, _foundation, _quartz = _install_fake_native(monkeypatch)
+        panel = RecordingIndicatorPanel()
+        appkit.NSPanel.alloc.return_value.initWithContentRect_styleMask_backing_defer_.side_effect = RuntimeError(
+            "panel init failed"
+        )
+
+        prepare_patch, create_patch = _patched_view(MagicMock())
+        with prepare_patch, create_patch:
+            panel.prewarm()  # must not raise
+
+        assert panel._panel is None
+        assert panel._indicator_view is None
+        assert panel._timer is None
+        assert panel._visible is False
+
+    def test_prewarm_disabled_builds_nothing(self):
+        panel = RecordingIndicatorPanel()
+        panel.enabled = False
+
+        with patch("wenzi.audio.recording_indicator.RecordingIndicatorView") as view_type:
+            panel.prewarm()
+
+        assert panel._panel is None
+        view_type.assert_not_called()
+
+    def test_show_after_prewarm_reuses_panel_view_and_palette(self, monkeypatch):
+        appkit, foundation, _quartz = _install_fake_native(monkeypatch)
+        panel = RecordingIndicatorPanel()
+        native_panel, timer = _host_mocks(appkit, foundation)
+        indicator = MagicMock(name="indicator_ns_view")
+
+        prepare_patch, create_patch = _patched_view(indicator)
+        with prepare_patch as prepare, create_patch as create_view:
+            panel.prewarm()
+            built_view = panel._indicator_view
+            panel.show("Mic", "Proofread")
+            panel.hide()
+            panel.show("Mic", "Proofread")
+
+        # One cold build, then pure reuse.
+        appkit.NSPanel.alloc.return_value.initWithContentRect_styleMask_backing_defer_.assert_called_once()
+        prepare.assert_called_once()
+        assert create_view.call_count == 1
+        assert panel._panel is native_panel
+        assert panel._indicator_view is built_view
+        assert native_panel.orderFront_.call_count == 2
+        assert panel._show_gen == 2
+        assert timer.invalidate.call_count == 1  # invalidated by hide()
+
+    def test_show_resets_session_state_and_removes_stale_layer_animations(self, monkeypatch):
+        appkit, foundation, _quartz = _install_fake_native(monkeypatch)
+        panel = RecordingIndicatorPanel()
+        _host_mocks(appkit, foundation)
+        indicator = MagicMock(name="indicator_ns_view")
+        layer = indicator.layer.return_value
+
+        prepare_patch, create_patch = _patched_view(indicator)
+        with prepare_patch, create_patch:
+            panel.show()
+            view = panel._indicator_view
+            view._level = 0.7
+            view._recording_active = True
+            view._recording_active_at = 1.0
+            view._flow_phase = 7.0
+            panel._smoothed_level = 0.5
+            panel._level_mean = 0.4
+            panel.show()
+
+        assert view._level == 0.0
+        assert view._recording_active is False
+        assert view._recording_active_at is None
+        assert view._flow_phase == 0.0
+        assert panel._smoothed_level == 0.0
+        assert panel._level_mean is None
+        # Once per show: clears the exit animation's held fillMode state.
+        assert layer.removeAllAnimations.call_count == 2
+
+    def test_show_recenters_on_current_main_screen_each_show(self, monkeypatch):
+        appkit, foundation, _quartz = _install_fake_native(monkeypatch)
+        panel = RecordingIndicatorPanel()
+        native_panel, _timer = _host_mocks(appkit, foundation)
+        indicator = MagicMock(name="indicator_ns_view")
+        frames = [
+            SimpleNamespace(
+                origin=SimpleNamespace(x=100.0, y=50.0),
+                size=SimpleNamespace(width=1000.0, height=700.0),
+            ),
+            SimpleNamespace(
+                origin=SimpleNamespace(x=0.0, y=0.0),
+                size=SimpleNamespace(width=2000.0, height=1200.0),
+            ),
+        ]
+        appkit.NSScreen.mainScreen.return_value.visibleFrame.side_effect = frames
+
+        prepare_patch, create_patch = _patched_view(indicator)
+        with prepare_patch, create_patch:
+            panel.show()
+            panel.hide()
+            panel.show()
+
+        assert native_panel.setFrameOrigin_.call_args_list == [
+            call((480.0, 50.0 + (700.0 - _PANEL_HEIGHT) * _SCREEN_VERTICAL_BIAS)),
+            call(
+                (
+                    (2000.0 - _PANEL_WIDTH) / 2.0,
+                    (1200.0 - _PANEL_HEIGHT) * _SCREEN_VERTICAL_BIAS,
+                )
+            ),
+        ]
+
+    def test_show_failure_tears_down_for_cold_rebuild(self, monkeypatch):
+        appkit, foundation, _quartz = _install_fake_native(monkeypatch)
+        panel = RecordingIndicatorPanel()
+        native_panel, _timer = _host_mocks(appkit, foundation)
+        indicator = MagicMock(name="indicator_ns_view")
         indicator.displayIfNeededIgnoringOpacity.side_effect = RuntimeError("draw failed")
 
-        appkit = MagicMock()
-        appkit.NSStatusWindowLevel = 100
-        appkit.NSPanel.alloc.return_value.initWithContentRect_styleMask_backing_defer_.return_value = native_panel
-        appkit.NSScreen.mainScreen.return_value = None
-        foundation = MagicMock()
-        foundation.NSMakeRect.side_effect = lambda *args: args
-
-        def _create_view(indicator_view, width, height):
-            indicator_view._view = indicator
-            indicator._indicator = indicator_view
-            return indicator
-
-        with (
-            patch.dict(
-                sys.modules,
-                {"AppKit": appkit, "Foundation": foundation},
-            ),
-            patch.object(
-                RecordingIndicatorView,
-                "prepare_for_display",
-            ),
-            patch.object(
-                RecordingIndicatorView,
-                "create_view",
-                autospec=True,
-                side_effect=_create_view,
-            ),
-        ):
+        prepare_patch, create_patch = _patched_view(indicator)
+        with prepare_patch, create_patch:
             panel.show("Microphone", "Proofread")
 
         native_panel.setAlphaValue_.assert_called_once_with(0.0)
         native_panel.orderFront_.assert_called_once_with(None)
         native_panel.orderOut_.assert_called_once_with(None)
-        foundation.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_.assert_not_called()
+        foundation.NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_.assert_not_called()
         assert indicator._indicator is None
         assert panel._panel is None
         assert panel._timer is None
         assert panel._indicator_view is None
+        assert panel._visible is False
+
+    def test_disabling_indicator_tears_down_cached_panel(self, monkeypatch):
+        appkit, foundation, _quartz = _install_fake_native(monkeypatch)
+        panel = RecordingIndicatorPanel()
+        native_panel, _timer = _host_mocks(appkit, foundation)
+        indicator = MagicMock(name="indicator_ns_view")
+
+        prepare_patch, create_patch = _patched_view(indicator)
+        with prepare_patch, create_patch:
+            panel.prewarm()
+            assert panel._panel is native_panel
+            panel.enabled = False
+
+        assert panel._panel is None
+        assert panel._indicator_view is None
+        assert indicator._indicator is None
+        native_panel.orderOut_.assert_called()
 
     def test_update_level_uses_asymmetric_ema_and_clamps(self):
         panel = RecordingIndicatorPanel()
         panel._indicator_view = RecordingIndicatorView()
 
-        panel.update_level(4.0)
+        # The first sample seeds the local mean: no artificial swing.
+        panel.update_level(0.05)
+        assert panel._smoothed_level == pytest.approx(0.0)
+        # A jump far above the mean saturates the swing → fast attack.
+        panel.update_level(1.0)
         assert panel._smoothed_level == pytest.approx(0.7)
         panel.update_level(1.0)
         assert panel._smoothed_level == pytest.approx(0.91)
-        panel.update_level(-2.0)
-        assert panel._smoothed_level == pytest.approx(0.6825)
-        assert panel._indicator_view._level == pytest.approx(0.6825)
+        # Falling back near the (risen) mean → soft release.
+        panel.update_level(0.2)
+        assert panel._smoothed_level == pytest.approx(0.732, abs=1e-3)
+        assert panel._indicator_view._level == pytest.approx(0.732, abs=1e-3)
 
-    def test_first_real_speech_sample_drives_waves_and_corona(self):
+    def test_shape_rests_after_speech_despite_room_noise(self):
+        """Stopping speech must relax the disk even when steady ambient
+        noise (music, fans) keeps the absolute level above the voice
+        floor: a flat signal has no modulation."""
         panel = RecordingIndicatorPanel()
         panel._indicator_view = RecordingIndicatorView()
 
-        # Recorder RMS 500 maps to 0.625; one attack tick must already be visible.
+        for _ in range(10):
+            panel.update_level(0.9)  # syllable peaks over room noise
+            panel.update_level(0.45)
+        assert _gravity_pull(panel._indicator_view._level) > 0.9
+
+        for _ in range(40):
+            panel.update_level(0.35)  # speech stopped; noise persists
+        assert _gravity_pull(panel._indicator_view._level) == 0.0
+
+    def test_continuous_speech_keeps_disk_rippling(self):
+        """As long as the signal is modulated (someone is talking), the
+        disk must keep rippling — it must NOT fade out mid-sentence."""
+        panel = RecordingIndicatorPanel()
+        panel._indicator_view = RecordingIndicatorView()
+
+        panel.update_level(0.1)  # settle the local mean while quiet
+        for _ in range(3):  # speech onset
+            panel.update_level(1.0)
+            panel.update_level(0.5)
+        for _ in range(60):  # a long uninterrupted sentence
+            panel.update_level(1.0)
+            assert _gravity_pull(panel._indicator_view._level) == 1.0
+            panel.update_level(0.5)
+            assert _gravity_pull(panel._indicator_view._level) == 1.0
+
+    def test_pause_then_resume_deforms_again(self):
+        panel = RecordingIndicatorPanel()
+        panel._indicator_view = RecordingIndicatorView()
+
+        panel.update_level(0.1)
+        for _ in range(4):
+            panel.update_level(1.0)
+            panel.update_level(0.5)
+        assert _gravity_pull(panel._indicator_view._level) == 1.0
+
+        for _ in range(40):
+            panel.update_level(0.35)  # pause: steady room noise
+        assert _gravity_pull(panel._indicator_view._level) == 0.0
+
+        panel.update_level(1.0)  # resume speaking
+        assert _gravity_pull(panel._indicator_view._level) == 1.0
+
+    def test_first_speech_sample_ripples_the_disk(self):
+        panel = RecordingIndicatorPanel()
+        panel._indicator_view = RecordingIndicatorView()
+
+        # Quiet room seeds the mean; recorder RMS 1500 maps to 0.625 —
+        # one attack tick must already be fully visible.
+        panel.update_level(0.05)
         panel.update_level(0.625)
         activity = panel._indicator_view._level
 
-        assert activity == pytest.approx(0.4375)
+        assert activity == pytest.approx(0.7)
         assert _gravity_pull(activity) > 0.7
         for index in range(3):
-            idle_wave = _wave_points(index, 1.0, 0.0)
-            speech_wave = _wave_points(index, 1.0, activity)
-            idle_span = max(y for _, y in idle_wave) - min(y for _, y in idle_wave)
-            speech_span = max(y for _, y in speech_wave) - min(y for _, y in speech_wave)
-            assert speech_span - idle_span >= 8.0
             assert (
                 _average_distance(
-                    _corona_points(index, 1.0, 0.0),
-                    _corona_points(index, 1.0, activity),
+                    _disk_points(index, 1.0, 0.0),
+                    _disk_points(index, 1.0, activity),
                 )
-                >= 0.9
+                >= 1.0
             )
 
         noise_panel = RecordingIndicatorPanel()
         noise_panel._indicator_view = RecordingIndicatorView()
-        noise_panel.update_level(0.25)
-        assert noise_panel._indicator_view._level == pytest.approx(0.175)
+        noise_panel.update_level(0.25)  # steady noise seeds the mean
+        assert noise_panel._indicator_view._level == pytest.approx(0.0)
         assert _gravity_pull(noise_panel._indicator_view._level) == 0.0
 
     def test_repeated_level_updates_converge_and_return_to_quiet(self):
         panel = RecordingIndicatorPanel()
         panel._indicator_view = RecordingIndicatorView()
 
-        for _ in range(10):
+        for _ in range(5):
             panel.update_level(1.0)
-        assert panel._smoothed_level > 0.99
+            panel.update_level(0.4)
+        assert panel._smoothed_level > 0.9
         assert _gravity_pull(panel._indicator_view._level) > 0.99
 
-        for _ in range(20):
+        for _ in range(40):
             panel.update_level(0.0)
-        assert panel._smoothed_level < 0.01
+        assert panel._smoothed_level < 0.05
         assert _gravity_pull(panel._indicator_view._level) == 0.0
 
     def test_set_recording_active_updates_view(self):
@@ -1070,11 +1231,13 @@ class TestRecordingIndicatorPanel:
         panel.set_recording_active()
 
         assert panel._indicator_view._recording_active is True
+        assert panel._indicator_view._recording_active_at is not None
         panel._indicator_view._view.setNeedsDisplay_.assert_called_once_with(True)
 
     def test_legacy_mode_and_device_updates_add_no_visual_content(self):
         panel = RecordingIndicatorPanel()
         panel._panel = MagicMock()
+        panel._visible = True
         panel._indicator_view = RecordingIndicatorView()
 
         panel.update_mode("Translate EN")
@@ -1084,6 +1247,15 @@ class TestRecordingIndicatorPanel:
         assert panel._device_name == "MacBook Pro Microphone"
         assert not hasattr(panel._indicator_view, "_subtitle")
         assert not hasattr(panel._indicator_view, "_status_text")
+
+    def test_update_device_name_ignored_while_hidden(self):
+        panel = RecordingIndicatorPanel()
+        panel._panel = MagicMock()
+        panel._visible = False
+
+        panel.update_device_name("MacBook Pro Microphone")
+
+        assert panel._device_name is None
 
     def test_clear_mode_keeps_orb_state(self):
         panel = RecordingIndicatorPanel()
@@ -1096,7 +1268,7 @@ class TestRecordingIndicatorPanel:
         assert panel._mode_name is None
         assert panel._indicator_view is view
 
-    def test_hide_invalidates_timer_and_clears_state(self):
+    def test_hide_orders_out_and_keeps_reusable_host(self):
         panel = RecordingIndicatorPanel()
         timer = MagicMock()
         native_panel = MagicMock()
@@ -1107,6 +1279,7 @@ class TestRecordingIndicatorPanel:
         panel._timer = timer
         panel._panel = native_panel
         panel._indicator_view = indicator_view
+        panel._visible = True
         panel._smoothed_level = 0.5
         panel._mode_name = "Proofread"
         panel._device_name = "Mic"
@@ -1116,14 +1289,16 @@ class TestRecordingIndicatorPanel:
         timer.invalidate.assert_called_once()
         native_panel.orderOut_.assert_called_once_with(None)
         assert panel._timer is None
-        assert panel._panel is None
-        assert panel._indicator_view is None
+        # The host survives for the next show()
+        assert panel._panel is native_panel
+        assert panel._indicator_view is indicator_view
+        assert native_view._indicator is indicator_view
+        assert panel._visible is False
         assert panel._smoothed_level == 0.0
         assert panel._mode_name is None
         assert panel._device_name is None
-        assert native_view._indicator is None
 
-    def test_hide_clears_ownership_when_native_cleanup_fails(self):
+    def test_hide_tears_down_when_native_cleanup_fails(self):
         panel = RecordingIndicatorPanel()
         timer = MagicMock()
         timer.invalidate.side_effect = RuntimeError("timer failed")
@@ -1136,15 +1311,17 @@ class TestRecordingIndicatorPanel:
         panel._timer = timer
         panel._panel = native_panel
         panel._indicator_view = indicator_view
+        panel._visible = True
 
         panel.hide()
 
         timer.invalidate.assert_called_once()
-        native_panel.orderOut_.assert_called_once_with(None)
+        # Broken native state must not be kept for reuse.
         assert panel._timer is None
         assert panel._panel is None
         assert panel._indicator_view is None
         assert native_view._indicator is None
+        assert panel._visible is False
 
     def test_current_frame(self):
         panel = RecordingIndicatorPanel()
@@ -1152,6 +1329,11 @@ class TestRecordingIndicatorPanel:
 
         native_panel = MagicMock()
         panel._panel = native_panel
+        # Built but hidden: still no frame (preview morphs only from a
+        # visible orb).
+        assert panel.current_frame is None
+
+        panel._visible = True
         assert panel.current_frame is native_panel.frame.return_value
 
     def test_animate_out_calls_completion_when_hidden(self):
@@ -1159,92 +1341,112 @@ class TestRecordingIndicatorPanel:
         completion = MagicMock()
 
         panel.animate_out(completion)
-
         completion.assert_called_once()
 
-    def test_animate_out_keeps_timer_until_scale_animation_completes(self):
-        panel = RecordingIndicatorPanel()
+        # Built-but-hidden panel behaves the same
         panel._panel = MagicMock()
-        panel._indicator_view = RecordingIndicatorView()
-        panel._indicator_view._view = MagicMock()
-        panel._indicator_view._view._indicator = panel._indicator_view
-        native_panel = panel._panel
-        native_view = panel._indicator_view._view
+        panel._visible = False
+        second_completion = MagicMock()
+        panel.animate_out(second_completion)
+        second_completion.assert_called_once()
+
+    def test_animate_out_stops_timer_and_orders_out_on_completion(self, monkeypatch):
+        appkit, foundation, quartz = _install_fake_native(monkeypatch)
+        panel = RecordingIndicatorPanel()
+        native_panel = MagicMock()
+        native_view = MagicMock()
+        indicator_view = RecordingIndicatorView()
+        indicator_view._view = native_view
+        panel._panel = native_panel
+        panel._indicator_view = indicator_view
+        panel._visible = True
+        panel._show_gen = 3
         timer = MagicMock()
         panel._timer = timer
-
-        captured = {}
-        context = MagicMock()
-        context.setCompletionHandler_.side_effect = lambda callback: captured.setdefault("callback", callback)
-        animation_context = MagicMock()
-        animation_context.currentContext.return_value = context
-
-        with patch.dict(
-            sys.modules,
-            {"AppKit": MagicMock(NSAnimationContext=animation_context)},
-        ):
-            panel.animate_out()
-
-        assert panel._indicator_view._exit_started_at is not None
-        panel._indicator_view._view.setNeedsDisplay_.assert_called_once_with(True)
-        timer.invalidate.assert_not_called()
-        assert panel._timer is timer
-
-        captured["callback"]()
-
-        timer.invalidate.assert_called_once()
-        native_panel.orderOut_.assert_called_once_with(None)
-        assert native_view._indicator is None
-        assert panel._timer is None
-        assert panel._panel is None
-
-    def test_stale_animate_completion_cannot_clear_new_orb(self):
-        panel = RecordingIndicatorPanel()
-        old_panel = MagicMock()
-        old_view = RecordingIndicatorView()
-        panel._panel = old_panel
-        panel._indicator_view = old_view
         completion = MagicMock()
 
         captured = {}
-        context = MagicMock()
+        context = appkit.NSAnimationContext.currentContext.return_value
         context.setCompletionHandler_.side_effect = lambda callback: captured.setdefault("callback", callback)
-        animation_context = MagicMock()
-        animation_context.currentContext.return_value = context
 
-        with patch.dict(
-            sys.modules,
-            {"AppKit": MagicMock(NSAnimationContext=animation_context)},
-        ):
-            panel.animate_out(completion)
+        panel.animate_out(completion)
 
-        new_panel = MagicMock()
-        new_view = RecordingIndicatorView()
-        new_timer = MagicMock()
-        panel._panel = new_panel
-        panel._indicator_view = new_view
-        panel._timer = new_timer
-        captured["callback"]()
+        # The refresh timer stops immediately: the exit is pure CA.
+        timer.invalidate.assert_called_once()
+        assert panel._timer is None
 
-        assert panel._panel is new_panel
-        assert panel._indicator_view is new_view
-        assert panel._timer is new_timer
-        new_timer.invalidate.assert_not_called()
-        old_panel.orderOut_.assert_not_called()
+        quartz.CABasicAnimation.animationWithKeyPath_.assert_called_once_with("transform")
+        shrink = quartz.CABasicAnimation.animationWithKeyPath_.return_value
+        shrink.setToValue_.assert_called_once_with(
+            foundation.NSValue.valueWithCATransform3D_.return_value
+        )
+        shrink.setDuration_.assert_called_once_with(pytest.approx(_EXIT_DURATION))
+        shrink.setFillMode_.assert_called_once_with(quartz.kCAFillModeForwards)
+        shrink.setRemovedOnCompletion_.assert_called_once_with(False)
+        native_view.layer.return_value.addAnimation_forKey_.assert_called_once_with(shrink, "wenzi.exit")
+        quartz.CAMediaTimingFunction.functionWithName_.assert_called_with(quartz.kCAMediaTimingFunctionEaseIn)
+        native_panel.animator.return_value.setAlphaValue_.assert_called_once_with(0.0)
+        context.setDuration_.assert_called_once_with(pytest.approx(_EXIT_DURATION))
+        native_panel.orderOut_.assert_not_called()
         completion.assert_not_called()
 
-    def test_alpha_animation_always_ends_group(self):
+        captured["callback"]()
+
+        native_panel.orderOut_.assert_called_once_with(None)
+        completion.assert_called_once()
+        assert panel._visible is False
+        # The host survives for the next show()
+        assert panel._panel is native_panel
+        assert panel._indicator_view is indicator_view
+
+    def test_stale_animate_completion_cannot_clear_new_orb(self, monkeypatch):
+        appkit, _foundation, _quartz = _install_fake_native(monkeypatch)
+        panel = RecordingIndicatorPanel()
         native_panel = MagicMock()
-        native_panel.animator().setAlphaValue_.side_effect = RuntimeError("animation failed")
-        animation_context = MagicMock()
+        native_view = MagicMock()
+        indicator_view = RecordingIndicatorView()
+        indicator_view._view = native_view
+        panel._panel = native_panel
+        panel._indicator_view = indicator_view
+        panel._visible = True
+        panel._show_gen = 1
+        completion = MagicMock()
 
-        with patch.dict(
-            sys.modules,
-            {"AppKit": MagicMock(NSAnimationContext=animation_context)},
-        ):
-            try:
-                RecordingIndicatorPanel._animate_alpha(native_panel, 1.0)
-            except RuntimeError:
-                pass
+        captured = {}
+        context = appkit.NSAnimationContext.currentContext.return_value
+        context.setCompletionHandler_.side_effect = lambda callback: captured.setdefault("callback", callback)
 
-        animation_context.endGrouping.assert_called_once()
+        panel.animate_out(completion)
+
+        # A newer show() takes over the REUSED panel before the fade ends
+        panel._show_gen += 1
+        panel._visible = True
+        new_timer = MagicMock()
+        panel._timer = new_timer
+
+        captured["callback"]()
+
+        native_panel.orderOut_.assert_not_called()
+        assert panel._visible is True
+        assert panel._timer is new_timer
+        new_timer.invalidate.assert_not_called()
+        completion.assert_not_called()
+
+    def test_animate_out_failure_falls_back_to_hide(self, monkeypatch):
+        appkit, _foundation, quartz = _install_fake_native(monkeypatch)
+        panel = RecordingIndicatorPanel()
+        native_panel = MagicMock()
+        native_view = MagicMock()
+        indicator_view = RecordingIndicatorView()
+        indicator_view._view = native_view
+        panel._panel = native_panel
+        panel._indicator_view = indicator_view
+        panel._visible = True
+        completion = MagicMock()
+        quartz.CABasicAnimation.animationWithKeyPath_.side_effect = RuntimeError("no CA")
+
+        panel.animate_out(completion)
+
+        native_panel.orderOut_.assert_called_once_with(None)
+        assert panel._visible is False
+        completion.assert_called_once()

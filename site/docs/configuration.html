@@ -108,7 +108,10 @@
     &quot;block_ms&quot;: 20,
     &quot;device&quot;: null,
     &quot;max_session_bytes&quot;: 20971520,
-    &quot;silence_rms&quot;: 20
+    &quot;silence_rms&quot;: 20,
+    &quot;duck_system_audio&quot;: false,
+    &quot;duck_volume_ratio&quot;: 0.25,
+    &quot;duck_max_volume&quot;: 0.05
   },
   &quot;asr&quot;: {
     &quot;backend&quot;: &quot;apple&quot;,
@@ -221,7 +224,7 @@
 <tr>
 <td><code>audio.device</code></td>
 <td><code>null</code></td>
-<td>Audio input device (null = system default)</td>
+<td>Audio input device UID. <code>null</code> follows the current macOS default input device without rebinding it. An explicit UID is always honored.</td>
 </tr>
 <tr>
 <td><code>audio.max_session_bytes</code></td>
@@ -232,6 +235,21 @@
 <td><code>audio.silence_rms</code></td>
 <td><code>20</code></td>
 <td>RMS threshold below which audio is considered silence</td>
+</tr>
+<tr>
+<td><code>audio.duck_system_audio</code></td>
+<td><code>false</code></td>
+<td>Lower all Mac playback while recording, then restore it afterward. This also affects meeting audio.</td>
+</tr>
+<tr>
+<td><code>audio.duck_volume_ratio</code></td>
+<td><code>0.25</code></td>
+<td>Fraction of the current system volume kept while recording</td>
+</tr>
+<tr>
+<td><code>audio.duck_max_volume</code></td>
+<td><code>0.05</code></td>
+<td>Maximum system volume scalar allowed while recording</td>
 </tr>
 </tbody>
 </table></div>
@@ -495,7 +513,7 @@
 <tr>
 <td><code>feedback.visual_indicator</code></td>
 <td><code>true</code></td>
-<td>Show floating recording indicator with audio level bars</td>
+<td>Show an audio-reactive recording orb</td>
 </tr>
 <tr>
 <td><code>feedback.restart_key</code></td>
@@ -539,12 +557,12 @@
 <tr>
 <td><code>scripting.enabled</code></td>
 <td><code>false</code></td>
-<td>Enable the Lua scripting system</td>
+<td>Enable the Python scripting system</td>
 </tr>
 <tr>
 <td><code>scripting.script_dir</code></td>
 <td><code>null</code></td>
-<td>Custom directory for Lua scripts (null = <code>&lt;config_dir&gt;/scripts</code>)</td>
+<td>Custom directory for Python scripts (null = <code>&lt;config_dir&gt;/scripts</code>)</td>
 </tr>
 </tbody>
 </table></div>

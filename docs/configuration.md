@@ -22,7 +22,10 @@ The config file is always `config.json` inside the resolved directory.
     "block_ms": 20,
     "device": null,
     "max_session_bytes": 20971520,
-    "silence_rms": 20
+    "silence_rms": 20,
+    "duck_system_audio": false,
+    "duck_volume_ratio": 0.25,
+    "duck_max_volume": 0.05
   },
   "asr": {
     "backend": "apple",
@@ -109,9 +112,12 @@ The config file is always `config.json` inside the resolved directory.
 |-----|---------|-------------|
 | `audio.sample_rate` | `16000` | Audio sample rate in Hz |
 | `audio.block_ms` | `20` | Recording block size in milliseconds |
-| `audio.device` | `null` | Audio input device UID. `null` uses automatic routing: when the system default input is Bluetooth, WenZi prefers the Mac's built-in microphone to keep Bluetooth playback stable; otherwise it keeps the system default. An explicit UID is always honored. |
+| `audio.device` | `null` | Audio input device UID. `null` follows the current macOS default input device without rebinding it. An explicit UID is always honored. |
 | `audio.max_session_bytes` | `20971520` | Max recording size (~20 MB) |
 | `audio.silence_rms` | `20` | RMS threshold below which audio is considered silence |
+| `audio.duck_system_audio` | `false` | Lower all Mac playback while recording, then restore it afterward. This also affects meeting audio. |
+| `audio.duck_volume_ratio` | `0.25` | Fraction of the current system volume kept while recording |
+| `audio.duck_max_volume` | `0.05` | Maximum system volume scalar allowed while recording |
 
 ### ASR
 

@@ -313,8 +313,8 @@ uv run python -m wenzi
 <h3 id="preview-panel-basics"><a href="#preview-panel-basics" class="heading-anchor">Preview Panel Basics</a></h3>
 <p>When Preview is on, after recording you'll see a floating panel:</p>
 <ul>
-<li><strong>Confirm</strong> (<code>Enter</code>) — types the text and closes the panel</li>
-<li><strong>Copy to clipboard</strong> (<code>⌘+Enter</code>) — copies the text to clipboard instead of typing</li>
+<li><strong>Confirm</strong> (<code>⌘+Enter</code>) — types the text and closes the panel; plain <code>Enter</code> outside the editable final text also confirms, while inside it <code>Enter</code> inserts a newline</li>
+<li><strong>Copy to clipboard</strong> (<code>⌘+Shift+Enter</code>) — copies the text to clipboard instead of typing</li>
 <li><strong>Cancel</strong> (<code>Esc</code>) — discards the text</li>
 <li><strong>Edit</strong> — click the text area to modify before confirming</li>
 </ul>
@@ -335,6 +335,7 @@ uv run python -m wenzi
 <p>All model selection, AI enhancement configuration, and hotkey management are done through the <strong>Settings</strong> panel — not the menubar menu directly.</p>
 <h3 id="recording-feedback"><a href="#recording-feedback" class="heading-anchor">Recording Feedback</a></h3>
 <p>While holding <code>fn</code>, a floating indicator with audio level bars shows you're recording. A sound plays on start and stop (configurable in Settings → General).</p>
+<p>Settings → Microphone can optionally lower all Mac playback while recording and restore it afterward. This includes browser, music, and meeting audio. The control reduces the current volume proportionally and also applies a safety cap; it cannot remove a brief interruption caused by macOS or Bluetooth reconfiguring an audio route.</p>
 <p>When the ASR backend supports streaming (e.g., Apple Speech), a <strong>live transcription overlay</strong> appears below the recording indicator, showing partial transcription text in real time as you speak. This gives you immediate visual feedback without waiting for the recording to end.</p>
 <h3 id="recording-controls"><a href="#recording-controls" class="heading-anchor">Recording Controls</a></h3>
 <p>While holding the recording hotkey, you can press additional keys to control the session:</p>
@@ -443,7 +444,7 @@ uv run python -m wenzi
 base_url: https://api.deepseek.com/v1
 api_key: sk-your-key
 models:
-  deepseek-chat
+  deepseek-v4-flash
 </code></pre>
 <ol start="3">
 <li>Click <strong>Verify</strong> → <strong>Save</strong></li>
@@ -523,7 +524,7 @@ models:
 </tr>
 <tr>
 <td><strong>Copy to clipboard</strong></td>
-<td><code>⌘+Enter</code> — copies instead of typing into the active app</td>
+<td><code>⌘+Shift+Enter</code> — copies instead of typing into the active app</td>
 </tr>
 <tr>
 <td><strong>Toggle punctuation</strong></td>
@@ -995,12 +996,12 @@ models:
 <td>Open/close Launcher (if enabled)</td>
 </tr>
 <tr>
-<td><code>Enter</code></td>
+<td><code>⌘+Enter</code></td>
 <td>Preview panel</td>
-<td>Confirm and type text</td>
+<td>Confirm and type text (<code>Enter</code> inside the final text inserts a newline)</td>
 </tr>
 <tr>
-<td><code>⌘+Enter</code></td>
+<td><code>⌘+Shift+Enter</code></td>
 <td>Preview panel</td>
 <td>Copy to clipboard</td>
 </tr>

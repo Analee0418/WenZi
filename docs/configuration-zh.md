@@ -22,7 +22,10 @@
     "block_ms": 20,
     "device": null,
     "max_session_bytes": 20971520,
-    "silence_rms": 20
+    "silence_rms": 20,
+    "duck_system_audio": false,
+    "duck_volume_ratio": 0.25,
+    "duck_max_volume": 0.05
   },
   "asr": {
     "backend": "apple",
@@ -109,9 +112,12 @@
 |-----|---------|-------------|
 | `audio.sample_rate` | `16000` | 音频采样率（Hz） |
 | `audio.block_ms` | `20` | 录音块大小（毫秒） |
-| `audio.device` | `null` | 音频输入设备 UID。`null` 表示自动选择：系统默认输入是蓝牙设备时，闻字优先使用 Mac 内建麦克风以避免播放音质和音量变化；其他情况继续使用系统默认。显式 UID 始终会被尊重。 |
+| `audio.device` | `null` | 音频输入设备 UID。`null` 表示始终跟随 macOS 当前的默认输入设备，不执行设备重绑。显式 UID 始终会被尊重。 |
 | `audio.max_session_bytes` | `20971520` | 单次录音最大字节数（约 20 MB） |
 | `audio.silence_rms` | `20` | 静音判定的 RMS 阈值，低于此值视为静音 |
+| `audio.duck_system_audio` | `false` | 录音时降低 Mac 上所有播放声音，结束后恢复；会议音频也会受影响 |
+| `audio.duck_volume_ratio` | `0.25` | 录音期间保留当前系统音量的比例 |
+| `audio.duck_max_volume` | `0.05` | 录音期间允许的系统音量标量上限 |
 
 ### 语音识别（ASR）
 

@@ -150,6 +150,8 @@ All model selection, AI enhancement configuration, and hotkey management are don
 
 While holding `fn`, a floating indicator with audio level bars shows you're recording. A sound plays on start and stop (configurable in Settings → General).
 
+Settings → Microphone can optionally lower all Mac playback while recording and restore it afterward. This includes browser, music, and meeting audio. The control reduces the current volume proportionally and also applies a safety cap; it cannot remove a brief interruption caused by macOS or Bluetooth reconfiguring an audio route.
+
 When the ASR backend supports streaming (e.g., Apple Speech), a **live transcription overlay** appears below the recording indicator, showing partial transcription text in real time as you speak. This gives you immediate visual feedback without waiting for the recording to end.
 
 ### Recording Controls

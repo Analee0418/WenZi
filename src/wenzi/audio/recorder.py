@@ -20,13 +20,6 @@ logger = logging.getLogger(__name__)
 # Notification name (string constant; not always in the PyObjC bindings).
 _ENGINE_CONFIG_CHANGE = "AVAudioEngineConfigurationChangeNotification"
 
-# CoreAudio transport FourCC values.  AVCaptureDevice.transportType() exposes
-# these values even though the constants are not consistently exported by
-# every PyObjC build.
-_TRANSPORT_BLUETOOTH = int.from_bytes(b"blue", "big")
-_TRANSPORT_BUILT_IN = int.from_bytes(b"bltn", "big")
-
-
 @dataclass(frozen=True)
 class _InputRoute:
     """Resolved capture route for one Recorder.start() attempt."""
@@ -86,10 +79,8 @@ def _capture_device_route(device, *, bind: bool) -> _InputRoute:
 def _select_input_route(configured_uid: str | None) -> _InputRoute:
     """Resolve the effective input route without activating the microphone.
 
-    An explicit UID is always honored.  In automatic mode, a Bluetooth
-    system default is replaced with the Mac's built-in microphone so opening
-    the input stream does not force Bluetooth playback into its call profile.
-    Other system defaults are left untouched.
+    An explicit UID is always honored. Automatic mode follows the current
+    macOS default input without rebinding the AVAudioEngine input node.
     """
     if configured_uid:
         try:
@@ -115,38 +106,11 @@ def _select_input_route(configured_uid: str | None) -> _InputRoute:
     if default_device is None:
         return _InputRoute(None, None, None, False)
 
-    default_route = _capture_device_route(default_device, bind=False)
-    if default_route.transport_type != _TRANSPORT_BLUETOOTH:
-        return default_route
-
-    try:
-        devices = AVCaptureDevice.devicesWithMediaType_(AVMediaTypeAudio)
-    except Exception:
-        logger.warning(
-            "The default input is Bluetooth, but input devices could not be "
-            "listed; keeping the system default",
-            exc_info=True,
-        )
-        return default_route
-    for device in devices:
-        route = _capture_device_route(device, bind=True)
-        if route.transport_type == _TRANSPORT_BUILT_IN:
-            logger.info(
-                "Automatic input switched from Bluetooth default %s to built-in %s",
-                default_route.name or default_route.uid or "unknown",
-                route.name or route.uid or "unknown",
-            )
-            return route
-
-    logger.warning(
-        "The default input is Bluetooth and no built-in microphone is available; "
-        "keeping the system default"
-    )
-    return default_route
+    return _capture_device_route(default_device, bind=False)
 
 
 def automatic_input_device_name() -> str | None:
-    """Return the device name automatic routing would use, if available."""
+    """Return the current macOS default input device name, if available."""
     try:
         return _select_input_route(None).name
     except Exception:
@@ -335,7 +299,7 @@ class Recorder:
 
     @property
     def device(self) -> str | None:
-        """Configured input device UID, or None for automatic routing."""
+        """Configured input device UID, or None for the system default."""
         return self._device
 
     @device.setter

@@ -27,6 +27,12 @@ def mock_app():
     app = MagicMock()
     app._config = {
         "hotkeys": {"fn": True, "ctrl": False},
+        "audio": {
+            "device": None,
+            "duck_system_audio": False,
+            "duck_volume_ratio": 0.25,
+            "duck_max_volume": 0.05,
+        },
         "feedback": {"sound_enabled": True, "visual_indicator": True},
         "output": {"method": "type", "append_newline": False, "preview": True},
         "screenshot": {"enabled": True, "hotkey": "ctrl+cmd+5"},
@@ -207,6 +213,86 @@ class TestVisualToggle:
 
         assert mock_app._recording_indicator.enabled is False
         assert mock_app._visual_indicator_item.state == 0
+        mock_save.assert_called_once()
+
+
+class TestSystemAudioDuckSettings:
+    @patch("wenzi.controllers.settings_controller.save_config")
+    def test_toggle_system_audio_duck(self, mock_save, ctrl, mock_app):
+        ctrl.audio_duck_toggle(True)
+
+        assert mock_app._config["audio"]["duck_system_audio"] is True
+        mock_save.assert_called_once()
+
+    @patch("wenzi.controllers.settings_controller.save_config")
+    def test_change_duck_ratio(self, mock_save, ctrl, mock_app):
+        ctrl.audio_duck_ratio_change(18)
+
+        assert mock_app._config["audio"]["duck_volume_ratio"] == 0.18
+        mock_save.assert_called_once()
+
+    @patch("wenzi.controllers.settings_controller.save_config")
+    def test_change_duck_max_volume(self, mock_save, ctrl, mock_app):
+        ctrl.audio_duck_max_volume_change(14)
+
+        assert mock_app._config["audio"]["duck_max_volume"] == 0.14
+        mock_save.assert_called_once()
+
+    @pytest.mark.parametrize("value", [-1, 101, True, "invalid"])
+    @patch("wenzi.controllers.settings_controller.save_config")
+    def test_invalid_duck_ratio_is_ignored(
+        self, mock_save, value, ctrl, mock_app
+    ):
+        ctrl.audio_duck_ratio_change(value)
+
+        assert mock_app._config["audio"]["duck_volume_ratio"] == 0.25
+        mock_save.assert_not_called()
+
+    @pytest.mark.parametrize("value", [-1, 101, True, "invalid"])
+    @patch("wenzi.controllers.settings_controller.save_config")
+    def test_invalid_duck_max_volume_is_ignored(
+        self, mock_save, value, ctrl, mock_app
+    ):
+        ctrl.audio_duck_max_volume_change(value)
+
+        assert mock_app._config["audio"]["duck_max_volume"] == 0.05
+        mock_save.assert_not_called()
+
+    @patch(
+        "wenzi.controllers.settings_controller.save_config",
+        side_effect=OSError("disk full"),
+    )
+    def test_save_failure_rolls_back_runtime_value(
+        self, mock_save, ctrl, mock_app
+    ):
+        mock_app._settings_panel.is_visible = False
+
+        ctrl.audio_duck_toggle(True)
+
+        assert mock_app._config["audio"]["duck_system_audio"] is False
+        mock_save.assert_called_once()
+
+    @patch(
+        "wenzi.controllers.settings_controller.save_config",
+        side_effect=OSError("disk full"),
+    )
+    @patch(
+        "PyObjCTools.AppHelper.callAfter",
+        side_effect=lambda callback, *args: callback(*args),
+    )
+    def test_save_failure_pushes_rolled_back_values_to_visible_panel(
+        self, mock_call_after, mock_save, ctrl, mock_app
+    ):
+        mock_app._settings_panel.is_visible = True
+
+        ctrl.audio_duck_max_volume_change(30)
+
+        assert mock_app._config["audio"]["duck_max_volume"] == 0.05
+        state = mock_app._settings_panel.update_state.call_args.args[0]
+        assert state["duck_system_audio"] is False
+        assert state["duck_volume_percent"] == 25
+        assert state["duck_max_volume_percent"] == 5
+        mock_call_after.assert_called_once()
         mock_save.assert_called_once()
 
 
@@ -673,6 +759,9 @@ class TestOnOpenSettings:
 
         assert "hotkeys" in state
         assert "sound_enabled" in state
+        assert state["duck_system_audio"] is False
+        assert state["duck_volume_percent"] == 25
+        assert state["duck_max_volume_percent"] == 5
         assert "preview" in state
         assert "current_preset_id" in state
         assert state["last_tab"] == "general"
@@ -682,6 +771,9 @@ class TestOnOpenSettings:
         assert "on_hotkey_mode_select" in callbacks
         assert "on_hotkey_delete" in callbacks
         assert "on_sound_toggle" in callbacks
+        assert "on_audio_duck_toggle" in callbacks
+        assert "on_audio_duck_ratio_change" in callbacks
+        assert "on_audio_duck_max_volume_change" in callbacks
         assert "on_stt_select" in callbacks
         assert "on_llm_select" in callbacks
         assert "on_thinking_toggle" in callbacks
@@ -1146,3 +1238,10 @@ class TestRevokeCallbackRegistered:
                 ctrl.on_open_settings(None)
         _, callbacks = mock_app._settings_panel.show.call_args[0]
         assert "on_revoke_all_permissions" in callbacks
+
+
+class TestRestartApp:
+    def test_delegates_to_app_restart_lifecycle(self, ctrl, mock_app):
+        ctrl._restart_app()
+
+        mock_app._on_restart.assert_called_once_with(None)

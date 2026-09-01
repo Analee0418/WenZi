@@ -333,6 +333,7 @@ class SettingsController:
         last_tab = ui_cfg.get("settings_last_tab", "general")
 
         microphone_state = self._microphone_state()
+        audio_cfg = app._config.get("audio", {})
 
         fb_cfg = app._config.get("feedback", {})
         return {
@@ -345,6 +346,13 @@ class SettingsController:
             "visual_indicator": app._recording_indicator.enabled,
             "show_device_name": app._recording_indicator.show_device_name,
             "hide_status_icon": not app.status_item_visible,
+            "duck_system_audio": audio_cfg.get("duck_system_audio", False),
+            "duck_volume_percent": round(
+                float(audio_cfg.get("duck_volume_ratio", 0.25)) * 100
+            ),
+            "duck_max_volume_percent": round(
+                float(audio_cfg.get("duck_max_volume", 0.05)) * 100
+            ),
             "preview": app._preview_enabled,
             "current_preset_id": app._current_preset_id,
             "current_remote_asr": app._current_remote_asr,
@@ -406,6 +414,11 @@ class SettingsController:
             "on_visual_toggle": self.visual_toggle,
             "on_device_name_toggle": self.show_device_name_toggle,
             "on_hide_status_icon_toggle": self.hide_status_icon_toggle,
+            "on_audio_duck_toggle": self.audio_duck_toggle,
+            "on_audio_duck_ratio_change": self.audio_duck_ratio_change,
+            "on_audio_duck_max_volume_change": (
+                self.audio_duck_max_volume_change
+            ),
             "on_preview_toggle": self.preview_toggle,
             "on_stt_select": self.stt_select,
             "on_stt_remote_select": self.stt_remote_select,
@@ -838,8 +851,76 @@ class SettingsController:
         """Re-enumerate audio devices and update the Settings panel."""
         self._app._settings_panel.update_state(self._microphone_state())
 
+    def audio_duck_toggle(self, enabled: bool) -> None:
+        """Enable or disable lowering system playback during recording."""
+        if not isinstance(enabled, bool):
+            return
+        self._commit_audio_setting("duck_system_audio", enabled)
+
+    def audio_duck_ratio_change(self, percent: int | float) -> None:
+        """Set recording playback as a percentage of its current volume."""
+        if isinstance(percent, bool):
+            return
+        try:
+            value = float(percent)
+        except (TypeError, ValueError):
+            return
+        if not 0.0 <= value <= 100.0:
+            return
+        self._commit_audio_setting("duck_volume_ratio", value / 100.0)
+
+    def audio_duck_max_volume_change(self, percent: int | float) -> None:
+        """Set the absolute playback-volume cap used while recording."""
+        if isinstance(percent, bool):
+            return
+        try:
+            value = float(percent)
+        except (TypeError, ValueError):
+            return
+        if not 0.0 <= value <= 100.0:
+            return
+        self._commit_audio_setting("duck_max_volume", value / 100.0)
+
+    def _commit_audio_setting(self, key: str, value: bool | float) -> None:
+        """Persist one audio setting and roll runtime state back on failure."""
+        from PyObjCTools import AppHelper
+
+        app = self._app
+        audio_cfg = app._config.setdefault("audio", {})
+        missing = object()
+        previous = audio_cfg.get(key, missing)
+        audio_cfg[key] = value
+        try:
+            save_config(app._config, app._config_path)
+        except Exception:
+            if previous is missing:
+                audio_cfg.pop(key, None)
+            else:
+                audio_cfg[key] = previous
+            logger.exception("Failed to save audio setting %s; rolled back", key)
+            if app._settings_panel.is_visible:
+                try:
+                    AppHelper.callAfter(self._refresh_panel)
+                except Exception:
+                    logger.warning(
+                        "Failed to refresh rolled-back audio setting",
+                        exc_info=True,
+                    )
+            return
+
+        if app._settings_panel.is_visible:
+            try:
+                AppHelper.callAfter(self._refresh_panel)
+            except Exception:
+                # Persistence is already committed; a UI refresh error must
+                # not roll the live config back out of sync with disk.
+                logger.warning(
+                    "Failed to refresh committed audio setting",
+                    exc_info=True,
+                )
+
     def _microphone_state(self) -> dict:
-        """Return the current microphone choices and automatic route."""
+        """Return microphone choices and the current system default input."""
         audio_cfg = self._app._config.get("audio", {})
         return {
             "audio_devices": list_input_devices(),
@@ -1626,11 +1707,9 @@ class SettingsController:
         if result:
             self._restart_app()
 
-    @staticmethod
-    def _restart_app() -> None:
-        """Restart the application."""
-        from wenzi.statusbar import restart_application
-        restart_application()
+    def _restart_app(self) -> None:
+        """Restart through the app lifecycle so active audio is restored."""
+        self._app._on_restart(None)
 
     # ── Launcher tab ─────────────────────────────────────────────────
 

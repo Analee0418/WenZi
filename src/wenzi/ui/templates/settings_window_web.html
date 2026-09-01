@@ -241,6 +241,13 @@ input[type="range"] {
   accent-color: #007aff;
 }
 
+.range-value {
+  width: 36px;
+  color: #6e6e73;
+  font-size: 12px;
+  text-align: right;
+}
+
 /* Buttons */
 .toolbar-btn {
   font-size: 12px;
@@ -905,6 +912,43 @@ textarea.provider-form-textarea.error {
       <div class="setting-group" id="mic-device-list">
         <!-- Dynamically populated by renderMicrophoneList() -->
       </div>
+
+      <div class="group-title" data-i18n="microphone_tab.playback_section">Playback During Recording</div>
+      <div class="setting-group">
+        <div class="setting-row">
+          <div class="setting-left">
+            <div class="setting-label" data-i18n="microphone_tab.duck_system_audio">Lower System Audio</div>
+            <div class="setting-desc" data-i18n="microphone_tab.duck_system_audio_desc">Reduce all Mac playback, including meeting audio, while recording and restore it afterward</div>
+          </div>
+          <div class="setting-right">
+            <div id="ctl-audio-duck" class="toggle" onclick="audioDuckToggle(this)"></div>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-left">
+            <div class="setting-label" data-i18n="microphone_tab.duck_volume_ratio">Relative Playback Level</div>
+            <div class="setting-desc" data-i18n="microphone_tab.duck_volume_ratio_desc">Percentage of the current volume to keep while recording</div>
+          </div>
+          <div class="setting-right">
+            <input id="ctl-audio-duck-ratio" type="range" min="0" max="100" step="1"
+                   oninput="document.getElementById('ctl-audio-duck-ratio-value').textContent = this.value + '%'"
+                   onchange="postCallback('on_audio_duck_ratio_change', Number(this.value))">
+            <span id="ctl-audio-duck-ratio-value" class="range-value">25%</span>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-left">
+            <div class="setting-label" data-i18n="microphone_tab.duck_max_volume">Maximum Playback Volume</div>
+            <div class="setting-desc" data-i18n="microphone_tab.duck_max_volume_desc">Safety cap applied after the relative reduction</div>
+          </div>
+          <div class="setting-right">
+            <input id="ctl-audio-duck-max-volume" type="range" min="0" max="100" step="1"
+                   oninput="document.getElementById('ctl-audio-duck-max-volume-value').textContent = this.value + '%'"
+                   onchange="postCallback('on_audio_duck_max_volume_change', Number(this.value))">
+            <span id="ctl-audio-duck-max-volume-value" class="range-value">5%</span>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- Security Tab -->
@@ -1338,6 +1382,41 @@ function setToggle(id, value) {
   var el = document.getElementById(id);
   if (!el) return;
   if (value) { el.classList.add('on'); } else { el.classList.remove('on'); }
+}
+
+function updateAudioDuckSlider(sliderId, labelId, enabled, percent) {
+  var slider = document.getElementById(sliderId);
+  var label = document.getElementById(labelId);
+  if (slider) {
+    if (percent !== undefined) slider.value = percent;
+    slider.disabled = !enabled;
+  }
+  if (label) {
+    var value = slider ? slider.value : percent;
+    label.textContent = Math.round(Number(value || 0)) + '%';
+    label.style.opacity = enabled ? '1' : '0.45';
+  }
+}
+
+function updateAudioDuckControls(enabled, ratioPercent, maxPercent) {
+  setToggle('ctl-audio-duck', enabled);
+  updateAudioDuckSlider(
+    'ctl-audio-duck-ratio',
+    'ctl-audio-duck-ratio-value',
+    enabled,
+    ratioPercent
+  );
+  updateAudioDuckSlider(
+    'ctl-audio-duck-max-volume',
+    'ctl-audio-duck-max-volume-value',
+    enabled,
+    maxPercent
+  );
+}
+
+function audioDuckToggle(el) {
+  toggleClick(el, 'on_audio_duck_toggle');
+  updateAudioDuckControls(el.classList.contains('on'));
 }
 
 function selectModelRow(row) {
@@ -2564,11 +2643,11 @@ function renderMicrophoneList(devices, selectedUid, automaticName) {
   var container = document.getElementById('mic-device-list');
   if (!container) return;
   var html = '';
-  // Automatic routing keeps Bluetooth playback out of its call profile.
+  // Automatic mode follows the input selected in macOS System Settings.
   var defSel = (!selectedUid) ? ' selected' : '';
   var defLabel = _esc(_t('microphone_tab.automatic', 'Automatic'));
   if (automaticName) defLabel += ' (' + _esc(automaticName) + ')';
-  var defDesc = _esc(_t('microphone_tab.automatic_desc', 'Prefers the Mac built-in microphone when the system default is Bluetooth'));
+  var defDesc = _esc(_t('microphone_tab.automatic_desc', 'Uses the current macOS default input device'));
   html += '<div class="model-row' + defSel + '" data-action="mic-select" data-uid="">';
   html += '  <div class="model-radio"></div>';
   html += '  <div class="model-info">';
@@ -2625,6 +2704,13 @@ function _initState(config) {
   setToggle('ctl-sound', config.sound_enabled);
   setToggle('ctl-visual', config.visual_indicator);
   setToggle('ctl-hide-status-icon', config.hide_status_icon);
+  updateAudioDuckControls(
+    Boolean(config.duck_system_audio),
+    config.duck_volume_percent === undefined ? 25 : config.duck_volume_percent,
+    config.duck_max_volume_percent === undefined
+      ? 5
+      : config.duck_max_volume_percent
+  );
 
   // Output
   setToggle('ctl-preview', config.preview);
@@ -3039,6 +3125,20 @@ function _updateState(state) {
   if (state.sound_enabled !== undefined) setToggle('ctl-sound', state.sound_enabled);
   if (state.visual_indicator !== undefined) setToggle('ctl-visual', state.visual_indicator);
   if (state.hide_status_icon !== undefined) setToggle('ctl-hide-status-icon', state.hide_status_icon);
+  if (
+    state.duck_system_audio !== undefined
+    || state.duck_volume_percent !== undefined
+    || state.duck_max_volume_percent !== undefined
+  ) {
+    var duckToggle = document.getElementById('ctl-audio-duck');
+    updateAudioDuckControls(
+      state.duck_system_audio === undefined
+        ? Boolean(duckToggle && duckToggle.classList.contains('on'))
+        : Boolean(state.duck_system_audio),
+      state.duck_volume_percent,
+      state.duck_max_volume_percent
+    );
+  }
   if (state.preview !== undefined) setToggle('ctl-preview', state.preview);
   if (state.keychain_enabled !== undefined) {
     setToggle('ctl-keychain', state.keychain_enabled);

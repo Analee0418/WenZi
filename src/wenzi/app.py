@@ -20,6 +20,7 @@ from wenzi.op_guard import OpGuard
 from .audio.recorder import Recorder
 from .audio.recording_indicator import RecordingIndicatorPanel
 from .audio.sound_manager import SoundManager
+from .audio.system_volume import SystemOutputDucker
 from .config import (
     DEFAULT_LOG_DIR,
     load_config,
@@ -220,6 +221,21 @@ class WenZiApp(StatusBarApp):
             max_session_bytes=audio_cfg["max_session_bytes"],
             silence_rms=audio_cfg.get("silence_rms", Recorder.DEFAULT_SILENCE_RMS),
         )
+        duck_recovery_path = os.path.join(
+            self._cache_dir,
+            "system-volume-duck.json",
+        )
+        self._system_output_ducker = SystemOutputDucker(
+            recovery_path=duck_recovery_path,
+        )
+        try:
+            if self._system_output_ducker.recover_stale():
+                logger.info("Recovered system output volume after an unclean exit")
+        except Exception:
+            logger.warning(
+                "Failed to recover system output volume after an unclean exit",
+                exc_info=True,
+            )
 
         asr_cfg = self._config["asr"]
 
@@ -1088,6 +1104,8 @@ class WenZiApp(StatusBarApp):
 
     def _on_restart(self, _) -> None:
         from wenzi.statusbar import restart_application
+
+        self._restore_system_output_on_exit()
         restart_application()
 
     # ── Settings panel ────────────────────────────────────────────────
@@ -1166,6 +1184,7 @@ class WenZiApp(StatusBarApp):
         self._screenshot_annotation = None
 
     def _on_quit_click(self, _) -> None:
+        self._restore_system_output_on_exit()
         self._update_controller.stop()
         if hasattr(self, "_script_engine") and self._script_engine:
             self._script_engine.stop()
@@ -1247,6 +1266,17 @@ class WenZiApp(StatusBarApp):
 
         cleanup_callbacks()
         quit_application()
+
+    def _restore_system_output_on_exit(self) -> None:
+        """Best-effort fallback for every process termination path."""
+        ducker = getattr(self, "_system_output_ducker", None)
+        if ducker is None:
+            return
+        try:
+            ducker.restore_all()
+        except Exception:
+            # Exit cleanup must never prevent the process from terminating.
+            logger.debug("System output volume restore failed", exc_info=True)
 
     @staticmethod
     def _ensure_accessibility() -> bool:
@@ -1647,14 +1677,22 @@ def _get_multiline_panel_target_class():
 
 def main() -> None:
     """Entry point."""
+    import atexit
     import faulthandler
     import signal
 
     faulthandler.enable()  # dump traceback on SIGSEGV/SIGABRT/SIGBUS
-    signal.signal(signal.SIGINT, lambda *_: quit_application())
 
     config_dir = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("WENZI_CONFIG_DIR")
     app = WenZiApp(config_dir=config_dir)  # None uses default dir
+
+    def _restore_and_quit(*_args) -> None:
+        app._restore_system_output_on_exit()
+        quit_application()
+
+    signal.signal(signal.SIGINT, _restore_and_quit)
+    signal.signal(signal.SIGTERM, _restore_and_quit)
+    atexit.register(app._restore_system_output_on_exit)
     app.run()
 
 

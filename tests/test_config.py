@@ -200,6 +200,8 @@ class TestLoadConfig:
         config, error = load_config(str(config_file))
         assert error is None
         assert config["audio"]["sample_rate"] == 44100
+        assert config["audio"]["duck_system_audio"] is False
+        assert config["audio"]["duck_volume_ratio"] == 0.25
         assert config["hotkeys"]["f5"] is True
 
     def test_syntax_error_returns_config_error(self, tmp_path):
@@ -359,6 +361,9 @@ class TestValidateConfig:
         config = self._make_config()
         validated = validate_config(config)
         assert validated["audio"]["sample_rate"] == 16000
+        assert validated["audio"]["duck_system_audio"] is False
+        assert validated["audio"]["duck_volume_ratio"] == 0.25
+        assert validated["audio"]["duck_max_volume"] == 0.05
         assert validated["output"]["method"] == "auto"
 
     def test_invalid_sample_rate_type(self):
@@ -423,6 +428,24 @@ class TestValidateConfig:
             config = self._make_config({"feedback.sound_volume": vol})
             validate_config(config)
             assert config["feedback"]["sound_volume"] == vol
+
+    @pytest.mark.parametrize("key", ["duck_volume_ratio", "duck_max_volume"])
+    @pytest.mark.parametrize("value", [-0.1, 1.1, True, "invalid"])
+    def test_invalid_audio_duck_volume_resets(self, key, value):
+        config = self._make_config({f"audio.{key}": value})
+
+        validate_config(config)
+
+        assert config["audio"][key] == DEFAULT_CONFIG["audio"][key]
+
+    @pytest.mark.parametrize("key", ["duck_volume_ratio", "duck_max_volume"])
+    @pytest.mark.parametrize("value", [0.0, 0.2, 1.0])
+    def test_valid_audio_duck_volume_preserved(self, key, value):
+        config = self._make_config({f"audio.{key}": value})
+
+        validate_config(config)
+
+        assert config["audio"][key] == value
 
     def test_bool_field_wrong_type(self):
         config = self._make_config({"output.append_newline": "yes"})

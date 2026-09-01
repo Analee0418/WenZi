@@ -313,8 +313,8 @@ uv run python -m wenzi
 <h3 id="_6"><a href="#_6" class="heading-anchor">预览面板基础</a></h3>
 <p>启用预览后，录音结束会看到一个浮动面板：</p>
 <ul>
-<li><strong>确认</strong>（<code>Enter</code>）— 输入文本并关闭面板</li>
-<li><strong>复制到剪贴板</strong>（<code>⌘+Enter</code>）— 将文本复制到剪贴板而非输入</li>
+<li><strong>确认</strong>（<code>⌘+Enter</code>）— 输入文本并关闭面板；在最终文本编辑区外按 <code>Enter</code> 也可确认，编辑区内按 <code>Enter</code> 为换行</li>
+<li><strong>复制到剪贴板</strong>（<code>⌘+Shift+Enter</code>）— 将文本复制到剪贴板而非输入</li>
 <li><strong>取消</strong>（<code>Esc</code>）— 丢弃文本</li>
 <li><strong>编辑</strong> — 点击文本区域可在确认前修改</li>
 </ul>
@@ -335,6 +335,7 @@ uv run python -m wenzi
 <p>所有模型选择、AI 增强配置和快捷键管理都通过 <strong>设置</strong> 面板完成——而非直接在菜单中操作。</p>
 <h3 id="_8"><a href="#_8" class="heading-anchor">录音反馈</a></h3>
 <p>按住 <code>fn</code> 时，会显示一个带音频电平条的浮动指示器，表示正在录音。开始和结束时会播放提示音（可在设置 → 通用中配置）。</p>
+<p>可在设置 → 麦克风中开启“降低系统音量”：录音期间降低 Mac 上全部播放声音，结束后自动恢复，包括浏览器、音乐和会议音频。该功能会按比例降低当前音量并设置安全上限，但无法消除 macOS 或蓝牙重新配置音频路由时产生的短暂中断。</p>
 <p>当 ASR 后端支持流式识别时（如 Apple Speech），录音指示器下方会出现一个 <strong>实时转录悬浮窗</strong>，在你说话的同时实时显示部分转录文本。无需等待录音结束即可获得即时的视觉反馈。</p>
 <h3 id="_9"><a href="#_9" class="heading-anchor">录音控制</a></h3>
 <p>按住录音快捷键的同时，可以按其他键控制录音过程：</p>
@@ -443,7 +444,7 @@ uv run python -m wenzi
 base_url: https://api.deepseek.com/v1
 api_key: sk-your-key
 models:
-  deepseek-chat
+  deepseek-v4-flash
 </code></pre>
 <ol start="3">
 <li>点击 <strong>验证</strong> → <strong>保存</strong></li>
@@ -523,7 +524,7 @@ models:
 </tr>
 <tr>
 <td><strong>复制到剪贴板</strong></td>
-<td><code>⌘+Enter</code> — 复制而非输入到当前应用</td>
+<td><code>⌘+Shift+Enter</code> — 复制而非输入到当前应用</td>
 </tr>
 <tr>
 <td><strong>切换标点</strong></td>
@@ -995,12 +996,12 @@ models:
 <td>打开/关闭启动器（如已启用）</td>
 </tr>
 <tr>
-<td><code>Enter</code></td>
+<td><code>⌘+Enter</code></td>
 <td>预览面板</td>
-<td>确认并输入文本</td>
+<td>确认并输入文本（编辑区内 <code>Enter</code> 为换行）</td>
 </tr>
 <tr>
-<td><code>⌘+Enter</code></td>
+<td><code>⌘+Shift+Enter</code></td>
 <td>预览面板</td>
 <td>复制到剪贴板</td>
 </tr>

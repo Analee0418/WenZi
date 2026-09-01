@@ -75,21 +75,18 @@ def _capture_device(name: str, uid: str, transport: bytes):
 
 
 class TestInputRouteSelection:
-    def test_automatic_uses_built_in_for_bluetooth_default(self, monkeypatch):
+    def test_automatic_keeps_bluetooth_system_default(self, monkeypatch):
         bluetooth = _capture_device("AirPods Max", "airpods", b"blue")
-        built_in = _capture_device(
-            "MacBook Pro Microphone", "builtin", b"bltn"
-        )
         capture = MagicMock()
         capture.defaultDeviceWithMediaType_.return_value = bluetooth
-        capture.devicesWithMediaType_.return_value = [bluetooth, built_in]
         monkeypatch.setattr("wenzi.audio.recorder.AVCaptureDevice", capture)
 
         route = _select_input_route(None)
 
-        assert route.uid == "builtin"
-        assert route.name == "MacBook Pro Microphone"
-        assert route.bind is True
+        assert route.uid == "airpods"
+        assert route.name == "AirPods Max"
+        assert route.bind is False
+        capture.devicesWithMediaType_.assert_not_called()
 
     def test_automatic_keeps_non_bluetooth_system_default(self, monkeypatch):
         usb = _capture_device("USB Microphone", "usb", b"usb ")
@@ -103,33 +100,6 @@ class TestInputRouteSelection:
         assert route.name == "USB Microphone"
         assert route.bind is False
         capture.devicesWithMediaType_.assert_not_called()
-
-    def test_automatic_keeps_bluetooth_when_no_built_in_exists(
-        self, monkeypatch
-    ):
-        bluetooth = _capture_device("AirPods Max", "airpods", b"blue")
-        capture = MagicMock()
-        capture.defaultDeviceWithMediaType_.return_value = bluetooth
-        capture.devicesWithMediaType_.return_value = [bluetooth]
-        monkeypatch.setattr("wenzi.audio.recorder.AVCaptureDevice", capture)
-
-        route = _select_input_route(None)
-
-        assert route.uid == "airpods"
-        assert route.name == "AirPods Max"
-        assert route.bind is False
-
-    def test_automatic_keeps_bluetooth_when_listing_fails(self, monkeypatch):
-        bluetooth = _capture_device("AirPods Max", "airpods", b"blue")
-        capture = MagicMock()
-        capture.defaultDeviceWithMediaType_.return_value = bluetooth
-        capture.devicesWithMediaType_.side_effect = RuntimeError("unavailable")
-        monkeypatch.setattr("wenzi.audio.recorder.AVCaptureDevice", capture)
-
-        route = _select_input_route(None)
-
-        assert route.uid == "airpods"
-        assert route.bind is False
 
     def test_explicit_airpods_is_honored(self, monkeypatch):
         bluetooth = _capture_device("AirPods Max", "airpods", b"blue")
@@ -174,6 +144,16 @@ class TestRecorder:
         assert r.is_recording is False
         assert wav_data is not None
         assert len(wav_data) > 0
+
+    def test_automatic_device_does_not_rebind_input_node(self, monkeypatch):
+        engine = _mock_engine(monkeypatch)
+
+        recorder = Recorder(sample_rate=16000, block_ms=20)
+        recorder.start()
+
+        audio_unit = engine.inputNode.return_value.AUAudioUnit.return_value
+        audio_unit.setDeviceID_error_.assert_not_called()
+        recorder.stop()
 
     def test_silence_detection_discards_quiet_audio(self, monkeypatch):
         _mock_engine(monkeypatch)

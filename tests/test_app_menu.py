@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import signal
 from unittest.mock import MagicMock, patch
 
 from wenzi.controllers.config_controller import ConfigController
@@ -170,3 +171,113 @@ class TestHelpMenu:
         mock_open.assert_called_once()
         url = mock_open.call_args[0][0]
         assert url == "https://airead.github.io/WenZi/docs/user-guide.html"
+
+
+class TestSystemOutputExitRestore:
+    def test_restore_helper_is_best_effort_and_handles_partial_init(self):
+        from wenzi.app import WenZiApp
+
+        app = object.__new__(WenZiApp)
+        WenZiApp._restore_system_output_on_exit(app)
+
+        app._system_output_ducker = MagicMock()
+        app._system_output_ducker.restore_all.side_effect = RuntimeError("restore")
+        WenZiApp._restore_system_output_on_exit(app)
+
+        app._system_output_ducker.restore_all.assert_called_once_with()
+
+    @patch("wenzi.statusbar.restart_application")
+    def test_restart_restores_before_relaunch(self, mock_restart):
+        from wenzi.app import WenZiApp
+
+        app = object.__new__(WenZiApp)
+        order: list[str] = []
+        app._restore_system_output_on_exit = MagicMock(
+            side_effect=lambda: order.append("restore")
+        )
+        mock_restart.side_effect = lambda: order.append("restart")
+
+        WenZiApp._on_restart(app, None)
+
+        assert order == ["restore", "restart"]
+
+    @patch("wenzi.app.quit_application")
+    @patch("wenzi.app.async_loop.shutdown_sync")
+    def test_normal_quit_restores_output(
+        self,
+        mock_shutdown_loop,
+        mock_quit,
+    ):
+        from wenzi.app import WenZiApp
+
+        app = object.__new__(WenZiApp)
+        app._update_controller = MagicMock()
+        app._script_engine = None
+        app._hotkey_listener = None
+        app._app_hotkey_tap = MagicMock()
+        app._settings_panel = MagicMock(is_visible=False)
+        app._vocab_controller = None
+        app._recording_indicator = MagicMock()
+        app._streaming_overlay = MagicMock()
+        app._transcriber = MagicMock()
+        app._preview_panel = MagicMock()
+        app._history_browser = None
+        app._screenshot_annotation = None
+        app._preview_controller = MagicMock()
+        app._usage_stats = MagicMock()
+        app._manual_vocab_store = MagicMock()
+        app._enhancer = None
+        order: list[str] = []
+        app._restore_system_output_on_exit = MagicMock(
+            side_effect=lambda: order.append("restore")
+        )
+        app._update_controller.stop.side_effect = lambda: order.append("cleanup")
+        mock_quit.side_effect = lambda: order.append("quit")
+
+        with (
+            patch("wenzi.input_context.shutdown_input_context"),
+            patch("wenzi.vault.shutdown_vault"),
+            patch("wenzi.hotkey.shutdown_hotkey_executor"),
+            patch("wenzi.statusbar.cleanup_callbacks"),
+        ):
+            WenZiApp._on_quit_click(app, None)
+
+        mock_shutdown_loop.assert_called_once_with(timeout=5)
+        app._restore_system_output_on_exit.assert_called_once_with()
+        mock_quit.assert_called_once_with()
+        assert order == ["restore", "cleanup", "quit"]
+
+    @patch("wenzi.app.quit_application")
+    @patch("atexit.register")
+    @patch("signal.signal")
+    @patch("faulthandler.enable")
+    @patch("wenzi.app.WenZiApp")
+    def test_main_registers_signal_and_atexit_restores(
+        self,
+        mock_app_class,
+        _mock_faulthandler,
+        mock_signal,
+        mock_atexit,
+        mock_quit,
+    ):
+        from wenzi.app import main
+
+        app = mock_app_class.return_value
+        order: list[str] = []
+        app._restore_system_output_on_exit.side_effect = (
+            lambda: order.append("restore")
+        )
+        mock_quit.side_effect = lambda: order.append("quit")
+
+        main()
+
+        handlers = {entry.args[0]: entry.args[1] for entry in mock_signal.call_args_list}
+        assert set(handlers) == {signal.SIGINT, signal.SIGTERM}
+        mock_atexit.assert_called_once_with(app._restore_system_output_on_exit)
+        app.run.assert_called_once_with()
+
+        handlers[signal.SIGINT](signal.SIGINT, None)
+        handlers[signal.SIGTERM](signal.SIGTERM, None)
+        mock_atexit.call_args.args[0]()
+
+        assert order == ["restore", "quit", "restore", "quit", "restore"]

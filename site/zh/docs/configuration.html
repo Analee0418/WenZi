@@ -108,7 +108,10 @@
     &quot;block_ms&quot;: 20,
     &quot;device&quot;: null,
     &quot;max_session_bytes&quot;: 20971520,
-    &quot;silence_rms&quot;: 20
+    &quot;silence_rms&quot;: 20,
+    &quot;duck_system_audio&quot;: false,
+    &quot;duck_volume_ratio&quot;: 0.25,
+    &quot;duck_max_volume&quot;: 0.05
   },
   &quot;asr&quot;: {
     &quot;backend&quot;: &quot;apple&quot;,
@@ -221,7 +224,7 @@
 <tr>
 <td><code>audio.device</code></td>
 <td><code>null</code></td>
-<td>音频输入设备（null 表示使用系统默认设备）</td>
+<td>音频输入设备 UID。<code>null</code> 表示始终跟随 macOS 当前的默认输入设备，不执行设备重绑。显式 UID 始终会被尊重。</td>
 </tr>
 <tr>
 <td><code>audio.max_session_bytes</code></td>
@@ -232,6 +235,21 @@
 <td><code>audio.silence_rms</code></td>
 <td><code>20</code></td>
 <td>静音判定的 RMS 阈值，低于此值视为静音</td>
+</tr>
+<tr>
+<td><code>audio.duck_system_audio</code></td>
+<td><code>false</code></td>
+<td>录音时降低 Mac 上所有播放声音，结束后恢复；会议音频也会受影响</td>
+</tr>
+<tr>
+<td><code>audio.duck_volume_ratio</code></td>
+<td><code>0.25</code></td>
+<td>录音期间保留当前系统音量的比例</td>
+</tr>
+<tr>
+<td><code>audio.duck_max_volume</code></td>
+<td><code>0.05</code></td>
+<td>录音期间允许的系统音量标量上限</td>
 </tr>
 </tbody>
 </table></div>
@@ -495,7 +513,7 @@
 <tr>
 <td><code>feedback.visual_indicator</code></td>
 <td><code>true</code></td>
-<td>显示浮动录音指示器及音频电平条</td>
+<td>显示随音量变化的录音光球</td>
 </tr>
 <tr>
 <td><code>feedback.restart_key</code></td>
@@ -539,12 +557,12 @@
 <tr>
 <td><code>scripting.enabled</code></td>
 <td><code>false</code></td>
-<td>启用 Lua 脚本系统</td>
+<td>启用 Python 脚本系统</td>
 </tr>
 <tr>
 <td><code>scripting.script_dir</code></td>
 <td><code>null</code></td>
-<td>Lua 脚本的自定义目录（null 表示使用 <code>&lt;配置目录&gt;/scripts</code>）</td>
+<td>Python 脚本的自定义目录（null 表示使用 <code>&lt;配置目录&gt;/scripts</code>）</td>
 </tr>
 </tbody>
 </table></div>

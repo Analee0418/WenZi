@@ -40,6 +40,9 @@ def _make_state():
         "sound_enabled": True,
         "visual_indicator": True,
         "show_device_name": False,
+        "duck_system_audio": False,
+        "duck_volume_percent": 25,
+        "duck_max_volume_percent": 5,
         "audio_devices": [
             {"uid": "builtin", "name": "MacBook Pro Microphone"},
             {"uid": "airpods", "name": "AirPods Max"},
@@ -107,7 +110,9 @@ def _make_callbacks():
         "on_hotkey_toggle", "on_hotkey_mode_select", "on_hotkey_delete",
         "on_record_hotkey", "on_restart_key_select", "on_cancel_key_select",
         "on_scripting_toggle", "on_sound_toggle", "on_visual_toggle",
-        "on_device_name_toggle", "on_preview_toggle", "on_mic_select",
+        "on_device_name_toggle", "on_audio_duck_toggle",
+        "on_audio_duck_ratio_change", "on_audio_duck_max_volume_change",
+        "on_preview_toggle", "on_mic_select",
         "on_mic_refresh",
         "on_stt_select", "on_stt_remote_select",
         "on_stt_add_provider", "on_stt_remove_provider",
@@ -219,6 +224,24 @@ class TestCallbackDispatch:
         panel, cbs = self._make_panel()
         panel._handle_js_message({"type": "callback", "name": "on_hotkey_toggle", "args": ["fn", False]})
         cbs["on_hotkey_toggle"].assert_called_once_with("fn", False)
+
+    def test_audio_duck_ratio_callback(self):
+        panel, cbs = self._make_panel()
+        panel._handle_js_message({
+            "type": "callback",
+            "name": "on_audio_duck_ratio_change",
+            "args": [20],
+        })
+        cbs["on_audio_duck_ratio_change"].assert_called_once_with(20)
+
+    def test_audio_duck_max_volume_callback(self):
+        panel, cbs = self._make_panel()
+        panel._handle_js_message({
+            "type": "callback",
+            "name": "on_audio_duck_max_volume_change",
+            "args": [12],
+        })
+        cbs["on_audio_duck_max_volume_change"].assert_called_once_with(12)
 
     def test_callback_with_two_args_llm(self):
         panel, cbs = self._make_panel()
@@ -334,6 +357,22 @@ class TestUpdateState:
         })
         js_call = panel._webview.evaluateJavaScript_completionHandler_.call_args[0][0]
         assert '"id": "apple-speech"' in js_call
+
+    def test_update_state_includes_audio_duck_controls(self):
+        from wenzi.ui.settings_window_web import SettingsWebPanel
+        panel = SettingsWebPanel()
+        panel.show(_make_state(), _make_callbacks())
+
+        panel.update_state({
+            "duck_system_audio": True,
+            "duck_volume_percent": 20,
+            "duck_max_volume_percent": 10,
+        })
+
+        js_call = panel._webview.evaluateJavaScript_completionHandler_.call_args[0][0]
+        assert '"duck_system_audio": true' in js_call
+        assert '"duck_volume_percent": 20' in js_call
+        assert '"duck_max_volume_percent": 10' in js_call
 
 
 class TestPrepareStateExtended:
@@ -583,5 +622,13 @@ class TestLoadHtml:
         assert 'id="tab-ai"' in html_content
         assert 'id="tab-launcher"' in html_content
         assert 'id="ctl-device-name"' not in html_content
+        assert 'id="ctl-audio-duck"' in html_content
+        assert 'id="ctl-audio-duck-ratio"' in html_content
+        assert 'id="ctl-audio-duck-max-volume"' in html_content
+        assert "on_audio_duck_max_volume_change" in html_content
+        assert "state.duck_max_volume_percent !== undefined" in html_content
+        assert (
+            "'ctl-audio-duck-max-volume-value'" in html_content
+        )
         assert '"automatic_device_name": "MacBook Pro Microphone"' in html_content
         assert "microphone_tab.automatic_desc" in html_content

@@ -2,6 +2,7 @@
 
 import importlib.util
 import os
+import tomllib
 
 import pytest
 
@@ -19,6 +20,19 @@ def sync_module():
 
 
 class TestSyncRegistry:
+    def test_plugin_source_override_keeps_other_plugins_on_base_url(self, tmp_path, sync_module):
+        for name, extra in [("upstream", ""), ("custom", 'source = "https://example.com/fork/plugin.toml"\n')]:
+            directory = tmp_path / name
+            directory.mkdir()
+            (directory / "plugin.toml").write_text(f'[plugin]\nid = "example.{name}"\n{extra}')
+        output = tmp_path / "registry.toml"
+        sync_module.generate_registry(str(tmp_path), str(output), "https://example.com/plugins")
+        entries = {entry["id"]: entry["source"] for entry in tomllib.loads(output.read_text())["plugins"]}
+        assert entries == {
+            "example.custom": "https://example.com/fork/plugin.toml",
+            "example.upstream": "https://example.com/plugins/upstream/plugin.toml",
+        }
+
     def test_generates_registry_from_plugin_toml(self, tmp_path, sync_module):
         """Registry is generated from plugin.toml files."""
         plugin_dir = tmp_path / "plugins" / "my_plugin"

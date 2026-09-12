@@ -1,0 +1,43 @@
+{
+  "words": [
+    {
+      "word": "I",
+      "ipa": "/aɪ/"
+    },
+    {
+      "word": "care",
+      "ipa": "/kɛr/"
+    },
+    {
+      "word": "about",
+      "ipa": "/əˈbaʊt/"
+    },
+    {
+      "word": "the",
+      "ipa": "/ðə/"
+    },
+    {
+      "word": "environment",
+      "ipa": "/ɪnˈvaɪrənmənt/"
+    }
+  ],
+  "connected": "/aɪ ˈkɛr əˌbaʊt ði ɪnˈvaɪrənmənt/",
+  "translation": "我关心环境。",
+  "features": [
+    {
+      "words": [
+        3
+      ],
+      "kind": "weak_form",
+      "ipa": "/ði/",
+      "note": "the 后接元音开头的 environment，因此使用 /ði/ 而不是 /ðə/。"
+    }
+  ],
+  "links": [
+    {
+      "from": 1,
+      "to": 2,
+      "note": "Join the words without a pause. Follow the sentence IPA below for their sounds in context."
+    }
+  ]
+}

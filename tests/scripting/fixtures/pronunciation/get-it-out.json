@@ -1,0 +1,84 @@
+{
+  "words": [
+    {
+      "word": "Get",
+      "ipa": "/ɡɛt/"
+    },
+    {
+      "word": "it",
+      "ipa": "/ɪt/"
+    },
+    {
+      "word": "out",
+      "ipa": "/aʊt/"
+    },
+    {
+      "word": "of",
+      "ipa": "/ʌv/"
+    },
+    {
+      "word": "the",
+      "ipa": "/ðə/"
+    },
+    {
+      "word": "way",
+      "ipa": "/weɪ/"
+    }
+  ],
+  "connected": "/ˈɡɛɾ‿ɪɾ‿ˈaʊɾ‿əv‿ðə‿ˈweɪ/",
+  "translation": "把它挪开。",
+  "features": [
+    {
+      "words": [
+        0,
+        1
+      ],
+      "kind": "flap",
+      "ipa": "/ˈɡɛɾ‿ɪt/",
+      "note": "get 词尾的 t 位于元音之间，浊化成闪音 [ɾ]。"
+    },
+    {
+      "words": [
+        1,
+        2
+      ],
+      "kind": "flap",
+      "ipa": "/ɪɾ‿ˈaʊt/",
+      "note": "it 词尾的 t 夹在元音之间，读作闪音 [ɾ]。"
+    },
+    {
+      "words": [
+        2,
+        3
+      ],
+      "kind": "flap",
+      "ipa": "/ˈaʊɾ‿əv/",
+      "note": "out 词尾的 t 位于元音和弱读元音之间，读作闪音 [ɾ]。"
+    },
+    {
+      "words": [
+        3
+      ],
+      "kind": "weak_form",
+      "ipa": "/əv/",
+      "note": "of 在非重读位置弱读，元音变为 /ə/。"
+    }
+  ],
+  "links": [
+    {
+      "from": 0,
+      "to": 1,
+      "note": "Join the words without a pause. Follow the sentence IPA below for their sounds in context."
+    },
+    {
+      "from": 1,
+      "to": 2,
+      "note": "Join the words without a pause. Follow the sentence IPA below for their sounds in context."
+    },
+    {
+      "from": 2,
+      "to": 3,
+      "note": "Join the words without a pause. Follow the sentence IPA below for their sounds in context."
+    }
+  ]
+}

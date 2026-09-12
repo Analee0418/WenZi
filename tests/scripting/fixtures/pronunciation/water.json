@@ -1,0 +1,21 @@
+{
+  "words": [
+    {
+      "word": "Water",
+      "ipa": "/ˈwɔtər/"
+    }
+  ],
+  "connected": "/ˈwɔɾɚ/",
+  "translation": "水",
+  "features": [
+    {
+      "words": [
+        0
+      ],
+      "kind": "flap",
+      "ipa": "/ˈwɔɾɚ/",
+      "note": "在美式英语中，元音后的 t 在两个元音之间常变为闪音 [ɾ]，听感接近 d。"
+    }
+  ],
+  "links": []
+}

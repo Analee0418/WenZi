@@ -1,0 +1,47 @@
+{
+  "words": [
+    {
+      "word": "Natural",
+      "ipa": "/ˈnætʃərəl/"
+    },
+    {
+      "word": "gas",
+      "ipa": "/ɡæs/"
+    },
+    {
+      "word": "powers",
+      "ipa": "/ˈpaʊərz/"
+    },
+    {
+      "word": "all",
+      "ipa": "/ɔl/"
+    },
+    {
+      "word": "city",
+      "ipa": "/ˈsɪti/"
+    },
+    {
+      "word": "buildings",
+      "ipa": "/ˈbɪldɪŋz/"
+    }
+  ],
+  "connected": "/ˈnætʃɚəl ɡæs ˈpaʊɚz ɔl ˈsɪɾi ˈbɪldɪŋz/",
+  "translation": "天然气为所有城市建筑供电。",
+  "features": [
+    {
+      "words": [
+        4
+      ],
+      "kind": "flap",
+      "ipa": "/ˈsɪɾi/",
+      "note": "在非重读元音之间，/t/ 变为闪音 [ɾ]，听感接近轻快的 d。"
+    }
+  ],
+  "links": [
+    {
+      "from": 2,
+      "to": 3,
+      "note": "Join the words without a pause. Follow the sentence IPA below for their sounds in context."
+    }
+  ]
+}

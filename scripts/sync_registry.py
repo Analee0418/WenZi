@@ -49,7 +49,8 @@ def generate_registry(
             print(f"WARNING: {toml_path} has no id field, skipping")
             continue
 
-        source = f"{base_url}/{entry}/plugin.toml"
+        # Fork-specific plugins may be published outside the registry's upstream.
+        source = section.get("source") or f"{base_url}/{entry}/plugin.toml"
         info = {"source": source}
         for field in REGISTRY_FIELDS:
             val = section.get(field, "")

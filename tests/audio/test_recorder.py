@@ -26,15 +26,20 @@ def _silence_bytes(count: int = 320) -> bytes:
     return b"\x00" * (count * 2)
 
 
+def _new_mock_engine():
+    engine = MagicMock()
+    input_node = MagicMock()
+    hw_format = MagicMock()
+    hw_format.sampleRate.return_value = 48000.0
+    input_node.outputFormatForBus_.return_value = hw_format
+    engine.inputNode.return_value = input_node
+    engine.startAndReturnError_.return_value = (True, None)
+    return engine
+
+
 def _mock_engine(monkeypatch):
     """Patch AVAudioEngine and friends so start() succeeds without hardware."""
-    mock_engine = MagicMock()
-    mock_input_node = MagicMock()
-    mock_hw_fmt = MagicMock()
-    mock_hw_fmt.sampleRate.return_value = 48000.0
-    mock_input_node.outputFormatForBus_.return_value = mock_hw_fmt
-    mock_engine.inputNode.return_value = mock_input_node
-    mock_engine.startAndReturnError_.return_value = (True, None)
+    mock_engine = _new_mock_engine()
 
     monkeypatch.setattr(
         "wenzi.audio.recorder.AVAudioEngine",
@@ -64,6 +69,53 @@ def _mock_engine(monkeypatch):
         lambda uid: _InputRoute("test-uid", "TestMic", None, False),
     )
     return mock_engine
+
+
+def _mock_engine_sequence(monkeypatch, engines, *, transport=b"blue"):
+    """Install normal mocks while returning AVAudioEngine objects in order."""
+    _mock_engine(monkeypatch)
+    allocator = MagicMock()
+    allocator.alloc.return_value.init.side_effect = engines
+    monkeypatch.setattr("wenzi.audio.recorder.AVAudioEngine", allocator)
+    route = _InputRoute(
+        "test-uid",
+        "TestMic",
+        int.from_bytes(transport, "big"),
+        False,
+    )
+    monkeypatch.setattr(
+        "wenzi.audio.recorder._select_input_route",
+        lambda uid: route,
+    )
+
+
+def _capture_config_callbacks(monkeypatch):
+    callbacks = []
+    center = MagicMock()
+
+    def _add_observer(_name, _engine, _queue, callback):
+        callbacks.append(callback)
+        return object()
+
+    center.addObserverForName_object_queue_usingBlock_.side_effect = (
+        _add_observer
+    )
+    notification_center = MagicMock()
+    notification_center.defaultCenter.return_value = center
+    monkeypatch.setattr(
+        "wenzi.audio.recorder.NSNotificationCenter",
+        notification_center,
+    )
+    return callbacks
+
+
+def _wait_until(predicate, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.005)
+    raise AssertionError("condition was not reached before timeout")
 
 
 def _capture_device(name: str, uid: str, transport: bytes):
@@ -101,21 +153,23 @@ class TestInputRouteSelection:
         assert route.bind is False
         capture.devicesWithMediaType_.assert_not_called()
 
-    def test_explicit_airpods_is_honored(self, monkeypatch):
+    def test_explicit_uid_still_follows_system_default(self, monkeypatch):
         bluetooth = _capture_device("AirPods Max", "airpods", b"blue")
         built_in = _capture_device(
             "MacBook Pro Microphone", "builtin", b"bltn"
         )
         capture = MagicMock()
+        capture.defaultDeviceWithMediaType_.return_value = built_in
         capture.devicesWithMediaType_.return_value = [bluetooth, built_in]
         monkeypatch.setattr("wenzi.audio.recorder.AVCaptureDevice", capture)
 
         route = _select_input_route("airpods")
 
-        assert route.uid == "airpods"
-        assert route.name == "AirPods Max"
-        assert route.bind is True
-        capture.defaultDeviceWithMediaType_.assert_not_called()
+        assert route.uid == "builtin"
+        assert route.name == "MacBook Pro Microphone"
+        assert route.bind is False
+        capture.defaultDeviceWithMediaType_.assert_called_once()
+        capture.devicesWithMediaType_.assert_not_called()
 
 
 class TestRecorder:
@@ -259,70 +313,108 @@ class TestRecorder:
         assert r.is_recording is True
         r.stop()
 
-    def test_explicit_device_not_found_fails_start(self, monkeypatch):
+    def test_explicit_device_config_is_ignored_without_binding(
+        self,
+        monkeypatch,
+    ):
         engine = _mock_engine(monkeypatch)
+        select = MagicMock(
+            return_value=_InputRoute(
+                "system-default",
+                "Default Mic",
+                None,
+                True,
+            )
+        )
+        resolve = MagicMock(return_value=42)
         monkeypatch.setattr(
             "wenzi.audio.recorder._select_input_route",
-            lambda uid: _InputRoute(uid, "Missing Mic", None, True),
+            select,
+        )
+        monkeypatch.setattr(
+            "wenzi.audio.recorder._resolve_device_id",
+            resolve,
         )
 
-        r = Recorder(sample_rate=16000, block_ms=20, device="missing")
+        r = Recorder(sample_rate=16000, block_ms=20, device="old-uid")
         r._query_device_name_enabled = False
+        assert r.device is None
         assert r.start() is None
-        assert r.is_recording is False
-        engine.stop.assert_called_once()
+        assert r.is_recording is True
+        select.assert_called_once_with(None)
+        resolve.assert_not_called()
+        engine.inputNode.return_value.AUAudioUnit.return_value.setDeviceID_error_.assert_not_called()
+        r.stop()
 
-    def test_device_bind_false_result_fails_start(self, monkeypatch):
+    def test_start_revalidates_sound_preflight_route(self, monkeypatch):
         engine = _mock_engine(monkeypatch)
+        route = _InputRoute(
+            "airpods",
+            "AirPods Max",
+            int.from_bytes(b"blue", "big"),
+            False,
+        )
+        select = MagicMock(return_value=route)
         monkeypatch.setattr(
             "wenzi.audio.recorder._select_input_route",
-            lambda uid: _InputRoute(uid, "Selected Mic", None, True),
+            select,
         )
-        monkeypatch.setattr("wenzi.audio.recorder._resolve_device_id", lambda uid: 42)
-        au = engine.inputNode.return_value.AUAudioUnit.return_value
-        au.setDeviceID_error_.return_value = False
 
-        r = Recorder(sample_rate=16000, block_ms=20, device="selected")
+        r = Recorder(sample_rate=16000, block_ms=20)
         r._query_device_name_enabled = False
+        assert r.preflight_input_route() is route
         assert r.start() is None
-        assert r.is_recording is False
-        engine.stop.assert_called_once()
-
-    def test_device_bind_mismatched_readback_fails_start(self, monkeypatch):
-        engine = _mock_engine(monkeypatch)
-        monkeypatch.setattr(
-            "wenzi.audio.recorder._select_input_route",
-            lambda uid: _InputRoute(uid, "Selected Mic", None, True),
-        )
-        monkeypatch.setattr("wenzi.audio.recorder._resolve_device_id", lambda uid: 42)
-        au = engine.inputNode.return_value.AUAudioUnit.return_value
-        au.setDeviceID_error_.return_value = True
-        au.deviceID.return_value = 41
-
-        r = Recorder(sample_rate=16000, block_ms=20, device="selected")
-        r._query_device_name_enabled = False
-        assert r.start() is None
-        assert r.is_recording is False
-        engine.stop.assert_called_once()
-
-    def test_device_bind_verified_before_recording(self, monkeypatch):
-        engine = _mock_engine(monkeypatch)
-        monkeypatch.setattr(
-            "wenzi.audio.recorder._select_input_route",
-            lambda uid: _InputRoute(uid, "Selected Mic", None, True),
-        )
-        monkeypatch.setattr("wenzi.audio.recorder._resolve_device_id", lambda uid: 42)
-        au = engine.inputNode.return_value.AUAudioUnit.return_value
-        au.setDeviceID_error_.return_value = True
-        au.deviceID.return_value = 42
-
-        r = Recorder(sample_rate=16000, block_ms=20, device="selected")
-        r._query_device_name_enabled = False
-        r.start()
 
         assert r.is_recording is True
-        au.setDeviceID_error_.assert_called_once_with(42, None)
+        assert r._session.is_bluetooth is True
+        assert select.call_args_list == [((None,), {}), ((None,), {})]
+        engine.inputNode.return_value.AUAudioUnit.return_value.setDeviceID_error_.assert_not_called()
         r.stop()
+
+    def test_chime_approved_then_bluetooth_default_aborts_start(
+        self,
+        monkeypatch,
+    ):
+        engine = _mock_engine(monkeypatch)
+        built_in = _InputRoute(
+            "built-in",
+            "Built-in Microphone",
+            int.from_bytes(b"bltn", "big"),
+            False,
+        )
+        airpods = _InputRoute(
+            "airpods",
+            "AirPods Max",
+            int.from_bytes(b"blue", "big"),
+            False,
+        )
+        select = MagicMock(side_effect=[built_in, airpods])
+        monkeypatch.setattr(
+            "wenzi.audio.recorder._select_input_route",
+            select,
+        )
+        recorder = Recorder(sample_rate=16000, block_ms=20)
+        recorder.preflight_input_route()
+        recorder.mark_preflight_chime_allowed()
+
+        assert recorder.start() is None
+
+        assert not recorder.is_recording
+        engine.inputNode.assert_not_called()
+
+    def test_unknown_transport_enables_bluetooth_recovery(self, monkeypatch):
+        _mock_engine(monkeypatch)
+        monkeypatch.setattr(
+            "wenzi.audio.recorder._select_input_route",
+            lambda _uid: _InputRoute("unknown", "Unknown Mic", None, False),
+        )
+        recorder = Recorder(sample_rate=16000, block_ms=20)
+
+        recorder.start()
+
+        assert recorder.is_recording
+        assert recorder._session.is_bluetooth is True
+        recorder.stop()
 
 
 class TestMarkTainted:
@@ -385,6 +477,21 @@ class TestMarkTainted:
                 break
             time.sleep(0.01)
         assert r.is_recording is False
+        engine.stop.assert_called_once()
+
+    def test_taint_after_commit_can_leave_teardown_to_owner(
+        self,
+        monkeypatch,
+    ):
+        engine = _mock_engine(monkeypatch)
+        recorder = Recorder(sample_rate=16000, block_ms=20)
+        recorder.start()
+
+        recorder.mark_tainted(stop_async=False)
+
+        assert recorder.is_recording is True
+        engine.stop.assert_not_called()
+        recorder.stop()
         engine.stop.assert_called_once()
 
     def test_superseded_stale_start_does_not_commit(self, monkeypatch):
@@ -467,6 +574,16 @@ def _voice_buffer():
     ch = MagicMock()
     ch.as_buffer.return_value = struct.pack("<3f", 0.5, 0.5, 0.5)
     buf.floatChannelData.return_value = [ch]
+    return buf
+
+
+def _zero_buffer(frame_count=3):
+    """A fake AVAudioPCMBuffer containing bit-exact float32 zeros."""
+    buf = MagicMock()
+    buf.frameLength.return_value = frame_count
+    channel = MagicMock()
+    channel.as_buffer.return_value = b"\x00" * (frame_count * 4)
+    buf.floatChannelData.return_value = [channel]
     return buf
 
 
@@ -665,39 +782,664 @@ class TestArmedGate:
         assert r.is_recording is False
 
 
-def _explicit_bind_mocks(monkeypatch, engine, uid="uid-1", dev_id=42):
-    """Route selection + id resolution mocks for an explicitly bound device."""
-    select = MagicMock(
-        return_value=_InputRoute(uid, "Selected Mic", None, True)
-    )
-    resolve = MagicMock(return_value=dev_id)
-    monkeypatch.setattr("wenzi.audio.recorder._select_input_route", select)
-    monkeypatch.setattr("wenzi.audio.recorder._resolve_device_id", resolve)
-    au = engine.inputNode.return_value.AUAudioUnit.return_value
-    au.setDeviceID_error_.return_value = True
-    au.deviceID.return_value = dev_id
-    return select, resolve
+class TestBluetoothRecovery:
+    @pytest.mark.parametrize("transport", [b"blue", b"blea"])
+    def test_exact_zero_rebuilds_engine_and_preserves_session(
+        self,
+        monkeypatch,
+        transport,
+    ):
+        old_engine = _new_mock_engine()
+        replacement = _new_mock_engine()
+        _mock_engine_sequence(
+            monkeypatch,
+            [old_engine, replacement],
+            transport=transport,
+        )
+        monkeypatch.setattr(
+            Recorder,
+            "_BLUETOOTH_ZERO_RECOVERY_SECS",
+            0.0,
+        )
+        monkeypatch.setattr(
+            Recorder,
+            "_BLUETOOTH_RECOVERY_MIN_INTERVAL_SECS",
+            0.0,
+        )
+
+        recorder = Recorder(sample_rate=16000, block_ms=20)
+        recorder.start()
+        session = recorder._session
+        original_queue = session.queue
+        received = []
+
+        def callback(data):
+            received.append(data)
+
+        recorder.set_on_audio_chunk(callback)
+
+        recorder._tap_callback(
+            _voice_buffer(),
+            recorder._active_gen,
+            3.0,
+            session,
+            engine_epoch=1,
+        )
+        recorder._tap_callback(
+            _zero_buffer(),
+            recorder._active_gen,
+            3.0,
+            session,
+            engine_epoch=1,
+        )
+        _wait_until(lambda: recorder._engine is replacement)
+
+        assert recorder._session is session
+        assert session.queue is original_queue
+        assert session.on_chunk is callback
+        assert session.engine_epoch == 2
+        assert session.saw_nonzero is True
+        assert session.recovery_count == 1
+        old_engine.stop.assert_called_once()
+
+        received_before_stale_callback = len(received)
+        recorder._tap_callback(
+            _voice_buffer(),
+            recorder._active_gen,
+            3.0,
+            session,
+            engine_epoch=1,
+        )
+        assert len(received) == received_before_stale_callback
+
+        recorder._tap_callback(
+            _voice_buffer(),
+            recorder._active_gen,
+            3.0,
+            session,
+            engine_epoch=2,
+        )
+        assert len(received) == received_before_stale_callback + 1
+        assert recorder.stop() is not None
+        replacement.stop.assert_called_once()
+
+    def test_short_startup_zeros_and_non_bluetooth_silence_do_not_recover(
+        self,
+        monkeypatch,
+    ):
+        recorder = Recorder(sample_rate=16000)
+        monkeypatch.setattr(
+            Recorder,
+            "_BLUETOOTH_ZERO_RECOVERY_SECS",
+            0.0,
+        )
+        schedule = MagicMock()
+        monkeypatch.setattr(
+            recorder,
+            "_schedule_bluetooth_recovery",
+            schedule,
+        )
+        zero = b"\x00" * 12
+        voice = struct.pack("<3f", 0.1, 0.0, 0.0)
+
+        bluetooth = _TapSession(is_bluetooth=True)
+        recorder._track_bluetooth_zero_audio(
+            zero, 3, 3.0, 1, bluetooth
+        )
+        schedule.assert_not_called()
+
+        built_in = _TapSession(is_bluetooth=False)
+        recorder._track_bluetooth_zero_audio(
+            voice, 3, 3.0, 1, built_in
+        )
+        recorder._track_bluetooth_zero_audio(
+            zero, 3, 3.0, 1, built_in
+        )
+        schedule.assert_not_called()
+
+        recorder._track_bluetooth_zero_audio(
+            voice, 3, 3.0, 1, bluetooth
+        )
+        recorder._track_bluetooth_zero_audio(
+            zero, 3, 3.0, 1, bluetooth
+        )
+        schedule.assert_called_once_with(1, bluetooth)
+
+    def test_subsecond_bluetooth_zero_run_does_not_recover(
+        self,
+        monkeypatch,
+    ):
+        recorder = Recorder(sample_rate=100)
+        schedule = MagicMock()
+        monkeypatch.setattr(
+            recorder,
+            "_schedule_bluetooth_recovery",
+            schedule,
+        )
+        session = _TapSession(is_bluetooth=True)
+        session.saw_nonzero = True
+
+        # Successful AirPods recordings can end with about 0.72 seconds of
+        # exact zeros.  Keep that valid tail below the recovery boundary.
+        recorder._track_bluetooth_zero_audio(
+            b"\x00" * (75 * 4), 75, 1.0, 1, session
+        )
+        schedule.assert_not_called()
+
+        recorder._track_bluetooth_zero_audio(
+            b"\x00" * (25 * 4), 25, 1.0, 1, session
+        )
+        schedule.assert_called_once_with(1, session)
+
+    def test_bluetooth_startup_exact_zero_eventually_recovers(
+        self,
+        monkeypatch,
+    ):
+        old_engine = _new_mock_engine()
+        replacement = _new_mock_engine()
+        _mock_engine_sequence(monkeypatch, [old_engine, replacement])
+        monkeypatch.setattr(
+            Recorder,
+            "_BLUETOOTH_STARTUP_ZERO_RECOVERY_SECS",
+            0.0,
+        )
+        monkeypatch.setattr(
+            Recorder,
+            "_BLUETOOTH_RECOVERY_MIN_INTERVAL_SECS",
+            0.0,
+        )
+
+        recorder = Recorder(sample_rate=16000)
+        recorder.start()
+        session = recorder._session
+        assert session.saw_nonzero is False
+
+        recorder._tap_callback(
+            _zero_buffer(), recorder._active_gen, 3.0, session
+        )
+        _wait_until(lambda: recorder._engine is replacement)
+
+        assert session.recovery_count == 1
+        assert session.engine_epoch == 2
+        recorder._queue.put(_int16_bytes(1000))
+        assert recorder.stop() is not None
+
+    def test_recovery_refreshes_output_after_commit_without_recorder_lock(
+        self,
+        monkeypatch,
+    ):
+        old_engine = _new_mock_engine()
+        replacement = _new_mock_engine()
+        _mock_engine_sequence(monkeypatch, [old_engine, replacement])
+        monkeypatch.setattr(
+            Recorder,
+            "_BLUETOOTH_STARTUP_ZERO_RECOVERY_SECS",
+            0.0,
+        )
+        monkeypatch.setattr(
+            Recorder,
+            "_BLUETOOTH_RECOVERY_MIN_INTERVAL_SECS",
+            0.0,
+        )
+
+        recorder = Recorder(sample_rate=16000)
+        callback_done = threading.Event()
+        observations = {}
+
+        def _on_route_recovered():
+            acquired = recorder._lock.acquire(blocking=False)
+            observations["lock_was_free"] = acquired
+            if acquired:
+                recorder._lock.release()
+            observations["engine"] = recorder._engine
+            observations["pending"] = recorder._session.recovery_pending
+            callback_done.set()
+            return True
+
+        recorder.start(on_route_recovered=_on_route_recovered)
+        session = recorder._session
+
+        recorder._tap_callback(
+            _zero_buffer(), recorder._active_gen, 3.0, session
+        )
+        assert callback_done.wait(timeout=2)
+        _wait_until(lambda: session.recovery_pending is False)
+
+        assert observations == {
+            "lock_was_free": True,
+            "engine": replacement,
+            "pending": False,
+        }
+        recorder._queue.put(_int16_bytes(1000))
+        assert recorder.stop() is not None
+
+    def test_stop_during_route_refresh_waits_without_discarding_audio(
+        self,
+        monkeypatch,
+    ):
+        old_engine = _new_mock_engine()
+        replacement = _new_mock_engine()
+        _mock_engine_sequence(monkeypatch, [old_engine, replacement])
+        monkeypatch.setattr(
+            Recorder,
+            "_BLUETOOTH_STARTUP_ZERO_RECOVERY_SECS",
+            0.0,
+        )
+        monkeypatch.setattr(
+            Recorder,
+            "_BLUETOOTH_RECOVERY_MIN_INTERVAL_SECS",
+            0.0,
+        )
+
+        recorder = Recorder(sample_rate=16000)
+        refresh_entered = threading.Event()
+        allow_refresh = threading.Event()
+        stop_reached = threading.Event()
+        replacement.stop.side_effect = stop_reached.set
+
+        def _on_route_recovered():
+            refresh_entered.set()
+            assert allow_refresh.wait(timeout=5)
+            return True
+
+        recorder.start(on_route_recovered=_on_route_recovered)
+        session = recorder._session
+        recorder._tap_callback(
+            _zero_buffer(), recorder._active_gen, 3.0, session
+        )
+        assert refresh_entered.wait(timeout=2)
+        assert session.recovery_pending is False
+        recorder._queue.put(_int16_bytes(1000))
+
+        result = []
+        stop_thread = threading.Thread(
+            target=lambda: result.append(recorder.stop())
+        )
+        stop_thread.start()
+        assert stop_reached.wait(timeout=2)
+        stop_thread.join(timeout=0.05)
+        assert stop_thread.is_alive()
+        assert session.capture_failed is False
+
+        allow_refresh.set()
+        stop_thread.join(timeout=2)
+
+        assert not stop_thread.is_alive()
+        assert result[0] is not None
+        replacement.stop.assert_called_once()
+
+    def test_route_refresh_exception_keeps_committed_recovery_usable(
+        self,
+        monkeypatch,
+    ):
+        old_engine = _new_mock_engine()
+        replacement = _new_mock_engine()
+        _mock_engine_sequence(monkeypatch, [old_engine, replacement])
+        monkeypatch.setattr(
+            Recorder,
+            "_BLUETOOTH_STARTUP_ZERO_RECOVERY_SECS",
+            0.0,
+        )
+        monkeypatch.setattr(
+            Recorder,
+            "_BLUETOOTH_RECOVERY_MIN_INTERVAL_SECS",
+            0.0,
+        )
+
+        def _on_route_recovered():
+            raise RuntimeError("CoreAudio route is still publishing")
+
+        recorder = Recorder(sample_rate=16000)
+        recorder.start(on_route_recovered=_on_route_recovered)
+        session = recorder._session
+        recorder._tap_callback(
+            _zero_buffer(), recorder._active_gen, 3.0, session
+        )
+        assert session.recovery_done.wait(timeout=2)
+
+        assert recorder._engine is replacement
+        assert session.recovery_pending is False
+        assert session.capture_failed is False
+        assert recorder._recovery_done.is_set()
+        recorder._queue.put(_int16_bytes(1000))
+        assert recorder.stop() is not None
+
+    def test_old_config_observer_cannot_invalidate_recovered_engine(
+        self,
+        monkeypatch,
+    ):
+        old_engine = _new_mock_engine()
+        replacement = _new_mock_engine()
+        _mock_engine_sequence(monkeypatch, [old_engine, replacement])
+        callbacks = _capture_config_callbacks(monkeypatch)
+        monkeypatch.setattr(
+            Recorder,
+            "_BLUETOOTH_STARTUP_ZERO_RECOVERY_SECS",
+            0.0,
+        )
+        monkeypatch.setattr(
+            Recorder,
+            "_BLUETOOTH_RECOVERY_MIN_INTERVAL_SECS",
+            0.0,
+        )
+
+        recorder = Recorder(sample_rate=16000)
+        recorder.start()
+        session = recorder._session
+        assert len(callbacks) == 1
+        old_callback = callbacks[0]
+        old_engine.stop.side_effect = lambda: old_callback(None)
+
+        recorder._tap_callback(
+            _zero_buffer(), recorder._active_gen, 3.0, session
+        )
+        _wait_until(lambda: recorder._engine is replacement)
+        assert len(callbacks) == 2
+        assert session.capture_failed is False
+
+        old_callback(None)
+        assert session.capture_failed is False
+
+        callbacks[1](None)
+        assert session.capture_failed is True
+        assert recorder.stop() is None
+
+    def test_unknown_replacement_keeps_bluetooth_recovery_armed(
+        self,
+        monkeypatch,
+    ):
+        old_engine = _new_mock_engine()
+        replacement = _new_mock_engine()
+        _mock_engine_sequence(monkeypatch, [old_engine, replacement])
+        bluetooth = _InputRoute(
+            "airpods",
+            "AirPods Max",
+            int.from_bytes(b"blue", "big"),
+            False,
+        )
+        unknown = _InputRoute("airpods", "AirPods Max", None, False)
+        monkeypatch.setattr(
+            "wenzi.audio.recorder._select_input_route",
+            MagicMock(side_effect=[bluetooth, unknown]),
+        )
+        monkeypatch.setattr(
+            Recorder,
+            "_BLUETOOTH_STARTUP_ZERO_RECOVERY_SECS",
+            0.0,
+        )
+        monkeypatch.setattr(
+            Recorder,
+            "_BLUETOOTH_RECOVERY_MIN_INTERVAL_SECS",
+            0.0,
+        )
+        recorder = Recorder(sample_rate=16000)
+        recorder.start()
+        session = recorder._session
+
+        recorder._tap_callback(
+            _zero_buffer(), recorder._active_gen, 3.0, session
+        )
+        _wait_until(lambda: recorder._engine is replacement)
+
+        assert session.is_bluetooth is True
+        recorder._queue.put(_int16_bytes(1000))
+        assert recorder.stop() is not None
+
+    def test_failed_recovery_discards_truncated_prefix(
+        self,
+        monkeypatch,
+    ):
+        old_engine = _new_mock_engine()
+        failed_engines = [_new_mock_engine() for _ in range(3)]
+        for engine in failed_engines:
+            engine.startAndReturnError_.return_value = (False, "failed")
+        _mock_engine_sequence(
+            monkeypatch,
+            [old_engine, *failed_engines],
+        )
+        monkeypatch.setattr(
+            Recorder,
+            "_BLUETOOTH_ZERO_RECOVERY_SECS",
+            0.0,
+        )
+        monkeypatch.setattr(
+            Recorder,
+            "_BLUETOOTH_RECOVERY_MIN_INTERVAL_SECS",
+            0.0,
+        )
+        monkeypatch.setattr(
+            Recorder,
+            "_BLUETOOTH_RECOVERY_RETRY_DELAY_SECS",
+            0.0,
+        )
+
+        recorder = Recorder(sample_rate=16000)
+        recorder.start()
+        session = recorder._session
+        recorder._tap_callback(
+            _voice_buffer(), recorder._active_gen, 3.0, session
+        )
+        recorder._tap_callback(
+            _zero_buffer(), recorder._active_gen, 3.0, session
+        )
+        _wait_until(lambda: recorder._recovery_done.is_set())
+
+        assert session.capture_failed is True
+        assert recorder.is_recording is True
+        assert recorder.stop() is None
+        old_engine.stop.assert_called_once()
+        for engine in failed_engines:
+            engine.stop.assert_called_once()
+
+    def test_stop_then_start_waits_for_stale_recovery_cleanup(
+        self,
+        monkeypatch,
+    ):
+        old_engine = _new_mock_engine()
+        stale_replacement = _new_mock_engine()
+        next_engine = _new_mock_engine()
+        build_entered = threading.Event()
+        allow_build = threading.Event()
+
+        def _blocking_start(_error):
+            build_entered.set()
+            assert allow_build.wait(timeout=5)
+            return True, None
+
+        stale_replacement.startAndReturnError_.side_effect = _blocking_start
+        _mock_engine_sequence(
+            monkeypatch,
+            [old_engine, stale_replacement, next_engine],
+        )
+        monkeypatch.setattr(
+            Recorder,
+            "_BLUETOOTH_ZERO_RECOVERY_SECS",
+            0.0,
+        )
+        monkeypatch.setattr(
+            Recorder,
+            "_BLUETOOTH_RECOVERY_MIN_INTERVAL_SECS",
+            0.0,
+        )
+
+        recorder = Recorder(sample_rate=16000)
+        recorder.start()
+        old_session = recorder._session
+        recorder._tap_callback(
+            _voice_buffer(), recorder._active_gen, 3.0, old_session
+        )
+        recorder._tap_callback(
+            _zero_buffer(), recorder._active_gen, 3.0, old_session
+        )
+        assert build_entered.wait(timeout=2)
+
+        stop_result = []
+        stop_done = threading.Event()
+
+        def _stop_old():
+            stop_result.append(recorder.stop())
+            stop_done.set()
+
+        stop_thread = threading.Thread(target=_stop_old)
+        stop_thread.start()
+        _wait_until(lambda: not recorder.is_recording)
+        assert not stop_done.wait(timeout=0.1)
+
+        start_result = []
+        start_done = threading.Event()
+
+        def _start_next():
+            start_result.append(recorder.start())
+            start_done.set()
+
+        start_thread = threading.Thread(target=_start_next)
+        start_thread.start()
+        assert not start_done.wait(timeout=0.1)
+        next_engine.startAndReturnError_.assert_not_called()
+
+        allow_build.set()
+        stop_thread.join(timeout=2)
+        start_thread.join(timeout=2)
+        assert not stop_thread.is_alive()
+        assert not start_thread.is_alive()
+        assert stop_result == [None]
+        assert start_result == ["TestMic"]
+        assert recorder._engine is next_engine
+        assert recorder._session is not old_session
+        stale_replacement.stop.assert_called_once()
+
+        recorder._queue.put(_int16_bytes(1000))
+        assert recorder.stop() is not None
+        next_engine.stop.assert_called_once()
+
+    def test_start_abandoned_while_waiting_never_builds_engine(
+        self,
+        monkeypatch,
+    ):
+        engine = _mock_engine(monkeypatch)
+        recorder = Recorder()
+        recorder._recovery_done.clear()
+        result = []
+        thread = threading.Thread(target=lambda: result.append(recorder.start()))
+        thread.start()
+        _wait_until(lambda: recorder._starting_since is not None)
+
+        recorder.mark_tainted()
+        recorder._recovery_done.set()
+        thread.join(timeout=2)
+
+        assert not thread.is_alive()
+        assert result == [None]
+        assert recorder.is_recording is False
+        engine.startAndReturnError_.assert_not_called()
+
+    def test_recovery_dispatch_failure_reopens_both_gates(
+        self,
+        monkeypatch,
+    ):
+        _mock_engine(monkeypatch)
+        recorder = Recorder()
+        recorder.start()
+        session = recorder._session
+        monkeypatch.setattr(
+            "wenzi.audio.recorder.threading.Thread",
+            MagicMock(side_effect=RuntimeError("cannot create thread")),
+        )
+
+        recorder._schedule_bluetooth_recovery(
+            recorder._active_gen,
+            session,
+        )
+
+        assert session.recovery_pending is False
+        assert session.recovery_count == 0
+        assert session.recovery_done.is_set()
+        assert recorder._recovery_done.is_set()
+        recorder._queue.put(_int16_bytes(1000))
+        assert recorder.stop() is not None
+
+    def test_recovery_limit_marks_repeated_zero_stream_failed(
+        self,
+        monkeypatch,
+    ):
+        engines = [_new_mock_engine() for _ in range(3)]
+        _mock_engine_sequence(monkeypatch, engines)
+        monkeypatch.setattr(
+            Recorder,
+            "_BLUETOOTH_ZERO_RECOVERY_SECS",
+            0.0,
+        )
+        monkeypatch.setattr(
+            Recorder,
+            "_BLUETOOTH_RECOVERY_MIN_INTERVAL_SECS",
+            0.0,
+        )
+
+        recorder = Recorder(sample_rate=16000)
+        recorder.start()
+        session = recorder._session
+        recorder._tap_callback(
+            _voice_buffer(), recorder._active_gen, 3.0, session
+        )
+
+        for expected_engine in engines[1:]:
+            recorder._tap_callback(
+                _zero_buffer(),
+                recorder._active_gen,
+                3.0,
+                session,
+                engine_epoch=session.engine_epoch,
+            )
+            _wait_until(lambda: recorder._engine is expected_engine)
+
+        recorder._tap_callback(
+            _zero_buffer(),
+            recorder._active_gen,
+            3.0,
+            session,
+            engine_epoch=session.engine_epoch,
+        )
+
+        assert session.recovery_count == 2
+        assert session.capture_failed is True
+        assert recorder.stop() is None
 
 
 class TestRouteCache:
-    def test_explicit_route_resolved_once_across_starts(self, monkeypatch):
+    def test_legacy_explicit_config_follows_each_new_default(
+        self,
+        monkeypatch,
+    ):
         engine = _mock_engine(monkeypatch)
-        select, resolve = _explicit_bind_mocks(monkeypatch, engine)
+        built_in = _InputRoute(
+            "built-in",
+            "Built-in",
+            int.from_bytes(b"bltn", "big"),
+            False,
+        )
+        airpods = _InputRoute(
+            "airpods",
+            "AirPods Max",
+            int.from_bytes(b"blue", "big"),
+            False,
+        )
+        select = MagicMock(side_effect=[built_in, airpods])
+        monkeypatch.setattr("wenzi.audio.recorder._select_input_route", select)
         au = engine.inputNode.return_value.AUAudioUnit.return_value
 
         r = Recorder(sample_rate=16000, block_ms=20, device="uid-1")
         r._query_device_name_enabled = False
         r.start()
         assert r.is_recording is True
+        assert r._session.is_bluetooth is False
         r.stop()
         r.start()
         assert r.is_recording is True
+        assert r._session.is_bluetooth is True
         r.stop()
 
-        select.assert_called_once_with("uid-1")
-        resolve.assert_called_once_with("uid-1")
-        # The bind itself is re-verified on every start (stale-id guard)
-        assert au.setDeviceID_error_.call_count == 2
+        assert [call.args for call in select.call_args_list] == [(None,), (None,)]
+        au.setDeviceID_error_.assert_not_called()
 
     def test_automatic_route_never_cached(self, monkeypatch):
         _mock_engine(monkeypatch)
@@ -716,50 +1458,53 @@ class TestRouteCache:
         assert select.call_count == 2
         assert r._route_cache is None
 
-    def test_device_setter_invalidates_route_cache(self, monkeypatch):
-        engine = _mock_engine(monkeypatch)
-        select, resolve = _explicit_bind_mocks(monkeypatch, engine)
-
+    def test_device_setter_keeps_automatic_and_drops_preflight(
+        self,
+        monkeypatch,
+    ):
+        _mock_engine(monkeypatch)
         r = Recorder(sample_rate=16000, block_ms=20, device="uid-1")
-        r._query_device_name_enabled = False
-        r.start()
-        r.stop()
-        assert r._route_cache is not None
+        route = r.preflight_input_route()
+        assert r._preflight_route is route
 
         r.device = "uid-2"
         assert r._route_cache is None
-        assert r.device == "uid-2"
+        assert r._preflight_route is None
+        assert r.device is None
 
-        r.start()
-        r.stop()
-        assert select.call_args_list[-1].args == ("uid-2",)
+    def test_config_change_invalidates_preflight(self, monkeypatch):
+        _mock_engine(monkeypatch)
+        r = Recorder(sample_rate=16000, block_ms=20)
+        r.preflight_input_route()
+        assert r._preflight_route is not None
 
-    def test_config_change_invalidates_route_cache(self, monkeypatch):
-        engine = _mock_engine(monkeypatch)
-        _explicit_bind_mocks(monkeypatch, engine)
-
-        r = Recorder(sample_rate=16000, block_ms=20, device="uid-1")
-        r._query_device_name_enabled = False
-        r.start()
-        r.stop()
-        assert r._route_cache is not None
-
-        r._on_config_change()
+        r._on_config_change(None, None, None)
         assert r._route_cache is None
+        assert r._preflight_route is None
 
-    def test_start_failure_invalidates_route_cache(self, monkeypatch):
+    def test_config_change_discards_active_capture(self, monkeypatch):
+        _mock_engine(monkeypatch)
+        recorder = Recorder(sample_rate=16000, block_ms=20)
+        recorder.start()
+        recorder._queue.put(_int16_bytes(1000))
+
+        recorder._on_config_change(
+            recorder._active_gen,
+            recorder._session,
+            recorder._session.engine_epoch,
+        )
+
+        assert recorder._session.capture_failed is True
+        assert recorder.stop() is None
+
+    def test_start_failure_invalidates_preflight(self, monkeypatch):
         engine = _mock_engine(monkeypatch)
-        _explicit_bind_mocks(monkeypatch, engine)
-
-        r = Recorder(sample_rate=16000, block_ms=20, device="uid-1")
-        r._query_device_name_enabled = False
-        r.start()
-        r.stop()
-        assert r._route_cache is not None
-
         engine.startAndReturnError_.return_value = (False, "boom")
+        r = Recorder(sample_rate=16000, block_ms=20)
+        r.preflight_input_route()
         assert r.start() is None
         assert r._route_cache is None
+        assert r._preflight_route is None
 
     def test_coreaudio_bindings_created_once(self, monkeypatch):
         import ctypes.util

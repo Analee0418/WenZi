@@ -298,15 +298,15 @@ class TestSystemAudioDuckSettings:
 
 class TestMicrophoneSelect:
     @patch("wenzi.controllers.settings_controller.save_config")
-    def test_explicit_device_updates_config_and_recorder(
+    def test_explicit_device_is_normalized_to_automatic(
         self, mock_save, ctrl, mock_app
     ):
         mock_app._settings_panel.is_visible = False
 
         ctrl.mic_select("airpods-uid")
 
-        assert mock_app._config["audio"]["device"] == "airpods-uid"
-        assert mock_app._recorder.device == "airpods-uid"
+        assert mock_app._config["audio"]["device"] is None
+        assert mock_app._recorder.device is None
         mock_save.assert_called_once()
 
     @patch("wenzi.controllers.settings_controller.save_config")
@@ -323,7 +323,7 @@ class TestMicrophoneSelect:
 
     @patch("wenzi.controllers.settings_controller.save_config")
     @patch("PyObjCTools.AppHelper.callAfter", side_effect=RuntimeError("UI busy"))
-    def test_refresh_failure_after_save_keeps_committed_selection(
+    def test_refresh_failure_after_save_keeps_automatic_selection(
         self, mock_call_after, mock_save, ctrl, mock_app
     ):
         mock_app._config["audio"] = {"device": "old-uid"}
@@ -332,8 +332,8 @@ class TestMicrophoneSelect:
 
         ctrl.mic_select("new-uid")
 
-        assert mock_app._config["audio"]["device"] == "new-uid"
-        assert mock_app._recorder.device == "new-uid"
+        assert mock_app._config["audio"]["device"] is None
+        assert mock_app._recorder.device is None
         mock_save.assert_called_once()
         mock_call_after.assert_called_once()
 
@@ -342,15 +342,11 @@ class TestMicrophoneSelect:
         return_value="MacBook Pro Microphone",
     )
     @patch(
-        "wenzi.controllers.settings_controller.list_input_devices",
-        return_value=[{"uid": "old-uid", "name": "Old Mic"}],
-    )
-    @patch(
         "wenzi.controllers.settings_controller.save_config",
         side_effect=OSError("disk full"),
     )
     def test_save_failure_rolls_back_memory_and_panel(
-        self, mock_save, mock_devices, mock_auto_name, ctrl, mock_app
+        self, mock_save, mock_auto_name, ctrl, mock_app
     ):
         mock_app._config["audio"] = {"device": "old-uid"}
         mock_app._recorder.device = "old-uid"
@@ -362,24 +358,19 @@ class TestMicrophoneSelect:
         assert mock_app._config["audio"]["device"] == "old-uid"
         assert mock_app._recorder.device == "old-uid"
         mock_app._settings_panel.update_state.assert_called_once_with({
-            "audio_devices": [{"uid": "old-uid", "name": "Old Mic"}],
-            "audio_device": "old-uid",
+            "audio_devices": [],
+            "audio_device": None,
             "automatic_device_name": "MacBook Pro Microphone",
         })
         mock_save.assert_called_once()
-        mock_devices.assert_called_once()
         mock_auto_name.assert_called_once()
 
     @patch(
         "wenzi.controllers.settings_controller.automatic_input_device_name",
         return_value="MacBook Pro Microphone",
     )
-    @patch(
-        "wenzi.controllers.settings_controller.list_input_devices",
-        return_value=[],
-    )
     def test_refresh_reports_automatic_route(
-        self, mock_devices, mock_auto_name, ctrl, mock_app
+        self, mock_auto_name, ctrl, mock_app
     ):
         mock_app._config["audio"] = {"device": None}
 
@@ -390,7 +381,6 @@ class TestMicrophoneSelect:
             "audio_device": None,
             "automatic_device_name": "MacBook Pro Microphone",
         })
-        mock_devices.assert_called_once()
         mock_auto_name.assert_called_once()
 
 

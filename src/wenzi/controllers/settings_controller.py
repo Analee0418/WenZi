@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from wenzi.app import WenZiApp
 
 from wenzi import get_version, is_version_compatible
-from wenzi.audio.recorder import automatic_input_device_name, list_input_devices
+from wenzi.audio.recorder import automatic_input_device_name
 from wenzi.config import BUILTIN_REGISTRY_URL, is_keychain_enabled, save_config
 from wenzi.enhance.enhancer import MODE_OFF
 from wenzi.i18n import build_doc_url, t
@@ -806,9 +806,13 @@ class SettingsController:
         self._save_and_reload()
 
     def mic_select(self, uid: str) -> None:
-        """Handle microphone device selection from Settings panel."""
+        """Keep capture on the current macOS default input device."""
         app = self._app
-        device = uid if uid else None
+        if uid:
+            logger.info(
+                "Ignoring explicit microphone selection; using macOS default"
+            )
+        device = None
         audio_cfg = app._config.setdefault("audio", {})
         missing = object()
         previous_config_device = audio_cfg.get("device", missing)
@@ -920,11 +924,10 @@ class SettingsController:
                 )
 
     def _microphone_state(self) -> dict:
-        """Return microphone choices and the current system default input."""
-        audio_cfg = self._app._config.get("audio", {})
+        """Expose only the current macOS default input route."""
         return {
-            "audio_devices": list_input_devices(),
-            "audio_device": audio_cfg.get("device"),
+            "audio_devices": [],
+            "audio_device": None,
             "automatic_device_name": automatic_input_device_name(),
         }
 

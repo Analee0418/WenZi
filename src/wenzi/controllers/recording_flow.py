@@ -17,9 +17,11 @@ import enum
 import logging
 import threading
 import time
+from functools import partial
 from typing import TYPE_CHECKING
 
 from wenzi import async_loop
+from wenzi.audio.system_volume import SystemVolumeBusyError
 from wenzi.config import save_config
 from wenzi.controllers import fire_scripting_event
 from wenzi.input import type_text
@@ -70,6 +72,19 @@ class _RestartSession(Exception):
         self.key_name = key_name
 
 
+class _OutputRestoreOutcome(enum.Enum):
+    """Final ownership state for one duck token restore attempt."""
+
+    RESTORED = "restored"
+    DEFERRED = "deferred"
+    RETAINED = "retained"
+
+    @property
+    def releases_owner(self) -> bool:
+        """Whether the foreground session may forget the duck token."""
+        return self in (self.RESTORED, self.DEFERRED)
+
+
 # ---------------------------------------------------------------------------
 # RecordingFlow — the main coroutine-based recording controller
 # ---------------------------------------------------------------------------
@@ -79,6 +94,10 @@ class RecordingFlow:
 
     _OUTPUT_RESTORE_ATTEMPTS = 3
     _OUTPUT_RESTORE_RETRY_DELAY = 0.05
+    _OUTPUT_RESTORE_BACKGROUND_ATTEMPTS = 3
+    _OUTPUT_RESTORE_BACKGROUND_DELAY = 0.25
+    _OUTPUT_REFRESH_ATTEMPTS = 10
+    _OUTPUT_REFRESH_RETRY_DELAY = 0.02
 
     _DELAYED_START_SECS = 0.35
     # A press shorter than this is a tap (cancel/abort): the engine is
@@ -115,12 +134,15 @@ class RecordingFlow:
         # recorder stop + streaming cleanup run at most once.  Output restore
         # is a separate task so it can overlap streaming/batch transcription.
         self._audio_shutdown_task: asyncio.Task | None = None
-        self._output_restore_task: asyncio.Task | None = None
+        self._output_restore_task: asyncio.Future | None = None
+        self._output_restore_token: object | None = None
+        self._mic_stopped_event: threading.Event | None = None
         # In-flight recorder.start() executor future.  Non-None only
         # between launching the start and awaiting it; every path that
         # leaves that window must go through _settle_pending_start() —
         # a dropped future would leave the microphone open.
         self._pending_start: asyncio.Future | None = None
+        self._pending_start_tainted = False
 
     # ------------------------------------------------------------------
     # Public properties
@@ -274,6 +296,14 @@ class RecordingFlow:
             ),
         )
 
+        # Shutdown can begin while the executor is blocked in Accessibility.
+        # This press already owns the operation token, so the earlier claim
+        # guard cannot reject it.  Never let it create a late session that
+        # reopens the microphone or re-ducks output after exit restoration.
+        if getattr(app, "_shutdown_started", False):
+            logger.info("Recording press abandoned because shutdown started")
+            return False
+
         # Restore previous override before applying a new one
         self._restore_mode()
 
@@ -314,14 +344,19 @@ class RecordingFlow:
         # Fresh session → fresh single-flight shutdown slot
         self._audio_shutdown_task = None
         self._output_restore_task = None
+        self._output_restore_token = None
+        self._mic_stopped_event = None
 
         try:
             self._fire_scripting_event("recording_start")
 
             # ① Play start sound + show indicator
             AppHelper.callAfter(app._set_status, "statusbar.status.recording")
-            AppHelper.callAfter(app._sound_manager.play, "start")
-            if app._sound_manager.enabled:
+            play_start_sound = app._sound_manager.should_play_start(
+                app._recorder.device
+            )
+            if play_start_sound:
+                AppHelper.callAfter(app._sound_manager.play, "start")
                 AppHelper.callAfter(app._usage_stats.record_sound_feedback)
 
             initial_dev = (
@@ -361,7 +396,7 @@ class RecordingFlow:
                     Action.RESTART, Action.PREVIEW_HISTORY,
                     timeout=self._TAP_GRACE_SECS,
                 )
-                if action is None:
+                if action is None and play_start_sound:
                     duck_enabled = bool(
                         app._config.get("audio", {}).get(
                             "duck_system_audio", False
@@ -377,7 +412,10 @@ class RecordingFlow:
                             Action.PREVIEW_HISTORY,
                         )
                     if action is None:
-                        self._launch_recorder_start(armed=False)
+                        self._launch_recorder_start(
+                            armed=False,
+                            duck_token=duck_token,
+                        )
                         action = await self._wait_action(
                             Action.RELEASE, Action.CANCEL,
                             Action.RESTART, Action.PREVIEW_HISTORY,
@@ -390,15 +428,22 @@ class RecordingFlow:
                         # The orb must vanish at the release, not after
                         # the in-flight start has been settled below.
                         AppHelper.callAfter(app._recording_indicator.hide)
+                        outcome = None
                         if self._pending_start is None:
                             if action != Action.RESTART:
-                                await self._restore_output_duck(duck_token)
+                                outcome = await self._restore_output_duck(
+                                    duck_token
+                                )
                         else:
-                            await self._settle_pending_start(
+                            outcome = await self._settle_pending_start(
                                 duck_token,
                                 restore_output=action != Action.RESTART,
                             )
-                        if action != Action.RESTART:
+                        if (
+                            action != Action.RESTART
+                            and outcome is not None
+                            and outcome.releases_owner
+                        ):
                             duck_token = None
                 if action in (Action.CANCEL, Action.RELEASE):
                     AppHelper.callAfter(self._reset_to_idle)
@@ -437,7 +482,10 @@ class RecordingFlow:
                         return
                     if action == Action.RESTART:
                         raise _RestartSession(key_name)
-                start_future = self._launch_recorder_start(armed=True)
+                start_future = self._launch_recorder_start(
+                    armed=True,
+                    duck_token=duck_token,
+                )
             try:
                 dev_name = await asyncio.wait_for(
                     asyncio.shield(start_future),
@@ -449,21 +497,25 @@ class RecordingFlow:
                     "aborting session",
                     self._START_TIMEOUT,
                 )
-                # Clear before tainting: the taint path owns the teardown
-                # of the abandoned start, settling it again is pointless.
-                self._pending_start = None
-                app._recorder.mark_tainted()
-                await self._restore_output_duck(duck_token)
-                duck_token = None
+                # Native AVFoundation startup cannot be cancelled. Hide the
+                # UI now, but retain both output ownership and the app-wide
+                # operation until the late start has torn its route down.
                 AppHelper.callAfter(self._reset_to_idle)
+                outcome = await self._settle_pending_start(
+                    duck_token,
+                    start_timed_out=True,
+                )
+                if outcome is not None and outcome.releases_owner:
+                    duck_token = None
                 return
             except Exception:
                 # e.g. a concurrent start() in flight, or engine creation
                 # blowing up before the recorder could handle it.
                 logger.exception("Recorder.start() failed, aborting session")
                 self._pending_start = None
-                await self._restore_output_duck(duck_token)
-                duck_token = None
+                outcome = await self._restore_output_duck(duck_token)
+                if outcome is not None and outcome.releases_owner:
+                    duck_token = None
                 AppHelper.callAfter(self._reset_to_idle)
                 return
             self._pending_start = None
@@ -476,11 +528,30 @@ class RecordingFlow:
 
                 logger.error("Recorder did not start, aborting session")
                 alert(t("alert.recording.start_failed"), duration=3.0)
-                await self._restore_output_duck(duck_token)
-                duck_token = None
+                outcome = await self._restore_output_duck(duck_token)
+                if outcome is not None and outcome.releases_owner:
+                    duck_token = None
                 AppHelper.callAfter(self._reset_to_idle)
                 return
-            await self._refresh_output_duck(duck_token)
+            if not await self._refresh_output_duck(duck_token):
+                logger.error(
+                    "Recording cancelled because the updated output route "
+                    "could not be lowered"
+                )
+                await asyncio.shield(
+                    self._ensure_audio_shutdown(
+                        False,
+                        cancel=True,
+                        duck_token=duck_token,
+                    )
+                )
+                outcome = await asyncio.shield(
+                    self._settle_output_restore()
+                )
+                if outcome is not None and outcome.releases_owner:
+                    duck_token = None
+                AppHelper.callAfter(self._reset_to_idle)
+                return
             # Sound window over and start committed: audio may flow now.
             # A no-op when the session started armed (sound disabled).
             app._recorder.arm()
@@ -523,7 +594,6 @@ class RecordingFlow:
                         duck_token=duck_token,
                     )
                 )
-                duck_token = None
                 self._cancel_subtasks()
                 AppHelper.callAfter(self._reset_to_idle)
                 return
@@ -547,7 +617,6 @@ class RecordingFlow:
                         duck_token=duck_token,
                     )
                 )
-                duck_token = None
                 self._cancel_subtasks()
                 show_preview_history = True
                 AppHelper.callAfter(self._reset_to_idle)
@@ -570,7 +639,6 @@ class RecordingFlow:
                     duck_token=duck_token,
                 )
             )
-            duck_token = None
 
             # Record audio duration
             audio_duration = 0.0
@@ -658,8 +726,9 @@ class RecordingFlow:
                 restarted = True
             except Exception:
                 logger.exception("Failed to hand off restarted recording")
-                await self._restore_output_duck(duck_token)
-                duck_token = None
+                outcome = await self._restore_output_duck(duck_token)
+                if outcome is not None and outcome.releases_owner:
+                    duck_token = None
                 AppHelper.callAfter(self._reset_to_idle)
             return
         except asyncio.CancelledError:
@@ -682,17 +751,31 @@ class RecordingFlow:
             # session — EXCEPT on restart: queued actions (e.g. a RELEASE
             # right behind the RESTART) belong to the restarted session.
             if not restarted:
-                restore_scheduled = await asyncio.shield(
-                    self._settle_output_restore()
-                )
-                if not restore_scheduled:
-                    await asyncio.shield(
-                        self._restore_output_duck(duck_token)
+                restore_outcome = await self._settle_output_restore()
+                if restore_outcome is None and duck_token is not None:
+                    restore_outcome = await self._restore_output_duck(
+                        duck_token
                     )
-                app._end_op(self._op_token)
-                self._op_token = None
+                output_owner_released = (
+                    restore_outcome.releases_owner
+                    if restore_outcome is not None
+                    else duck_token is None
+                )
+                if output_owner_released:
+                    duck_token = None
+                    app._end_op(self._op_token)
+                    self._op_token = None
+                else:
+                    # The live ducker token is the only trustworthy copy of
+                    # the original volume. Keep the app-wide operation owner
+                    # claimed rather than allowing another recording to race
+                    # an unresolved CoreAudio restore.
+                    logger.error(
+                        "System output remains owned after restore failure; "
+                        "recording operation will stay claimed"
+                    )
                 self._drain_actions()
-                if show_preview_history:
+                if show_preview_history and output_owner_released:
                     AppHelper.callAfter(
                         app._preview_controller.on_show_last_preview
                     )
@@ -1452,51 +1535,195 @@ class RecordingFlow:
                 return await asyncio.shield(begin_future)
             except asyncio.CancelledError:
                 # Cancelling an asyncio waiter cannot stop its executor
-                # job. Settle it here so a token returned after cancellation
-                # is never lost with the system volume left lowered.
-                token = await asyncio.shield(begin_future)
+                # job. Repeated cancellation must also be absorbed until the
+                # token is known, otherwise a late token would be lost with
+                # the system volume left lowered.
+                token = None
+                try:
+                    token = await self._await_executor_future(begin_future)
+                except asyncio.CancelledError:
+                    # The private executor Future should not be cancelled,
+                    # but it still represents no token if loop shutdown does
+                    # so. Preserve the original caller cancellation.
+                    pass
+                except Exception:
+                    logger.exception(
+                        "System output lowering failed after cancellation"
+                    )
                 if token is not None:
                     try:
-                        await asyncio.shield(
-                            self._loop.run_in_executor(
-                                None,
-                                lambda: self._end_output_duck_sync(token),
-                            )
-                        )
+                        # This publishes the single-flight restore before its
+                        # first suspension and absorbs later cancellations.
+                        await self._restore_output_duck(token)
                     except Exception:
                         logger.exception(
                             "Failed to restore output after cancelled start"
                         )
                 raise
+        except SystemVolumeBusyError:
+            # Starting the microphone while an older restore still owns
+            # CoreAudio would recreate the exact loud-pulse race ducking is
+            # meant to prevent. Abort this press before recorder.start().
+            logger.warning(
+                "Recording cancelled because system audio recovery is busy"
+            )
+            raise
         except Exception:
             # Recording remains usable when an output device exposes no
             # writable volume control or CoreAudio rejects the request.
             logger.exception("Failed to lower system output volume")
             return None
 
-    async def _refresh_output_duck(self, duck_token: object | None) -> None:
+    @staticmethod
+    async def _await_executor_future(fut: asyncio.Future):
+        """Return an executor result without orphaning it on repeated cancel."""
+        while not fut.done():
+            try:
+                await asyncio.shield(fut)
+            except asyncio.CancelledError:
+                continue
+        return fut.result()
+
+    def _refresh_output_duck_sync(self, duck_token: object) -> bool:
+        """Confirm one known CoreAudio route boundary with bounded retries."""
+
+        for attempt in range(self._OUTPUT_REFRESH_ATTEMPTS):
+            try:
+                if (
+                    self._app._system_output_ducker.refresh(duck_token)
+                    is not False
+                ):
+                    return True
+            except Exception:
+                logger.exception("Failed to lower the updated output route")
+            if attempt + 1 < self._OUTPUT_REFRESH_ATTEMPTS:
+                time.sleep(self._OUTPUT_REFRESH_RETRY_DELAY)
+        return False
+
+    async def _refresh_output_duck(self, duck_token: object | None) -> bool:
         """Apply the same cap if microphone startup changed the output route."""
         if duck_token is None:
-            return
-        try:
-            await self._loop.run_in_executor(
-                None,
-                lambda: self._app._system_output_ducker.refresh(duck_token),
-            )
-        except Exception:
-            logger.exception("Failed to lower the updated output route")
+            return True
+        return await self._loop.run_in_executor(
+            None,
+            lambda: self._refresh_output_duck_sync(duck_token),
+        )
 
-    async def _restore_output_duck(self, duck_token: object | None) -> None:
-        """Best-effort, idempotent playback-volume restore."""
+    def _ensure_output_restore(
+        self,
+        duck_token: object | None,
+        *,
+        mic_stopped: threading.Event | None = None,
+    ) -> asyncio.Future | None:
+        """Return this session's one restore task for *duck_token*.
+
+        The task, once published, is the sole caller of ``end()`` for this
+        session. Every direct, cancellation, and audio-shutdown path reuses it,
+        so cancelling an asyncio waiter cannot start a stale second restore.
+        """
         if duck_token is None:
-            return
+            return None
+        task = self._output_restore_task
+        if task is not None:
+            if duck_token is not self._output_restore_token:
+                raise RuntimeError(
+                    "Recording session tried to restore two duck tokens"
+                )
+            return task
+
+        self._output_restore_token = duck_token
         try:
-            await self._loop.run_in_executor(
-                None,
-                lambda: self._end_output_duck_sync(duck_token),
+            task = self._loop.create_task(
+                self._run_output_restore(
+                    duck_token,
+                    mic_stopped=mic_stopped,
+                )
             )
         except Exception:
-            logger.exception("Failed to restore system output volume")
+            # Publish a terminal retained result so the session finalizer sees
+            # that this token still owns output, instead of scheduling a stale
+            # second attempt or releasing the app operation slot.
+            task = self._loop.create_future()
+            task.set_result(_OutputRestoreOutcome.RETAINED)
+            self._output_restore_task = task
+            raise
+        self._output_restore_task = task
+        return task
+
+    async def _run_output_restore(
+        self,
+        duck_token: object,
+        *,
+        mic_stopped: threading.Event | None,
+    ) -> _OutputRestoreOutcome:
+        """Run bounded retained-token recovery without blocking the loop."""
+        total_attempts = self._OUTPUT_RESTORE_BACKGROUND_ATTEMPTS + 1
+        for attempt in range(total_attempts):
+            if attempt == 0 and mic_stopped is not None:
+                restore = partial(
+                    self._restore_output_after_mic_stop_sync,
+                    mic_stopped,
+                    duck_token,
+                )
+            else:
+                restore = partial(self._end_output_duck_sync, duck_token)
+
+            restore_future = asyncio.ensure_future(
+                self._loop.run_in_executor(None, restore)
+            )
+            try:
+                outcome = await asyncio.shield(restore_future)
+            except asyncio.CancelledError:
+                # Cancelling an asyncio task cannot stop the CoreAudio call.
+                # Settle that one native owner before allowing cancellation to
+                # finish; no successor attempt is started afterward.
+                await asyncio.shield(restore_future)
+                raise
+            if outcome.releases_owner:
+                return outcome
+            if attempt + 1 == total_attempts:
+                return outcome
+
+            delay = self._OUTPUT_RESTORE_BACKGROUND_DELAY * (2 ** attempt)
+            logger.warning(
+                "System output restore still owns its token; "
+                "retrying in %.2fs (%d/%d)",
+                delay,
+                attempt + 1,
+                self._OUTPUT_RESTORE_BACKGROUND_ATTEMPTS,
+            )
+            await asyncio.sleep(delay)
+
+        raise AssertionError("unreachable output restore state")
+
+    async def _restore_output_duck(
+        self,
+        duck_token: object | None,
+    ) -> _OutputRestoreOutcome | None:
+        """Settle the session's shielded, single-flight output restore."""
+        if duck_token is None:
+            return None
+        try:
+            task = self._ensure_output_restore(duck_token)
+        except Exception:
+            logger.exception("Failed to schedule system output restoration")
+            return _OutputRestoreOutcome.RETAINED
+        assert task is not None
+        return await self._await_output_restore_task(task)
+
+    @staticmethod
+    async def _await_output_restore_task(
+        task: asyncio.Future,
+    ) -> _OutputRestoreOutcome:
+        """Settle the bounded restore task despite waiter cancellation."""
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # The caller's cancellation must not cancel or orphan the one
+                # task that owns the original system volume snapshot.
+                continue
+        return task.result()
 
     def _ensure_audio_shutdown(
         self,
@@ -1519,6 +1746,7 @@ class RecordingFlow:
         """
         if self._audio_shutdown_task is None:
             mic_stopped = threading.Event()
+            self._mic_stopped_event = mic_stopped
             self._audio_shutdown_task = asyncio.ensure_future(
                 self._loop.run_in_executor(
                     None,
@@ -1529,16 +1757,14 @@ class RecordingFlow:
                     ),
                 )
             )
-            if restore_output and duck_token is not None:
-                self._output_restore_task = asyncio.ensure_future(
-                    self._loop.run_in_executor(
-                        None,
-                        lambda: self._restore_output_after_mic_stop_sync(
-                            mic_stopped,
-                            duck_token,
-                        ),
-                    )
-                )
+        if restore_output and duck_token is not None:
+            mic_stopped = self._mic_stopped_event
+            if mic_stopped is None:
+                raise RuntimeError("Audio shutdown has no mic-stop barrier")
+            self._ensure_output_restore(
+                duck_token,
+                mic_stopped=mic_stopped,
+            )
         return self._audio_shutdown_task
 
     def _audio_shutdown_sync(
@@ -1578,45 +1804,60 @@ class RecordingFlow:
         self,
         mic_stopped: threading.Event,
         duck_token: object,
-    ) -> bool:
+    ) -> _OutputRestoreOutcome:
         """Restore output once recorder.stop() has crossed its finalizer."""
         mic_stopped.wait()
         return self._end_output_duck_sync(duck_token)
 
-    def _end_output_duck_sync(self, duck_token: object) -> bool:
-        """Best-effort restore that honors an explicit failure result."""
+    def _end_output_duck_sync(
+        self,
+        duck_token: object,
+    ) -> _OutputRestoreOutcome:
+        """Restore or durably transfer one token; never imply false success."""
+        exhausted_false = False
         for attempt in range(1, self._OUTPUT_RESTORE_ATTEMPTS + 1):
             try:
                 result = self._app._system_output_ducker.end(duck_token)
             except Exception:
                 logger.exception("Failed to restore system output volume")
-                return False
+                break
             if result is not False:
-                return True
+                return _OutputRestoreOutcome.RESTORED
+            exhausted_false = attempt == self._OUTPUT_RESTORE_ATTEMPTS
             if attempt < self._OUTPUT_RESTORE_ATTEMPTS:
                 time.sleep(self._OUTPUT_RESTORE_RETRY_DELAY)
 
-        logger.error(
-            "System output volume restore returned False after %d attempts",
-            self._OUTPUT_RESTORE_ATTEMPTS,
-        )
-        return False
+        if exhausted_false:
+            logger.error(
+                "System output volume restore returned False after %d attempts",
+                self._OUTPUT_RESTORE_ATTEMPTS,
+            )
+        try:
+            if self._app._system_output_ducker.defer_failed_restore(
+                duck_token
+            ):
+                logger.warning(
+                    "System output restore handed to background recovery"
+                )
+                return _OutputRestoreOutcome.DEFERRED
+        except Exception:
+            logger.exception(
+                "Failed to defer exhausted system output restoration"
+            )
+        return _OutputRestoreOutcome.RETAINED
 
-    async def _settle_output_restore(self) -> bool:
-        """Wait for this session's restore task without cancelling it.
-
-        Returns whether audio shutdown transferred ownership of the duck
-        token to a restore task.  A false result tells the session finalizer
-        to use the direct best-effort fallback instead.
-        """
+    async def _settle_output_restore(
+        self,
+    ) -> _OutputRestoreOutcome | None:
+        """Return the sole restore task's final token disposition, if any."""
         task = self._output_restore_task
         if task is None:
-            return False
+            return None
         try:
-            await asyncio.shield(task)
+            return await self._await_output_restore_task(task)
         except Exception:
             logger.exception("System output restore task failed")
-        return True
+            return _OutputRestoreOutcome.RETAINED
 
     def _finalize_streaming_sync(self, cancel: bool) -> str | None:
         """Stop or cancel streaming, with mutual fallback.
@@ -1646,14 +1887,27 @@ class RecordingFlow:
                 raise primary_exc
             return None
 
-    def _launch_recorder_start(self, *, armed: bool) -> asyncio.Future:
+    def _launch_recorder_start(
+        self,
+        *,
+        armed: bool,
+        duck_token: object | None = None,
+    ) -> asyncio.Future:
         """Launch recorder.start() on the executor and track the future."""
         app = self._app
+
+        def _start():
+            kwargs = {"armed": armed}
+            if duck_token is not None:
+                kwargs["on_route_recovered"] = (
+                    lambda: self._refresh_output_duck_sync(duck_token)
+                )
+            return app._recorder.start(**kwargs)
+
         self._pending_start = asyncio.ensure_future(
-            self._loop.run_in_executor(
-                None, lambda: app._recorder.start(armed=armed)
-            )
+            self._loop.run_in_executor(None, _start)
         )
+        self._pending_start_tainted = False
         return self._pending_start
 
     async def _settle_pending_start(
@@ -1661,7 +1915,8 @@ class RecordingFlow:
         duck_token: object | None = None,
         *,
         restore_output: bool = True,
-    ) -> None:
+        start_timed_out: bool = False,
+    ) -> _OutputRestoreOutcome | None:
         """Await an in-flight recorder.start() and close the mic it opened.
 
         Cancelling the future cannot stop the executor thread, so the
@@ -1670,24 +1925,46 @@ class RecordingFlow:
         mechanism the start-timeout path uses.  No-op when no start is
         pending.
         """
-        fut, self._pending_start = self._pending_start, None
+        fut = self._pending_start
         if fut is None:
-            return
-        try:
-            await asyncio.wait_for(
-                asyncio.shield(fut), timeout=self._START_TIMEOUT
-            )
-        except TimeoutError:
-            self._app._recorder.mark_tainted()
-            if restore_output:
-                await self._restore_output_duck(duck_token)
-            return
-        except Exception:
-            # start() raised before touching the hardware (e.g. a
-            # concurrent start in flight); nothing to close.
-            if restore_output:
-                await self._restore_output_duck(duck_token)
-            return
+            return None
+        timed_out = start_timed_out or self._pending_start_tainted
+        if not timed_out:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(fut), timeout=self._START_TIMEOUT
+                )
+            except TimeoutError:
+                timed_out = True
+            except asyncio.CancelledError:
+                # Once cancellation reaches a native start, correctness owns
+                # the waiter: taint and settle it instead of letting another
+                # cancel escape into output restoration.
+                timed_out = True
+            except Exception:
+                # start() raised before touching the hardware (e.g. a
+                # concurrent start in flight); nothing remains to close.
+                self._pending_start = None
+                self._pending_start_tainted = False
+                if restore_output:
+                    return await self._restore_output_duck(duck_token)
+                return None
+        if timed_out:
+            if not self._pending_start_tainted:
+                self._pending_start_tainted = True
+                self._app._recorder.mark_tainted(stop_async=False)
+            # Keep the Future published while waiting. If this coroutine is
+            # cancelled again, the barrier absorbs it until the unkillable
+            # native start has returned and torn down its route.
+            try:
+                await self._await_pending_start_future(fut)
+            except Exception:
+                logger.debug(
+                    "Tainted recorder start finished with an error",
+                    exc_info=True,
+                )
+        self._pending_start = None
+        self._pending_start_tainted = False
         if self._app._recorder.is_recording:
             # streaming=False is accurate here: streaming only attaches
             # after arm(), which never ran for a pending start.
@@ -1699,8 +1976,21 @@ class RecordingFlow:
                     restore_output=restore_output,
                 )
             )
+            if restore_output:
+                return await self._settle_output_restore()
         elif restore_output:
-            await self._restore_output_duck(duck_token)
+            return await self._restore_output_duck(duck_token)
+        return None
+
+    @staticmethod
+    async def _await_pending_start_future(fut: asyncio.Future) -> None:
+        """Settle one native start Future despite repeated waiter cancels."""
+        while not fut.done():
+            try:
+                await asyncio.shield(fut)
+            except asyncio.CancelledError:
+                continue
+        fut.result()
 
     async def _cleanup_session_audio(
         self, streaming: bool, duck_token: object | None = None,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import logging
 import logging.handlers
@@ -73,6 +74,16 @@ from .usage_stats import UsageStats
 logger = logging.getLogger(__name__)
 
 _build_type_cache: str | None = None
+
+
+def _migrate_input_device_to_automatic(config: dict[str, Any]) -> bool:
+    """Drop legacy per-device input selection in favor of macOS default."""
+
+    audio = config.get("audio")
+    if not isinstance(audio, dict) or audio.get("device") is None:
+        return False
+    audio["device"] = None
+    return True
 
 
 def get_build_type() -> str:
@@ -198,13 +209,28 @@ class WenZiApp(StatusBarApp):
         self._config, config_error = load_config(self._config_path)
         self._config_error = config_error
         self._config_degraded = config_error is not None
+        input_device_migrated = _migrate_input_device_to_automatic(
+            self._config
+        )
         if self._config_degraded:
             set_config_readonly(True)
+        elif input_device_migrated:
+            try:
+                save_config(self._config, self._config_path)
+            except Exception:
+                # Runtime capture still follows the system default. Keep
+                # startup available and retry migration on the next launch.
+                logger.warning(
+                    "Failed to persist automatic input-device migration",
+                    exc_info=True,
+                )
 
         init_i18n(locale=self._config.get("language"))
 
         super().__init__(t("app.name"), icon=None, title=t("statusbar.status.ready"))
         self._current_status = "statusbar.status.ready"
+        self._shutdown_started = False
+        self._shutdown_lock = threading.Lock()
 
         # Seed the SF Symbol icon so the first render shows an icon, not text
         nsimage = self._sf_symbol_image("mic.fill", t("app.name"))
@@ -299,6 +325,10 @@ class WenZiApp(StatusBarApp):
             enabled=fb_cfg.get("sound_enabled", True),
             volume=fb_cfg.get("sound_volume", 0.1),
             config_dir=self._config_dir,
+            input_route_provider=self._recorder.preflight_input_route,
+            input_route_chime_notifier=(
+                self._recorder.mark_preflight_chime_allowed
+            ),
         )
         self._recording_indicator = RecordingIndicatorPanel()
         self._recording_indicator.enabled = fb_cfg.get("visual_indicator", True)
@@ -615,6 +645,8 @@ class WenZiApp(StatusBarApp):
         Returns an opaque release token, or None when another operation
         is in progress.  Pair every successful call with _end_op(token).
         """
+        if getattr(self, "_shutdown_started", False):
+            return None
         return self._op_guard.try_begin(name)
 
     def _end_op(self, token: object | None) -> None:
@@ -1105,8 +1137,8 @@ class WenZiApp(StatusBarApp):
     def _on_restart(self, _) -> None:
         from wenzi.statusbar import restart_application
 
-        self._restore_system_output_on_exit()
-        restart_application()
+        if self._shutdown_runtime():
+            restart_application()
 
     # ── Settings panel ────────────────────────────────────────────────
 
@@ -1184,17 +1216,189 @@ class WenZiApp(StatusBarApp):
         self._screenshot_annotation = None
 
     def _on_quit_click(self, _) -> None:
+        if not self._shutdown_runtime():
+            return
+        quit_application()
+
+    def _claim_shutdown(self) -> bool:
+        """Claim the one process-shutdown sequence without blocking re-entry."""
+        lock = getattr(self, "_shutdown_lock", None)
+        if lock is None:
+            lock = self._shutdown_lock = threading.Lock()
+        if not lock.acquire(blocking=False):
+            return False
+        try:
+            if getattr(self, "_shutdown_started", False):
+                return False
+            self._shutdown_started = True
+            return True
+        finally:
+            lock.release()
+
+    def _stop_hotkey_sources_on_exit(self) -> None:
+        """Block every input source before cancelling the active recording."""
+        listener = getattr(self, "_hotkey_listener", None)
+        if listener is not None:
+            try:
+                listener.stop()
+            except Exception:
+                logger.debug("Recording hotkey shutdown failed", exc_info=True)
+
+        app_tap = getattr(self, "_app_hotkey_tap", None)
+        if app_tap is not None:
+            try:
+                app_tap.stop()
+            except Exception:
+                logger.debug("App hotkey shutdown failed", exc_info=True)
+
+        script_engine = getattr(self, "_script_engine", None)
+        if script_engine is not None:
+            try:
+                script_engine.stop()
+            except Exception:
+                logger.debug("Script hotkey shutdown failed", exc_info=True)
+
+        try:
+            from wenzi.hotkey import shutdown_hotkey_executor
+            shutdown_hotkey_executor()
+        except Exception:
+            logger.debug("Hotkey executor shutdown failed", exc_info=True)
+
+    async def _cancel_recording_session_on_exit(self) -> None:
+        """Cancel the flow task and await its single-flight audio cleanup."""
+        controller = getattr(self, "_recording_controller", None)
+        if controller is None:
+            return
+
+        # A press may still be collecting input context when shutdown begins.
+        # Let it publish its session task, then cancel that task so its normal
+        # CancelledError path owns recorder/streaming teardown.
+        while controller._press_pending:
+            published_task = controller._current_task
+            if published_task is not None and not published_task.done():
+                break
+            await asyncio.sleep(0.01)
+
+        session_task = controller._current_task
+        if session_task is not None and not session_task.done():
+            session_task.cancel()
+            await asyncio.gather(session_task, return_exceptions=True)
+
+        # Cancellation may leave shielded single-flight jobs running after the
+        # session task exits.  Output restoration must not race either job.
+        for task_name in ("_audio_shutdown_task", "_output_restore_task"):
+            task = getattr(controller, task_name, None)
+            if task is not None and not task.done():
+                await asyncio.shield(task)
+
+        recorder = getattr(self, "_recorder", None)
+        if recorder is not None and recorder.is_recording:
+            await controller._loop.run_in_executor(None, recorder.stop)
+
+    def _stop_recording_on_exit(self, timeout: float = 7.0) -> None:
+        """Synchronously quiesce microphone and streaming audio before restore."""
+        controller = getattr(self, "_recording_controller", None)
+        recorder = getattr(self, "_recorder", None)
+        if controller is None:
+            if recorder is not None and recorder.is_recording:
+                try:
+                    recorder.stop()
+                except Exception:
+                    logger.debug("Orphaned recorder shutdown failed", exc_info=True)
+            return
+
+        shutdown_future = None
+        try:
+            controller.on_cancel_recording()
+        except Exception:
+            logger.warning(
+                "Failed to request recording cancellation during shutdown",
+                exc_info=True,
+            )
+        else:
+            shutdown_coro = self._cancel_recording_session_on_exit()
+            try:
+                shutdown_future = async_loop.submit(shutdown_coro)
+            except Exception:
+                shutdown_coro.close()
+                logger.warning(
+                    "Failed to submit recording shutdown; forcing recorder teardown",
+                    exc_info=True,
+                )
+
+        if shutdown_future is not None:
+            while True:
+                try:
+                    shutdown_future.result(timeout=timeout)
+                    return
+                except TimeoutError:
+                    if shutdown_future.done():
+                        logger.warning(
+                            "Recording shutdown task failed with a timeout",
+                            exc_info=True,
+                        )
+                        break
+                    current_task = controller._current_task
+                    pending_without_session = controller._press_pending and (
+                        current_task is None or current_task.done()
+                    )
+                    if pending_without_session:
+                        # The post-context shutdown fence guarantees that this
+                        # accepted press cannot create a session after restore.
+                        shutdown_future.cancel()
+                        logger.warning(
+                            "Abandoning blocked input-context capture during shutdown"
+                        )
+                        return
+                    # Once a session has touched audio, correctness wins over
+                    # a fast exit: keep waiting rather than restoring output
+                    # concurrently with native recorder teardown.
+                    logger.warning(
+                        "Still waiting for recording audio shutdown to finish"
+                    )
+                except Exception:
+                    logger.warning(
+                        "Recording shutdown failed; forcing recorder teardown",
+                        exc_info=True,
+                    )
+                    break
+
+        # A blocked native start cannot be cancelled by asyncio.  Tainting its
+        # generation makes a late completion tear itself down instead of
+        # reopening the microphone after output restoration.
+        if recorder is not None:
+            try:
+                recorder.mark_tainted()
+            except Exception:
+                logger.debug("Recorder taint failed during shutdown", exc_info=True)
+            try:
+                if recorder.is_recording:
+                    recorder.stop()
+            except Exception:
+                logger.debug("Forced recorder shutdown failed", exc_info=True)
+
+    def _shutdown_runtime(self) -> bool:
+        """Stop runtime services in the only order safe for audio restoration."""
+        if not self._claim_shutdown():
+            return False
+
+        self._stop_hotkey_sources_on_exit()
+        self._stop_recording_on_exit()
         self._restore_system_output_on_exit()
-        self._update_controller.stop()
-        if hasattr(self, "_script_engine") and self._script_engine:
-            self._script_engine.stop()
-        if self._hotkey_listener:
-            self._hotkey_listener.stop()
-        self._app_hotkey_tap.stop()
-        if self._settings_panel.is_visible:
-            self._settings_panel.close()
-        if self._vocab_controller is not None:
-            self._vocab_controller.close_panel()
+        try:
+            self._update_controller.stop()
+        except Exception:
+            logger.debug("Update controller shutdown failed", exc_info=True)
+        try:
+            if self._settings_panel.is_visible:
+                self._settings_panel.close()
+        except Exception:
+            logger.debug("Settings panel shutdown failed", exc_info=True)
+        try:
+            if self._vocab_controller is not None:
+                self._vocab_controller.close_panel()
+        except Exception:
+            logger.debug("Vocabulary panel shutdown failed", exc_info=True)
         # Close active UI panels and release resources
         try:
             self._recording_indicator.hide()
@@ -1249,12 +1453,6 @@ class WenZiApp(StatusBarApp):
             shutdown_vault()
         except Exception:
             logger.debug("Vault shutdown failed", exc_info=True)
-        # Shut down the hotkey dispatch executor
-        try:
-            from wenzi.hotkey import shutdown_hotkey_executor
-            shutdown_hotkey_executor()
-        except Exception:
-            logger.debug("Hotkey executor shutdown failed", exc_info=True)
         # Close AI provider clients and shut down the shared asyncio loop
         if self._enhancer:
             try:
@@ -1265,7 +1463,7 @@ class WenZiApp(StatusBarApp):
         from wenzi.statusbar import cleanup_callbacks
 
         cleanup_callbacks()
-        quit_application()
+        return True
 
     def _restore_system_output_on_exit(self) -> None:
         """Best-effort fallback for every process termination path."""
@@ -1276,7 +1474,22 @@ class WenZiApp(StatusBarApp):
             ducker.restore_all()
         except Exception:
             # Exit cleanup must never prevent the process from terminating.
-            logger.debug("System output volume restore failed", exc_info=True)
+            logger.debug("Active system output volume restore failed", exc_info=True)
+        try:
+            # restore_all() may hand a disconnected route to its deferred
+            # worker. Stop that daemon before process exit and synchronously
+            # release any mute still owned by the recovery journal.
+            ducker.recover_stale(start_deferred=False)
+        except Exception:
+            logger.debug("Deferred system output volume restore failed", exc_info=True)
+        finally:
+            try:
+                ducker.stop_background_workers()
+            except Exception:
+                logger.debug(
+                    "System output worker shutdown failed",
+                    exc_info=True,
+                )
 
     @staticmethod
     def _ensure_accessibility() -> bool:
@@ -1686,9 +1899,24 @@ def main() -> None:
     config_dir = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("WENZI_CONFIG_DIR")
     app = WenZiApp(config_dir=config_dir)  # None uses default dir
 
-    def _restore_and_quit(*_args) -> None:
-        app._restore_system_output_on_exit()
-        quit_application()
+    shutdown_requested = False
+
+    def _restore_and_quit(signum, _frame) -> None:
+        nonlocal shutdown_requested
+        if shutdown_requested:
+            # The first signal may be waiting for a native audio teardown that
+            # cannot be interrupted safely. A deliberate second signal is the
+            # escape hatch: restore the OS default and deliver it again.
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+            return
+        shutdown_requested = True
+        # Python signal handlers run on the main thread and may interrupt
+        # arbitrary cleanup code.  Queue the idempotent shutdown instead of
+        # blocking or acquiring lifecycle locks in the handler itself.
+        from PyObjCTools import AppHelper
+
+        AppHelper.callAfter(app._on_quit_click, None)
 
     signal.signal(signal.SIGINT, _restore_and_quit)
     signal.signal(signal.SIGTERM, _restore_and_quit)

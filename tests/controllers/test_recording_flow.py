@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import pytest
 
 import wenzi.async_loop as async_loop
+from wenzi.audio.system_volume import SystemVolumeBusyError
 from wenzi.controllers.recording_flow import Action, RecordingFlow
 
 _FILE = str(Path(__file__).resolve())
@@ -57,6 +58,7 @@ def mock_app(tmp_path):
     )
     app._config_degraded = False
     app._voice_input_available = True
+    app._shutdown_started = False
     app._config = {
         "audio": {
             "duck_system_audio": False,
@@ -68,6 +70,7 @@ def mock_app(tmp_path):
     app._config_path = str(tmp_path / "config.json")
     app._sound_manager = MagicMock()
     app._sound_manager.enabled = True
+    app._sound_manager.should_play_start.return_value = True
     app._recording_indicator = MagicMock()
     app._recording_indicator.enabled = True
     app._recording_indicator.show_device_name = False
@@ -76,6 +79,7 @@ def mock_app(tmp_path):
     app._recorder.is_recording = False
     app._recorder.current_level = 0.5
     app._recorder.last_device_name = "MacBook Pro Microphone"
+    app._recorder.device = None
 
     def _recorder_start(*args, **kwargs):
         # Mirror the real contract: a successful start() flips is_recording
@@ -367,6 +371,40 @@ class TestWarmupStart:
 
     @patch("wenzi.controllers.recording_flow.capture_input_context", return_value=None)
     @patch("PyObjCTools.AppHelper")
+    def test_bluetooth_skips_chime_and_starts_armed_after_tap_grace(
+        self, mock_ah, _mock_ic, flow, mock_app, monkeypatch
+    ):
+        mock_ah.callAfter = lambda fn, *a, **kw: fn(*a, **kw)
+        mock_app._sound_manager.enabled = True
+        mock_app._sound_manager.should_play_start.return_value = False
+        monkeypatch.setattr(RecordingFlow, "_TAP_GRACE_SECS", 0.02)
+        monkeypatch.setattr(RecordingFlow, "_DELAYED_START_SECS", 30.0)
+
+        async def _test():
+            started = asyncio.Event()
+            loop = asyncio.get_running_loop()
+
+            def _start(*a, **kw):
+                mock_app._recorder.is_recording = True
+                loop.call_soon_threadsafe(started.set)
+                return "AirPods Max"
+
+            mock_app._recorder.start.side_effect = _start
+            await flow._handle_press("fn")
+            # Bluetooth does not wait for the 30-second sound window.
+            await asyncio.wait_for(started.wait(), timeout=2.0)
+            flow._actions.put_nowait(Action.RELEASE)
+            await flow._current_task
+
+        run(_test())
+
+        mock_app._sound_manager.play.assert_not_called()
+        mock_app._usage_stats.record_sound_feedback.assert_not_called()
+        assert mock_app._recorder.start.call_args.kwargs == {"armed": True}
+        mock_app._recorder.arm.assert_called_once()
+
+    @patch("wenzi.controllers.recording_flow.capture_input_context", return_value=None)
+    @patch("PyObjCTools.AppHelper")
     def test_early_release_settles_inflight_start_and_stops_mic(
         self, mock_ah, _mock_ic, flow, mock_app, monkeypatch
     ):
@@ -432,12 +470,23 @@ class TestWarmupStart:
             await flow._handle_press("fn")
             await asyncio.wait_for(started.wait(), timeout=5.0)
             flow._actions.put_nowait(Action.CANCEL)
+            for _ in range(100):
+                if mock_app._recorder.mark_tainted.called:
+                    break
+                await asyncio.sleep(0.01)
+            assert mock_app._recorder.mark_tainted.called
+            assert flow.is_busy
+            hold.set()
             await flow._current_task
-            hold.set()  # let the executor thread finish
 
-        run(_test())
+        try:
+            run(_test())
+        finally:
+            hold.set()
 
-        mock_app._recorder.mark_tainted.assert_called_once()
+        mock_app._recorder.mark_tainted.assert_called_once_with(
+            stop_async=False
+        )
         mock_app._recorder.stop.assert_not_called()
         mock_app._recording_indicator.hide.assert_called()
         assert not flow.is_busy
@@ -562,6 +611,90 @@ class TestWarmupStart:
 
 
 class TestSystemAudioDucking:
+    def test_route_refresh_retries_until_updated_output_is_available(
+        self, flow, mock_app
+    ):
+        token = object()
+        mock_app._system_output_ducker.refresh.side_effect = [
+            False,
+            False,
+            True,
+        ]
+
+        with patch(
+            "wenzi.controllers.recording_flow.time.sleep"
+        ) as mock_sleep:
+            assert run(flow._refresh_output_duck(token)) is True
+
+        assert mock_app._system_output_ducker.refresh.call_args_list == [
+            call(token),
+            call(token),
+            call(token),
+        ]
+        assert mock_sleep.call_args_list == [
+            call(flow._OUTPUT_REFRESH_RETRY_DELAY),
+            call(flow._OUTPUT_REFRESH_RETRY_DELAY),
+        ]
+
+    def test_recorder_recovery_receives_same_route_refresh_token(
+        self, flow, mock_app
+    ):
+        token = object()
+        mock_app._system_output_ducker.refresh.return_value = True
+
+        async def _test():
+            return await flow._launch_recorder_start(
+                armed=True,
+                duck_token=token,
+            )
+
+        assert run(_test()) == "MacBook Pro Microphone"
+        callback = mock_app._recorder.start.call_args.kwargs[
+            "on_route_recovered"
+        ]
+
+        assert callback() is True
+        mock_app._system_output_ducker.refresh.assert_called_once_with(token)
+
+    @patch("wenzi.controllers.recording_flow.capture_input_context", return_value=None)
+    @patch("PyObjCTools.AppHelper")
+    def test_unconfirmed_updated_output_aborts_before_audio_gate_opens(
+        self, mock_ah, _mock_ic, flow, mock_app
+    ):
+        mock_ah.callAfter = lambda fn, *a, **kw: fn(*a, **kw)
+        mock_app._sound_manager.enabled = False
+        mock_app._config["audio"]["duck_system_audio"] = True
+        token = object()
+        mock_app._system_output_ducker.begin.return_value = token
+        mock_app._system_output_ducker.refresh.return_value = False
+        mock_app._system_output_ducker.end.return_value = True
+
+        async def _test():
+            await flow._handle_press("fn")
+            task = flow._current_task
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=1)
+                return True
+            except TimeoutError:
+                # Clean up the old behavior deterministically: implementations
+                # that continue recording after an unconfirmed refresh wait
+                # for RELEASE instead of hanging this regression test.
+                flow._actions.put_nowait(Action.RELEASE)
+                await asyncio.wait_for(task, timeout=2)
+                return False
+
+        with patch("wenzi.controllers.recording_flow.time.sleep"):
+            assert run(_test()) is True
+
+        assert mock_app._system_output_ducker.refresh.call_count == (
+            flow._OUTPUT_REFRESH_ATTEMPTS
+        )
+        mock_app._recorder.arm.assert_not_called()
+        mock_app._recorder.stop.assert_called_once()
+        mock_app._system_output_ducker.end.assert_called_once_with(token)
+        assert mock_app._recorder.is_recording is False
+        assert not flow.is_busy
+
     @patch("wenzi.controllers.recording_flow.capture_input_context", return_value=None)
     @patch("PyObjCTools.AppHelper")
     def test_release_during_duck_ramp_never_starts_microphone(
@@ -594,31 +727,350 @@ class TestSystemAudioDucking:
         mock_app._system_output_ducker.end.assert_called_once_with(token)
 
     def test_cancelled_duck_begin_settles_token_and_restores(
-        self, flow, mock_app
+        self, flow, mock_app, monkeypatch
     ):
         mock_app._config["audio"]["duck_system_audio"] = True
         token = object()
         entered = threading.Event()
         release_begin = threading.Event()
+        second_shield_entered = threading.Event()
+        restore_entered = threading.Event()
+        release_restore = threading.Event()
+        original_shield = asyncio.shield
+        shield_calls = 0
 
         def _begin(**_kwargs):
             entered.set()
             assert release_begin.wait(timeout=5)
             return token
 
+        def _restore(_token):
+            restore_entered.set()
+            assert release_restore.wait(timeout=5)
+            return True
+
+        def _tracking_shield(awaitable):
+            nonlocal shield_calls
+            shield_calls += 1
+            if shield_calls == 2:
+                second_shield_entered.set()
+            return original_shield(awaitable)
+
         mock_app._system_output_ducker.begin.side_effect = _begin
+        mock_app._system_output_ducker.end.side_effect = _restore
+        monkeypatch.setattr(asyncio, "shield", _tracking_shield)
 
         async def _test():
             task = asyncio.create_task(flow._begin_output_duck())
-            await asyncio.get_running_loop().run_in_executor(None, entered.wait)
-            task.cancel()
-            release_begin.set()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+            try:
+                await _wait_thread_event(entered)
+                task.cancel()
+                await _wait_thread_event(second_shield_entered)
+
+                # A second cancel used to escape and permanently lose the
+                # token returned later by the executor job.
+                task.cancel()
+                await asyncio.sleep(0.01)
+                assert not task.done()
+                mock_app._system_output_ducker.end.assert_not_called()
+
+                release_begin.set()
+                await _wait_thread_event(restore_entered)
+                assert flow._output_restore_task is not None
+                assert mock_app._system_output_ducker.end.call_count == 1
+
+                # Restoration itself is also cancellation-resistant.
+                task.cancel()
+                await asyncio.sleep(0.01)
+                assert not task.done()
+                release_restore.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            finally:
+                release_begin.set()
+                release_restore.set()
+                if not task.done():
+                    await asyncio.gather(task, return_exceptions=True)
 
         run(_test())
 
         mock_app._system_output_ducker.end.assert_called_once_with(token)
+
+    def test_cancelled_duck_begin_failure_preserves_cancellation(
+        self, flow, mock_app, monkeypatch
+    ):
+        mock_app._config["audio"]["duck_system_audio"] = True
+        entered = threading.Event()
+        release_begin = threading.Event()
+        second_shield_entered = threading.Event()
+        original_shield = asyncio.shield
+        shield_calls = 0
+
+        def _begin(**_kwargs):
+            entered.set()
+            assert release_begin.wait(timeout=5)
+            raise RuntimeError("injected begin failure")
+
+        def _tracking_shield(awaitable):
+            nonlocal shield_calls
+            shield_calls += 1
+            if shield_calls == 2:
+                second_shield_entered.set()
+            return original_shield(awaitable)
+
+        mock_app._system_output_ducker.begin.side_effect = _begin
+        monkeypatch.setattr(asyncio, "shield", _tracking_shield)
+
+        async def _test():
+            task = asyncio.create_task(flow._begin_output_duck())
+            try:
+                await _wait_thread_event(entered)
+                task.cancel()
+                await _wait_thread_event(second_shield_entered)
+                release_begin.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            finally:
+                release_begin.set()
+                if not task.done():
+                    await asyncio.gather(task, return_exceptions=True)
+
+        run(_test())
+
+        mock_app._system_output_ducker.end.assert_not_called()
+
+    @patch("wenzi.controllers.recording_flow.capture_input_context", return_value=None)
+    @patch("PyObjCTools.AppHelper")
+    def test_quick_release_restore_stays_single_flight_when_waiter_cancelled(
+        self, mock_ah, _mock_ic, flow, mock_app
+    ):
+        mock_ah.callAfter = lambda fn, *a, **kw: fn(*a, **kw)
+        mock_app._sound_manager.enabled = False
+        mock_app._config["audio"]["duck_system_audio"] = True
+        token = object()
+        begin_entered = threading.Event()
+        allow_begin = threading.Event()
+        restore_entered = threading.Event()
+        allow_restore = threading.Event()
+
+        def _begin(**_kwargs):
+            begin_entered.set()
+            assert allow_begin.wait(timeout=5)
+            return token
+
+        def _restore(_token):
+            restore_entered.set()
+            assert allow_restore.wait(timeout=5)
+            return True
+
+        mock_app._system_output_ducker.begin.side_effect = _begin
+        mock_app._system_output_ducker.end.side_effect = _restore
+
+        async def _test():
+            try:
+                await flow._handle_press("fn")
+                await _wait_thread_event(begin_entered)
+                flow._actions.put_nowait(Action.RELEASE)
+                allow_begin.set()
+                await _wait_thread_event(restore_entered)
+
+                task = flow._current_task
+                task.cancel()
+                await asyncio.sleep(0.02)
+                assert not task.done()
+                assert mock_app._system_output_ducker.end.call_count == 1
+                mock_app._end_op.assert_not_called()
+            finally:
+                allow_begin.set()
+                allow_restore.set()
+                task = flow._current_task
+                if task is not None:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=5)
+
+        run(_test())
+
+        mock_app._recorder.start.assert_not_called()
+        mock_app._system_output_ducker.end.assert_called_once_with(token)
+        mock_app._end_op.assert_called_once()
+        assert not mock_app._busy
+
+    def test_pending_start_timeout_retains_duck_until_future_settles(
+        self, flow, mock_app, monkeypatch
+    ):
+        token = object()
+        monkeypatch.setattr(flow, "_START_TIMEOUT", 0.01)
+        mock_app._system_output_ducker.end.return_value = True
+
+        async def _test():
+            pending = asyncio.get_running_loop().create_future()
+            flow._pending_start = pending
+            settle = asyncio.create_task(
+                flow._settle_pending_start(token)
+            )
+            for _ in range(100):
+                if mock_app._recorder.mark_tainted.called:
+                    break
+                await asyncio.sleep(0.005)
+            assert mock_app._recorder.mark_tainted.called
+            mock_app._system_output_ducker.end.assert_not_called()
+
+            settle.cancel()
+            await asyncio.sleep(0.01)
+            settle.cancel()
+            await asyncio.sleep(0.01)
+            assert not settle.done()
+            assert not pending.cancelled()
+            assert flow._pending_start is pending
+            mock_app._system_output_ducker.end.assert_not_called()
+
+            pending.set_result(None)
+            outcome = await asyncio.wait_for(settle, timeout=2)
+            assert outcome.releases_owner
+            assert (await flow._settle_output_restore()) is outcome
+
+        run(_test())
+
+        mock_app._recorder.mark_tainted.assert_called_once_with(
+            stop_async=False
+        )
+        mock_app._system_output_ducker.end.assert_called_once_with(token)
+
+    def test_end_exception_is_durably_deferred_once(self, flow, mock_app):
+        token = object()
+        mock_app._system_output_ducker.end.side_effect = RuntimeError("HAL")
+        mock_app._system_output_ducker.defer_failed_restore.return_value = True
+
+        outcome = run(flow._restore_output_duck(token))
+        settled = run(flow._settle_output_restore())
+
+        assert outcome.value == "deferred"
+        assert settled is outcome
+        mock_app._system_output_ducker.end.assert_called_once_with(token)
+        mock_app._system_output_ducker.defer_failed_restore.assert_called_once_with(
+            token
+        )
+
+    @patch("wenzi.controllers.recording_flow.capture_input_context", return_value=None)
+    @patch("PyObjCTools.AppHelper")
+    def test_transient_defer_failure_recovers_before_op_release(
+        self, mock_ah, _mock_ic, flow, mock_app, monkeypatch
+    ):
+        mock_ah.callAfter = lambda fn, *a, **kw: fn(*a, **kw)
+        mock_app._sound_manager.enabled = False
+        mock_app._config["audio"]["duck_system_audio"] = True
+        token = object()
+        mock_app._system_output_ducker.begin.return_value = token
+        monkeypatch.setattr(flow, "_OUTPUT_RESTORE_BACKGROUND_DELAY", 0.0)
+        monkeypatch.setattr(flow, "_OUTPUT_RESTORE_RETRY_DELAY", 0.0)
+        second_cycle_entered = threading.Event()
+        allow_second_cycle = threading.Event()
+        end_calls = 0
+        defer_calls = 0
+
+        def _end(_token):
+            nonlocal end_calls
+            end_calls += 1
+            if end_calls == 4:
+                second_cycle_entered.set()
+                assert allow_second_cycle.wait(timeout=5)
+            return False
+
+        def _defer(_token):
+            nonlocal defer_calls
+            defer_calls += 1
+            return defer_calls == 2
+
+        mock_app._system_output_ducker.end.side_effect = _end
+        mock_app._system_output_ducker.defer_failed_restore.side_effect = _defer
+
+        async def _test():
+            try:
+                await flow._handle_press("fn")
+                while not mock_app._recorder.is_recording:
+                    await asyncio.sleep(0.005)
+                flow._actions.put_nowait(Action.RELEASE)
+                await _wait_thread_event(second_cycle_entered)
+
+                mock_app._end_op.assert_not_called()
+                assert mock_app._busy
+                assert not flow._current_task.done()
+            finally:
+                allow_second_cycle.set()
+                task = flow._current_task
+                if task is not None:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=5)
+
+        run(_test())
+
+        assert mock_app._system_output_ducker.end.call_count == 6
+        assert mock_app._system_output_ducker.defer_failed_restore.call_count == 2
+        mock_app._end_op.assert_called_once()
+        assert not mock_app._busy
+
+    @patch("wenzi.controllers.recording_flow.capture_input_context", return_value=None)
+    @patch("PyObjCTools.AppHelper")
+    def test_exhausted_defer_failure_keeps_owner_without_stale_end(
+        self, mock_ah, _mock_ic, flow, mock_app, monkeypatch
+    ):
+        mock_ah.callAfter = lambda fn, *a, **kw: fn(*a, **kw)
+        mock_app._sound_manager.enabled = False
+        mock_app._config["audio"]["duck_system_audio"] = True
+        token = object()
+        mock_app._system_output_ducker.begin.return_value = token
+        mock_app._system_output_ducker.end.return_value = False
+        mock_app._system_output_ducker.defer_failed_restore.return_value = False
+        monkeypatch.setattr(flow, "_OUTPUT_RESTORE_BACKGROUND_ATTEMPTS", 1)
+        monkeypatch.setattr(flow, "_OUTPUT_RESTORE_BACKGROUND_DELAY", 0.0)
+        monkeypatch.setattr(flow, "_OUTPUT_RESTORE_RETRY_DELAY", 0.0)
+
+        async def _test():
+            await flow._handle_press("fn")
+            while not mock_app._recorder.is_recording:
+                await asyncio.sleep(0.005)
+            flow._actions.put_nowait(Action.RELEASE)
+            await asyncio.wait_for(flow._current_task, timeout=5)
+
+        run(_test())
+
+        assert mock_app._system_output_ducker.end.call_count == 6
+        assert mock_app._system_output_ducker.defer_failed_restore.call_count == 2
+        mock_app._end_op.assert_not_called()
+        assert mock_app._busy
+        assert flow._op_token is not None
+
+        outcome = run(flow._settle_output_restore())
+        assert outcome.value == "retained"
+        assert mock_app._system_output_ducker.end.call_count == 6
+        assert mock_app._system_output_ducker.defer_failed_restore.call_count == 2
+
+    @patch(
+        "wenzi.controllers.recording_flow.capture_input_context",
+        return_value=None,
+    )
+    @patch("PyObjCTools.AppHelper")
+    def test_busy_volume_recovery_aborts_before_microphone_start(
+        self,
+        mock_ah,
+        _mock_ic,
+        flow,
+        mock_app,
+    ):
+        mock_ah.callAfter = lambda fn, *a, **kw: fn(*a, **kw)
+        mock_app._sound_manager.enabled = False
+        mock_app._config["audio"]["duck_system_audio"] = True
+        mock_app._system_output_ducker.begin.side_effect = (
+            SystemVolumeBusyError("restore busy")
+        )
+
+        async def _test():
+            await flow._handle_press("fn")
+            await flow._current_task
+
+        run(_test())
+
+        mock_app._recorder.start.assert_not_called()
+        mock_app._system_output_ducker.end.assert_not_called()
+        assert not flow.is_busy
 
     def test_explicit_restore_failure_retries_are_bounded(
         self, flow, mock_app, caplog
@@ -645,6 +1097,9 @@ class TestSystemAudioDucking:
             ]
         )
         assert mock_sleep.call_count == 2
+        mock_app._system_output_ducker.defer_failed_restore.assert_called_once_with(
+            token
+        )
         assert "restore returned False after 3 attempts" in caplog.text
 
     @patch("wenzi.controllers.recording_flow.capture_input_context", return_value=None)
@@ -1097,6 +1552,54 @@ class TestPressContextCapture:
         assert call_order == ["frontmost", "context"]
         assert flow._target_app is target_app
 
+    def test_shutdown_during_context_capture_never_starts_late_session(
+        self, flow, mock_app
+    ):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def _blocked_capture(_level):
+            entered.set()
+            assert release.wait(timeout=2.0)
+            return None
+
+        flow._recording_session = AsyncMock()
+        with (
+            patch(
+                "wenzi.controllers.recording_flow.capture_input_context",
+                side_effect=_blocked_capture,
+            ),
+            patch(
+                "wenzi.controllers.recording_flow.get_frontmost_app",
+                return_value=None,
+            ),
+        ):
+            async def _install_stale_done_task():
+                task = asyncio.create_task(asyncio.sleep(0))
+                await task
+                flow._current_task = task
+
+            run(_install_stale_done_task())
+            assert flow._current_task.done()
+            flow.on_press("fn")
+            assert entered.wait(timeout=2.0)
+            mock_app._shutdown_started = True
+            release.set()
+
+            async def _wait_until_idle():
+                for _ in range(200):
+                    if not flow.is_busy:
+                        return
+                    await asyncio.sleep(0.01)
+                raise AssertionError("press did not leave the pending state")
+
+            run(_wait_until_idle())
+
+        flow._recording_session.assert_not_awaited()
+        mock_app._recorder.start.assert_not_called()
+        mock_app._system_output_ducker.begin.assert_not_called()
+        assert mock_app._busy is False
+
 
 class TestRecordAndRelease:
     @patch("wenzi.controllers.recording_flow.capture_input_context", return_value=None)
@@ -1535,30 +2038,69 @@ class TestStartTimeout:
     def test_start_timeout_resets_to_idle(
         self, mock_ah, _mock_ic, flow, mock_app, monkeypatch
     ):
-        """When recorder.start() times out, session should reset to idle."""
+        """A timed-out native start keeps output owned until teardown."""
         mock_ah.callAfter = lambda fn, *a, **kw: fn(*a, **kw)
         mock_app._sound_manager.enabled = False
-        monkeypatch.setattr(RecordingFlow, "_START_TIMEOUT", 0.1)
+        mock_app._config["audio"]["duck_system_audio"] = True
+        token = object()
+        mock_app._system_output_ducker.begin.return_value = token
+        mock_app._system_output_ducker.end.return_value = True
+        monkeypatch.setattr(RecordingFlow, "_START_TIMEOUT", 0.05)
+        started = threading.Event()
+        allow_start = threading.Event()
+        order: list[str] = []
 
         def hanging_start(*a, **kw):
-            # Block until cancelled — simulates a hung AVFoundation call
-            import time
-            time.sleep(5)
+            started.set()
+            assert allow_start.wait(timeout=5)
+            order.append("late-start-commit")
+            mock_app._recorder.is_recording = True
+            return "AirPods Max"
+
+        def _stop():
+            order.append("recorder-stop")
+            mock_app._recorder.is_recording = False
+            return None
+
+        def _restore(_token):
+            order.append("output-restore")
+            return True
 
         mock_app._recorder.start.side_effect = hanging_start
+        mock_app._recorder.stop.side_effect = _stop
+        mock_app._system_output_ducker.end.side_effect = _restore
 
         async def _test():
             await flow._handle_press("fn")
-            # Wait for session to finish (via timeout)
+            await _wait_thread_event(started)
             for _ in range(100):
-                if not flow.is_busy:
+                if mock_app._recorder.mark_tainted.called:
                     break
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.01)
+            assert mock_app._recorder.mark_tainted.called
+            assert flow.is_busy
+            mock_app._system_output_ducker.end.assert_not_called()
+            mock_app._end_op.assert_not_called()
+            mock_app._recording_indicator.hide.assert_called()
 
-        run(_test())
+            allow_start.set()
+            await asyncio.wait_for(flow._current_task, timeout=2)
 
-        mock_app._recorder.mark_tainted.assert_called_once()
-        mock_app._recording_indicator.hide.assert_called()
+        try:
+            run(_test())
+        finally:
+            allow_start.set()
+
+        mock_app._recorder.mark_tainted.assert_called_once_with(
+            stop_async=False
+        )
+        assert order == [
+            "late-start-commit",
+            "recorder-stop",
+            "output-restore",
+        ]
+        mock_app._recorder.stop.assert_called_once()
+        mock_app._system_output_ducker.end.assert_called_once_with(token)
         assert not flow.is_busy
 
 

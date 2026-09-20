@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 
 from wenzi.config import DEFAULT_CONFIG_DIR
 
@@ -16,6 +17,33 @@ DEFAULT_START_SOUND = "start_default.wav"
 # User-custom sound in ~/.config/WenZi/sounds/
 USER_SOUNDS_DIR = os.path.join(DEFAULT_CONFIG_DIR, "sounds")
 CUSTOM_START_SOUND = "start_custom.wav"
+
+# AVCaptureDevice.transportType uses the CoreAudio transport fourcc values.
+_BLUETOOTH_TRANSPORTS = {
+    int.from_bytes(b"blue", "big"),
+    int.from_bytes(b"blea", "big"),
+}
+
+
+def _input_device_uses_bluetooth(
+    configured_uid: str | None,
+) -> bool | None:
+    """Return Bluetooth state for the current default input.
+
+    ``None`` means the route could not be classified. The legacy UID argument
+    is ignored because WenZi never overrides the macOS default input.
+    """
+    del configured_uid
+    try:
+        from AVFoundation import AVCaptureDevice, AVMediaTypeAudio
+
+        device = AVCaptureDevice.defaultDeviceWithMediaType_(AVMediaTypeAudio)
+        if device is None:
+            return None
+        return int(device.transportType()) in _BLUETOOTH_TRANSPORTS
+    except Exception:
+        logger.debug("Failed to inspect input transport", exc_info=True)
+        return None
 
 
 def _resolve_start_sound(config_dir: str | None = None) -> str:
@@ -49,11 +77,15 @@ class SoundManager:
         enabled: bool = True,
         volume: float = 0.1,
         config_dir: str | None = None,
+        input_route_provider: Callable[[], object | None] | None = None,
+        input_route_chime_notifier: Callable[[], None] | None = None,
     ) -> None:
         self._enabled = enabled
         self._volume = volume
         self._start_sound_path = _resolve_start_sound(config_dir)
         self._cached_sound: object = None  # Cached NSSound instance
+        self._input_route_provider = input_route_provider
+        self._input_route_chime_notifier = input_route_chime_notifier
 
     @property
     def enabled(self) -> bool:
@@ -62,6 +94,57 @@ class SoundManager:
     @enabled.setter
     def enabled(self, value: bool) -> None:
         self._enabled = value
+
+    def should_play_start(self, input_device_uid: str | None) -> bool:
+        """Return whether audible start feedback is safe for this input.
+
+        ``NSSound`` opens the playback route.  Starting a Bluetooth microphone
+        while the 300 ms chime still owns A2DP can race the A2DP-to-HFP switch
+        and leave the capture stream delivering silence.  The visual indicator
+        remains the start feedback for Bluetooth sessions.
+        """
+        bluetooth: bool | None
+        provider = self._input_route_provider
+        if provider is not None:
+            try:
+                route = provider()
+                transport_type = getattr(route, "transport_type", None)
+                bluetooth = (
+                    int(transport_type) in _BLUETOOTH_TRANSPORTS
+                    if transport_type is not None
+                    else None
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to preflight the input route",
+                    exc_info=True,
+                )
+                bluetooth = None
+        else:
+            if not self._enabled:
+                return False
+            bluetooth = _input_device_uses_bluetooth(input_device_uid)
+        if not self._enabled:
+            # Calling the provider above refreshes Recorder's attempt-scoped
+            # preflight even when feedback was disabled after a quick tap.
+            return False
+        if bluetooth is True:
+            logger.info("Skipping start sound for Bluetooth input")
+            return False
+        if bluetooth is None:
+            logger.info("Skipping start sound because input route is unknown")
+            return False
+        notifier = self._input_route_chime_notifier
+        if notifier is not None:
+            try:
+                notifier()
+            except Exception:
+                logger.debug(
+                    "Failed to mark the preflight route for start sound",
+                    exc_info=True,
+                )
+                return False
+        return True
 
     def warmup(self) -> None:
         """Pre-load the NSSound object on the main thread.

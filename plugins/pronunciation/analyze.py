@@ -228,7 +228,7 @@ def _validate_analysis(data: dict[str, Any], sentence: str) -> dict[str, Any]:
     }
 
 
-def _parse_response(response: dict[str, Any], sentence: str) -> dict[str, Any]:
+def _parse_response(response: dict[str, Any], sentence: str, validator=_validate_analysis) -> dict[str, Any]:
     choices = response.get("choices") if isinstance(response, dict) else None
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
         raise _InvalidAnalysisResponse(
@@ -249,14 +249,14 @@ def _parse_response(response: dict[str, Any], sentence: str) -> dict[str, Any]:
     content = message.get("content") if isinstance(message, dict) else None
     if not isinstance(content, str) or not content.strip():
         raise _InvalidAnalysisResponse("AI returned an empty answer. Please try again.")
-    return _validate_analysis(_extract_json(content), sentence)
+    return validator(_extract_json(content), sentence)
 
 
 # -- LLM call ----------------------------------------------------------------
 
 
 async def _call_llm(
-    system_prompt: str, user_content: str, config: dict[str, Any]
+    system_prompt: str, user_content: str, config: dict[str, Any], *, validator=_validate_analysis,
 ) -> dict:
     ai_config = config.get("ai_enhance", {})
     provider_name = ai_config.get("default_provider", "")
@@ -299,7 +299,7 @@ async def _call_llm(
             extra_body=extra_body,
         )
         try:
-            return _parse_response(response, user_content)
+            return _parse_response(response, user_content, validator)
         except _InvalidAnalysisResponse as exc:
             # Log diagnostics without recording the user's sentence or model answer.
             logger.warning(

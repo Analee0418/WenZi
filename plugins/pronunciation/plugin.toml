@@ -2,7 +2,7 @@
 id = "io.github.airead.wenzi.pronunciation"
 name = "Pronunciation"
 description = "English pronunciation trainer - IPA transcription + connected speech + TTS"
-version = "0.4.0"
+version = "0.5.0"
 author = "WenZi"
 url = "https://github.com/Airead/WenZi"
 source = "https://raw.githubusercontent.com/Analee0418/WenZi/refs/heads/main/plugins/pronunciation/plugin.toml"
@@ -10,6 +10,8 @@ min_wenzi_version = "0.2.0"
 files = [
     "__init__.py",
     "analyze.py",
+    "rhythm.py",
+    "rhythm_view.py",
     "dialogue.py",
     "tts.py",
     "README.md",

@@ -24,6 +24,20 @@ Curves illustrate suggested connections, not measured audio timing. The panel
 respects reduced motion; **Replay links** explicitly plays one brief demonstration
 when that preference is enabled. Reload WenZi scripts and reopen PH after updates.
 
+## Stress and pauses
+
+Both the sentence panel and dialogue reader have **Mark stress & pauses**.
+Highlighted bold words carry suggested sentence emphasis; `|` marks a brief
+thought-group boundary and `||` a longer boundary. Hover over marks for reasons.
+Stress does not require a pause, and a grammatical collocation can span a spoken
+boundary. These are suggestions for neutral everyday speech, not a measurement
+of the generated audio or a claim about the speaker's intended contrast.
+
+The guide preserves input words, analyzes long passages in bounded chunks, and
+ignores stale results after the reader's source changes. In the sentence panel,
+linking curves do not cross suggested pauses. Guide analysis is independent of
+audio generation and the IPA analysis button.
+
 ## Development
 
 The manifest's `source` points this fork-specific plugin at its own repository.

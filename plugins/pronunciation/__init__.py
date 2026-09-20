@@ -22,6 +22,7 @@ _HTML_TEMPLATE = """\
   --bg: #f5f5f7; --text: #1d1d1f; --secondary: #86868b;
   --card: #ffffff; --border: #d2d2d7; --accent: #007aff;
   --link: #168baf; --link-soft: rgba(22, 139, 175, 0.09);
+  --playback-height: 140px;
 }}
 @media (prefers-color-scheme: dark) {{
   :root {{
@@ -31,10 +32,16 @@ _HTML_TEMPLATE = """\
   }}
 }}
 * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+html, body {{ height: 100%; overflow: hidden; }}
 body {{
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   background: var(--bg); color: var(--text);
-  padding: 32px 40px; user-select: text; -webkit-user-select: text;
+  user-select: text; -webkit-user-select: text;
+}}
+/* Pin both regions to the viewport instead of relying on document height. */
+.content-scroll {{
+  position: fixed; inset: 0 0 var(--playback-height) 0;
+  overflow-y: auto; padding: 32px 40px 24px;
 }}
 .container {{ max-width: 720px; margin: 0 auto; }}
 
@@ -42,6 +49,10 @@ body {{
   font-size: 26px; font-weight: 600; text-align: center;
   margin-bottom: 28px; line-height: 1.5;
 }}
+.rhythm-controls {{ text-align:center; margin:-12px 0 24px; }}
+.rhythm-controls .audio-btn {{ font-size:13px; padding:8px 14px; }}
+.rhythm-controls .rhythm-summary {{ max-width:560px; margin:6px auto; }}
+.rhythm-status {{ font-size:12px; margin-top:8px; color:var(--secondary); }}
 
 .section {{ margin-bottom: 24px; }}
 .label {{
@@ -140,9 +151,16 @@ button:focus-visible {{ outline: 2px solid var(--link); outline-offset: 3px; }}
   margin-top: 10px; line-height: 1.6;
 }}
 
-.audio-row {{
-  display: flex; justify-content: center; gap: 16px;
+.playback-bar {{
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 10;
+  padding: 14px 24px;
+  background: var(--bg); border-top: 1px solid var(--border);
 }}
+.playback-bar .error {{ overflow-wrap: anywhere; }}
+.audio-row {{
+  display: flex; flex-wrap: wrap; justify-content: center; gap: 12px 24px;
+}}
+.voice-controls {{ display: flex; align-items: center; gap: 8px; }}
 .audio-btn {{
   display: inline-flex; align-items: center; gap: 8px;
   padding: 10px 28px; border-radius: 10px;
@@ -179,9 +197,19 @@ button:focus-visible {{ outline: 2px solid var(--link); outline-offset: 3px; }}
 </style>
 </head>
 <body>
+<main class="content-scroll" tabindex="0" aria-label="Pronunciation content">
 <div class="container">
 
-  <div class="sentence">{sentence}</div>
+  <div class="sentence" id="sentence">{sentence}</div>
+  <div class="rhythm-controls">
+    <button class="audio-btn" id="rhythm-action" type="button">Mark stress &amp; pauses</button>
+    <div class="rhythm-status" id="rhythm-status" role="status" aria-live="polite"></div>
+    <div class="rhythm-legend hidden" id="rhythm-legend">
+      <span class="rhythm-stress">Bold color = stress</span> · | brief pause · || longer pause<br>
+      Suggested phrasing, not audio timing. Stress does not require a pause.
+    </div>
+    <div class="rhythm-summary hidden" id="rhythm-summary"></div>
+  </div>
 
   <div id="ph-content" class="hidden">
     <div class="section">
@@ -225,25 +253,44 @@ button:focus-visible {{ outline: 2px solid var(--link); outline-offset: 3px; }}
     <div id="connected-error" class="error hidden" role="alert"></div>
   </div>
 
-  <div class="section" style="margin-top: 8px;">
+</div>
+</main>
+
+<footer class="playback-bar" aria-label="Audio playback">
+  <div class="container">
     <div class="audio-row">
-      <button class="audio-btn" id="btn-f" disabled onclick="playF()">
-        <span class="icon">&#9792;</span> Female
-      </button>
-      <button class="audio-btn save-btn" id="save-f" disabled onclick="saveF()" title="Save">&#8595;</button>
-      <button class="audio-btn" id="btn-m" disabled onclick="playM()">
-        <span class="icon">&#9794;</span> Male
-      </button>
-      <button class="audio-btn save-btn" id="save-m" disabled onclick="saveM()" title="Save">&#8595;</button>
+      <div class="voice-controls" role="group" aria-label="Female voice">
+        <button class="audio-btn" id="btn-f" disabled onclick="playF()">
+          <span class="icon">&#9792;</span> Female
+        </button>
+        <button class="audio-btn save-btn" id="save-f" disabled onclick="saveF()" title="Save">&#8595;</button>
+      </div>
+      <div class="voice-controls" role="group" aria-label="Male voice">
+        <button class="audio-btn" id="btn-m" disabled onclick="playM()">
+          <span class="icon">&#9794;</span> Male
+        </button>
+        <button class="audio-btn save-btn" id="save-m" disabled onclick="saveM()" title="Save">&#8595;</button>
+      </div>
     </div>
     <div id="tts-loading" class="loading" style="margin-top: 10px;">
       <div class="spinner"></div>Generating audio…
     </div>
     <div id="tts-error" class="error hidden"></div>
   </div>
-
-</div>
+</footer>
 <script>
+var _playbackBar = document.querySelector(".playback-bar");
+var _playbackHeight = null;
+function _syncPlaybackHeight() {{
+  var height = _playbackBar.offsetHeight;
+  if (height === _playbackHeight) return;
+  _playbackHeight = height;
+  // Keep the last content line reachable when buttons wrap or status text changes.
+  document.documentElement.style.setProperty("--playback-height", height + "px");
+}}
+_syncPlaybackHeight();
+new ResizeObserver(_syncPlaybackHeight).observe(_playbackBar);
+
 var _audio = {{}};
 var _words = [];
 var _links = [];
@@ -253,6 +300,66 @@ var _animateLinks = false;
 var _linkLayout = "";
 var _analyzing = false;
 var _features = [];
+var _rhythm = null;
+var _rhythmRequest = 0;
+var _allLinks = [];
+
+function _rhythmWordsAligned() {{
+  function normalized(word) {{ return word.toLowerCase().replace(/[^a-z0-9]/g, ""); }}
+  return _rhythm && _words.length === _rhythm.words.length
+    && _words.every(function(word, i) {{ return normalized(word.word) === normalized(_rhythm.words[i]); }});
+}}
+function _applyWordStress() {{
+  var items = document.getElementById("words").children;
+  var marked = new Map((_rhythm ? _rhythm.stress : []).map(function(item) {{ return [item.index, item]; }}));
+  var aligned = _rhythmWordsAligned();
+  Array.from(items).forEach(function(item, index) {{
+    var word = item.querySelector(".word-text");
+    var hint = aligned && marked.get(index);
+    word.classList.toggle("rhythm-stress", !!hint);
+    word.title = hint ? hint.note : "";
+  }});
+}}
+
+document.getElementById("rhythm-action").addEventListener("click", function() {{
+  var button = document.getElementById("rhythm-action");
+  if (button.disabled) return;
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  button.textContent = "Marking…";
+  document.getElementById("rhythm-status").className = "rhythm-status";
+  document.getElementById("rhythm-status").textContent = "Finding emphasis and thought groups…";
+  wz.send("request_rhythm", {{request_id: ++_rhythmRequest}});
+}});
+wz.on("rhythm_progress", function(data) {{
+  if (data.request_id !== _rhythmRequest) return;
+  document.getElementById("rhythm-status").textContent = "Marking passage " + data.done + " / " + data.total + "…";
+}});
+wz.on("rhythm_result", function(data) {{
+  if (data.request_id !== _rhythmRequest) return;
+  _rhythm = data.result;
+  PhRhythm.render(document.getElementById("sentence"), __SENTENCE_JS__, _rhythm);
+  _applyWordStress();
+  _renderLinks(_allLinks);
+  document.getElementById("rhythm-legend").classList.remove("hidden");
+  document.getElementById("rhythm-summary").classList.toggle("hidden", !_rhythm.summary);
+  document.getElementById("rhythm-summary").textContent = _rhythm.summary;
+  document.getElementById("rhythm-status").textContent = "";
+  var button = document.getElementById("rhythm-action");
+  button.disabled = false;
+  button.setAttribute("aria-busy", "false");
+  button.textContent = "Mark stress & pauses again";
+}});
+wz.on("rhythm_error", function(data) {{
+  if (data.request_id !== _rhythmRequest) return;
+  var status = document.getElementById("rhythm-status");
+  status.className = "rhythm-error";
+  status.textContent = data.message;
+  var button = document.getElementById("rhythm-action");
+  button.disabled = false;
+  button.setAttribute("aria-busy", "false");
+  button.textContent = "Retry stress & pauses";
+}});
 
 function _renderWords(words) {{
   _words = words;
@@ -265,6 +372,7 @@ function _renderWords(words) {{
       + '</div><div class="word-ipa">' + _e(item.ipa) + '</div>';
     w.appendChild(el);
   }});
+  _applyWordStress();
 }}
 
 function _highlightLink(index) {{
@@ -358,11 +466,13 @@ function _scheduleLinks(animate) {{
 }}
 
 function _renderLinks(links) {{
+  _allLinks = Array.isArray(links) ? links : [];
+  var pauses = new Set((_rhythmWordsAligned() ? _rhythm.pauses : []).map(function(item) {{ return item.after; }}));
   var seen = {{}};
-  _links = (Array.isArray(links) ? links : []).filter(function(link) {{
+  _links = _allLinks.filter(function(link) {{
     if (!link || !Number.isInteger(link.from) || link.to !== link.from + 1
         || link.from < 0 || link.to >= _words.length || seen[link.from]
-        || typeof link.note !== "string" || !link.note.trim()) return false;
+        || typeof link.note !== "string" || !link.note.trim() || pauses.has(link.from)) return false;
     seen[link.from] = true;
     return true;
   }});
@@ -571,6 +681,8 @@ wz.on("connected_error", function(d) {{
 
 
 def _build_html(sentence: str, words_json: str, init_error: str) -> str:
+    from .rhythm_view import inject_rhythm_assets
+
     safe = (
         sentence.replace("&", "&amp;")
         .replace("<", "&lt;")
@@ -578,7 +690,7 @@ def _build_html(sentence: str, words_json: str, init_error: str) -> str:
         .replace('"', "&quot;")
     )
     html = _HTML_TEMPLATE.format(sentence=safe)
-    return (
+    return inject_rhythm_assets(
         html.replace("__WORDS_JSON__", words_json)
         .replace("__INIT_ERROR__", init_error)
         .replace("__SENTENCE_JS__", json.dumps(sentence))
@@ -610,11 +722,17 @@ def _open_panel(wz, sentence: str) -> None:
         title="Pronunciation",
         html=_build_html(sentence, words_json, init_error),
         width=700,
-        height=740,
+        height=820,
         floating=True,
     )
     panel.show()
     _panel_ref[0] = panel
+
+    def _on_close():
+        if _panel_ref[0] is panel:
+            _panel_ref[0] = None
+
+    panel.on_close(_on_close)
 
     async def _work():
         from .tts import generate_tts
@@ -642,6 +760,51 @@ def _open_panel(wz, sentence: str) -> None:
 
         wz.run(_analyze())
 
+    rhythm_request = [None]
+
+    def _on_request_rhythm(data):
+        request_id = (data or {}).get("request_id")
+        rhythm_request[0] = request_id
+
+        def current():
+            return _panel_ref[0] is panel and rhythm_request[0] == request_id
+
+        def send_current(event, payload):
+            import threading
+
+            def send():
+                if current():
+                    panel.send(event, payload)
+
+            if threading.current_thread() is threading.main_thread():
+                send()
+            else:
+                from PyObjCTools import AppHelper
+
+                AppHelper.callAfter(send)
+
+        async def _analyze_rhythm():
+            import asyncio
+
+            from .rhythm import analyze_rhythm
+
+            try:
+                result = await analyze_rhythm(
+                    sentence, should_continue=current,
+                    on_progress=lambda done, total: send_current(
+                        "rhythm_progress", {"done": done, "total": total, "request_id": request_id}
+                    ) if current() else None,
+                )
+                if current():
+                    send_current("rhythm_result", {"result": result, "request_id": request_id})
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                if current():
+                    send_current("rhythm_error", {"message": str(exc), "request_id": request_id})
+
+        wz.run(_analyze_rhythm())
+
     def _on_save_audio(data):
         import base64
         import os
@@ -659,6 +822,7 @@ def _open_panel(wz, sentence: str) -> None:
             panel.send("save_error", {"message": str(e)})
 
     panel.on("request_connected", _on_request_connected)
+    panel.on("request_rhythm", _on_request_rhythm)
     panel.on("save_audio", _on_save_audio)
     wz.run(_work())
 

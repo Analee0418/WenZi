@@ -400,6 +400,10 @@ textarea:focus-visible { border-color:var(--accent); }
 .speaker { color:var(--role-color); font-size:13px; font-weight:650;
            overflow-wrap:anywhere; }
 .dialogue-text { min-width:0; overflow-wrap:anywhere; }
+.rhythm-toolbar { display:flex; align-items:center; flex-wrap:wrap; gap:10px;
+                  margin-top:10px; }
+.rhythm-status { color:var(--muted); font-size:12px; }
+#rhythm-summary { margin:7px 0 12px; }
 .role-0 { --role-color:var(--role-0); } .role-1 { --role-color:var(--role-1); }
 .role-2 { --role-color:var(--role-2); } .role-3 { --role-color:var(--role-3); }
 .role-4 { --role-color:var(--role-4); } .role-5 { --role-color:var(--role-5); }
@@ -469,6 +473,10 @@ textarea:focus-visible { border-color:var(--accent); }
         <span id="read-label">Read Dialogue</span>
       </button>
     </footer>
+    <div class="rhythm-toolbar">
+      <button id="mark-rhythm" onclick="markRhythm()" aria-busy="false">Mark stress &amp; pauses</button>
+      <span class="rhythm-status" id="rhythm-status" role="status" aria-live="polite"></span>
+    </div>
   </section>
   <section class="results" id="results" aria-labelledby="dialogue-title">
     <header class="section-head">
@@ -491,6 +499,11 @@ textarea:focus-visible { border-color:var(--accent); }
         </button>
       </div>
     </header>
+    <div class="rhythm-legend" id="rhythm-legend" hidden>
+      <span class="rhythm-stress">Bold color = stress</span> · | brief pause · || longer pause<br>
+      Suggested phrasing, not audio timing. Stress does not require a pause.
+    </div>
+    <p class="rhythm-summary" id="rhythm-summary" hidden></p>
     <div class="roles" id="roles" role="list"></div>
     <div class="script" id="script" role="list"><div class="empty">No dialogue</div></div>
   </section>
@@ -503,6 +516,57 @@ var activeDialogueRequestId = 0;
 var sourceRollbackState = null;
 var dialogueOwned = false;
 var sourceErrorMessage = "";
+var rhythmRequestSequence = 0;
+var activeRhythmRequestId = null;
+var rhythmResult = null;
+var displayedSegments = [];
+function setRhythmBusy(busy) {
+  var button = document.getElementById("mark-rhythm");
+  button.disabled = busy;
+  button.setAttribute("aria-busy", busy ? "true" : "false");
+  button.textContent = busy ? "Marking..." : "Mark stress & pauses";
+}
+function setRhythmStatus(message, error) {
+  var status = document.getElementById("rhythm-status");
+  status.textContent = message || "";
+  status.classList.toggle("rhythm-error", !!error);
+}
+function renderRhythm() {
+  var combinedText = displayedSegments.map(function(item) { return item.text; }).join("\\n\\n");
+  var result = rhythmResult && rhythmResult.text === combinedText ? rhythmResult : null;
+  var offset = 0;
+  document.querySelectorAll("#script .dialogue-text").forEach(function(container, index) {
+    var text = displayedSegments[index].text;
+    if (result) PhRhythm.render(container, text, result, offset);
+    else container.textContent = text;
+    offset += (text.match(/\\S+/g) || []).length;
+  });
+  document.getElementById("rhythm-legend").hidden = !result;
+  var summary = document.getElementById("rhythm-summary");
+  summary.hidden = !result;
+  summary.textContent = result ? result.summary : "";
+}
+function invalidateRhythm() {
+  if (activeRhythmRequestId !== null) {
+    wz.send("invalidate_rhythm", {request_id:activeRhythmRequestId});
+  }
+  activeRhythmRequestId = null;
+  rhythmResult = null;
+  setRhythmBusy(false);
+  setRhythmStatus("");
+  renderRhythm();
+}
+function markRhythm() {
+  var requestId = ++rhythmRequestSequence;
+  activeRhythmRequestId = requestId;
+  rhythmResult = null;
+  renderRhythm();
+  setRhythmBusy(true);
+  setRhythmStatus("Preparing reading guide...");
+  wz.send("request_rhythm", {
+    text:document.getElementById("source").value, request_id:requestId
+  });
+}
 function setStatus(message, state) {
   var el = document.getElementById("status");
   document.getElementById("status-text").textContent = message || "";
@@ -605,6 +669,7 @@ function saveAudio() {
   wz.send("save_audio", {request_id:activeDialogueRequestId});
 }
 function renderDialogue(data) {
+  displayedSegments = data.segments;
   var roles = document.getElementById("roles");
   var roleIndexes = new Map();
   var roleFragment = document.createDocumentFragment();
@@ -645,6 +710,7 @@ function renderDialogue(data) {
     scriptFragment.appendChild(row);
   });
   script.replaceChildren(scriptFragment);
+  renderRhythm();
   document.getElementById("summary").textContent =
     countLabel(data.segments.length, "line") + " \\u00b7 " +
     countLabel(data.roles.length, "voice");
@@ -655,6 +721,7 @@ function renderDialogue(data) {
 }
 wz.on("source_loaded", function(data) {
   if (data.request_id !== sourceRequestId) return;
+  invalidateRhythm();
   sourceRollbackState = null;
   document.getElementById("source").value = data.text;
   _startDialogue();
@@ -703,6 +770,27 @@ function handleDialogueEvent(name, data) {
 wz.on("dialogue_parsed", function(data) { handleDialogueEvent("dialogue_parsed", data); });
 wz.on("dialogue_audio", function(data) { handleDialogueEvent("dialogue_audio", data); });
 wz.on("dialogue_error", function(data) { handleDialogueEvent("dialogue_error", data); });
+wz.on("rhythm_parsed", function(data) {
+  if (data.request_id !== activeRhythmRequestId) return;
+  renderDialogue(data);
+});
+wz.on("rhythm_progress", function(data) {
+  if (data.request_id !== activeRhythmRequestId) return;
+  setRhythmStatus("Marking reading guide: " + data.done + " / " + data.total);
+});
+wz.on("rhythm_result", function(data) {
+  if (data.request_id !== activeRhythmRequestId) return;
+  rhythmResult = data.result;
+  renderRhythm();
+  setRhythmBusy(false);
+  setRhythmStatus("Suggested everyday American reading");
+});
+wz.on("rhythm_error", function(data) {
+  if (data.request_id !== activeRhythmRequestId) return;
+  setRhythmBusy(false);
+  document.getElementById("mark-rhythm").textContent = "Retry stress & pauses";
+  setRhythmStatus(data.message, true);
+});
 wz.on("save_complete", function(data) {
   if (data.request_id !== activeDialogueRequestId) return;
   document.getElementById("download").disabled = false;
@@ -720,6 +808,7 @@ wz.on("save_error", function(data) {
   setStatus(data.message, "error");
 });
 document.getElementById("source").addEventListener("input", function() {
+  invalidateRhythm();
   ++sourceRequestId;
   var ownedRequestId = null;
   if (sourceRollbackState && sourceRollbackState.dialogueOwned) {
@@ -745,12 +834,14 @@ document.getElementById("source").addEventListener("input", function() {
 
 
 def _build_dialogue_html(initial_text: str) -> str:
+    from .rhythm_view import inject_rhythm_assets
+
     escaped = (
         initial_text.replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
-    return _DIALOGUE_HTML.replace("__INITIAL_TEXT__", escaped)
+    return inject_rhythm_assets(_DIALOGUE_HTML.replace("__INITIAL_TEXT__", escaped))
 
 
 def open_dialogue_panel(wz, initial_text: str = "") -> None:
@@ -771,11 +862,13 @@ def open_dialogue_panel(wz, initial_text: str = "") -> None:
     panel.show()
     _dialogue_panel_ref[0] = panel
     audio_state = _DialogueAudioState()
+    rhythm_request = [None]
 
     def _on_close() -> None:
         if _dialogue_panel_ref[0] is panel:
             _dialogue_panel_ref[0] = None
         audio_state.retire()
+        rhythm_request[0] = None
 
     panel.on_close(_on_close)
 
@@ -942,6 +1035,77 @@ def open_dialogue_panel(wz, initial_text: str = "") -> None:
         request_id = (data or {}).get("request_id")
         audio_state.retire_request(request_id)
 
+    def _on_request_rhythm(data) -> None:
+        from .rhythm import analyze_rhythm
+
+        request_id = (data or {}).get("request_id")
+        owner = {"request_id": request_id}
+        rhythm_request[0] = owner
+
+        def _is_current() -> bool:
+            return rhythm_request[0] is owner and _dialogue_panel_ref[0] is panel
+
+        def _send_rhythm(event: str, payload: dict) -> None:
+            def _deliver() -> None:
+                if _is_current():
+                    panel.send(event, payload)
+
+            if threading.current_thread() is threading.main_thread():
+                _deliver()
+            else:
+                from PyObjCTools import AppHelper
+
+                AppHelper.callAfter(_deliver)
+
+        try:
+            segments, roles = assign_voices(parse_dialogue((data or {}).get("text", "")))
+        except Exception as exc:
+            _send_rhythm(
+                "rhythm_error",
+                {"message": str(exc), "request_id": request_id},
+            )
+            return
+
+        # Speaker labels are visual metadata, not words the learner will say.
+        text = "\n\n".join(segment["text"] for segment in segments)
+        _send_rhythm(
+            "rhythm_parsed",
+            {"segments": segments, "roles": roles, "request_id": request_id},
+        )
+
+        def _on_progress(done: int, total: int) -> None:
+            if _is_current():
+                _send_rhythm(
+                    "rhythm_progress",
+                    {"done": done, "total": total, "request_id": request_id},
+                )
+
+        async def _analyze() -> None:
+            if not _is_current():
+                return
+            try:
+                result = await analyze_rhythm(
+                    text, on_progress=_on_progress, should_continue=_is_current
+                )
+                if _is_current():
+                    _send_rhythm(
+                        "rhythm_result", {"result": result, "request_id": request_id}
+                    )
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                if _is_current():
+                    _send_rhythm(
+                        "rhythm_error", {"message": str(exc), "request_id": request_id}
+                    )
+
+        wz.run(_analyze())
+
+    def _on_invalidate_rhythm(data) -> None:
+        owner = rhythm_request[0]
+        if owner is not None and owner["request_id"] == (data or {}).get("request_id"):
+            rhythm_request[0] = None
+
     def _on_save_audio(data) -> None:
         request_id = (data or {}).get("request_id")
         audio = audio_state.audio_for(request_id)
@@ -980,4 +1144,6 @@ def open_dialogue_panel(wz, initial_text: str = "") -> None:
     panel.on("load_clipboard", _on_load_clipboard)
     panel.on("read_dialogue", _on_read_dialogue)
     panel.on("invalidate_dialogue", _on_invalidate_dialogue)
+    panel.on("request_rhythm", _on_request_rhythm)
+    panel.on("invalidate_rhythm", _on_invalidate_rhythm)
     panel.on("save_audio", _on_save_audio)

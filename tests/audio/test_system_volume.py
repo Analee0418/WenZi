@@ -149,7 +149,13 @@ class FakeVolumeBackend:
         device_id: int,
     ) -> tuple[int, int] | None:
         self.reads.append(("output_route_signature", device_id))
-        return self.route_signatures.get(device_id)
+        if device_id in self.route_signatures:
+            return self.route_signatures[device_id]
+        # Any other live device publishes a readable media-shaped route,
+        # mirroring real CoreAudio devices after an ID recycle.
+        if device_id in self.elements:
+            return (48_000, 2)
+        return None
 
     def get_volume(self, device_id: int, element: int) -> float:
         self.reads.append(("get_volume", device_id, element))
@@ -202,10 +208,10 @@ class BluetoothGainBackend(FakeVolumeBackend):
         self,
         device_id: int,
     ) -> tuple[int, int] | None:
-        self.reads.append(("output_route_signature", device_id))
         if device_id == self.tracked_device:
+            self.reads.append(("output_route_signature", device_id))
             return (48_000, 2) if self.a2dp_active else (24_000, 1)
-        return self.route_signatures.get(device_id)
+        return super().output_route_signature(device_id)
 
     def set_mute(self, device_id: int, muted: bool) -> None:
         super().set_mute(device_id, muted)
@@ -4911,6 +4917,188 @@ def test_monitor_reducks_a_recreated_device_with_the_same_uid_and_topology() -> 
 
     assert ducker.end(token)
     assert backend.values[(2, 0)] == pytest.approx(0.8)
+
+
+def test_monitor_freezes_media_snapshot_during_call_profile() -> None:
+    """An A2DP→HFP flip must not be misread as a user volume change.
+
+    HFP exposes an independent volume scale under the same element layout,
+    so the ducked media value is invisible there. The monitor must freeze
+    instead of abandoning the media original (which orphaned the duck and
+    left music stuck quiet after recording).
+    """
+    virtual = system_volume._VIRTUAL_MAIN_ELEMENT
+    backend = FakeVolumeBackend()
+    backend.elements = {1: (virtual,)}
+    backend.values = {(1, virtual): 0.8}
+    ducker = SystemOutputDucker(
+        backend,
+        sleeper=lambda _delay: None,
+        monitor_waiter=lambda stop, _timeout: stop.wait(),
+    )
+    token = ducker.begin()
+    assert token is not None
+    assert backend.values[(1, virtual)] == pytest.approx(0.05)
+
+    # Microphone opened: the headset flips to its call profile, whose scale
+    # reads a foreign value through the same virtual-main element.
+    backend.route_signatures[1] = (24_000, 1)
+    backend.values[(1, virtual)] = 0.7
+    with ducker._lock:
+        assert ducker._refresh_locked(
+            allow_reduck=False,
+            abandon_on_deviation=True,
+            force_mute=False,
+        )
+    assert ("uid-1", (virtual,)) in ducker._snapshots
+    assert "uid-1" not in ducker._overridden_devices
+    assert backend.values[(1, virtual)] == pytest.approx(0.7)
+
+    # Media profile returns (still ducked); the original must be restored.
+    backend.route_signatures[1] = (48_000, 2)
+    backend.values[(1, virtual)] = 0.05
+    assert ducker.end(token)
+    assert backend.values[(1, virtual)] == pytest.approx(0.8)
+
+
+def test_monitor_does_not_capture_transient_call_profile_topology() -> None:
+    """The brief HFP-only element layout must not become an owned snapshot.
+
+    A snapshot captured on the call topology can never be resolved once the
+    media profile returns; it used to strand the recovery journal and left
+    every later session re-adopting an unrestorable duck.
+    """
+    virtual = system_volume._VIRTUAL_MAIN_ELEMENT
+    backend = FakeVolumeBackend()
+    backend.elements = {1: (virtual,)}
+    backend.values = {(1, virtual): 0.8}
+    ducker = SystemOutputDucker(
+        backend,
+        sleeper=lambda _delay: None,
+        monitor_waiter=lambda stop, _timeout: stop.wait(),
+    )
+    token = ducker.begin()
+    assert token is not None
+
+    # Transition window: the call profile briefly exposes only the raw
+    # main element with its own scale.
+    backend.route_signatures[1] = (24_000, 1)
+    backend.elements = {1: (0,)}
+    backend.values[(1, 0)] = 0.0625
+    with ducker._lock:
+        assert ducker._refresh_locked(
+            allow_reduck=False,
+            abandon_on_deviation=True,
+            force_mute=False,
+        )
+    assert ("uid-1", (0,)) not in ducker._snapshots
+    assert backend.values[(1, 0)] == pytest.approx(0.0625)
+
+    backend.route_signatures[1] = (48_000, 2)
+    backend.elements = {1: (virtual,)}
+    assert ducker.end(token)
+    assert backend.values[(1, virtual)] == pytest.approx(0.8)
+
+
+def test_begin_leaves_call_profile_snapshot_deferred_on_media_route() -> None:
+    """A call-scale original must never be adopted into a media session."""
+    virtual = system_volume._VIRTUAL_MAIN_ELEMENT
+    backend = FakeVolumeBackend()
+    backend.elements = {1: (virtual,)}
+    backend.values = {(1, virtual): 0.0625}
+    backend.route_signatures[1] = (24_000, 1)
+    ducker = SystemOutputDucker(
+        backend,
+        sleeper=lambda _delay: None,
+        monitor_waiter=lambda stop, _timeout: stop.wait(),
+    )
+    first = ducker.begin()
+    assert first is not None
+    snapshot = ducker._snapshots[("uid-1", (virtual,))]
+    assert snapshot.capture_route == (24_000, 1)
+
+    # Restore fails while the call profile is still up; the snapshot is
+    # parked for background recovery.
+    backend.fail_writes[(1, virtual)] = 100
+    assert not ducker.end(first)
+    assert ducker.defer_failed_restore(first)
+    assert ("uid-1", (virtual,)) in ducker._deferred_snapshots
+    backend.fail_writes.clear()
+
+    # Media profile is back with its own scale; the parked call-scale
+    # values must stay parked instead of becoming this session's original.
+    backend.route_signatures[1] = (48_000, 2)
+    backend.values[(1, virtual)] = 0.8
+    second = ducker.begin()
+    assert second is None
+    assert ("uid-1", (virtual,)) in ducker._deferred_snapshots
+    assert ("uid-1", (virtual,)) not in ducker._snapshots
+    assert backend.values[(1, virtual)] == pytest.approx(0.8)
+    ducker.stop_background_workers()
+
+
+def test_media_snapshot_survives_sample_rate_renegotiation() -> None:
+    """44.1k/48k renegotiation stays within the media class: no freeze."""
+    virtual = system_volume._VIRTUAL_MAIN_ELEMENT
+    backend = FakeVolumeBackend()
+    backend.elements = {1: (virtual,)}
+    backend.values = {(1, virtual): 0.8}
+    ducker = SystemOutputDucker(
+        backend,
+        sleeper=lambda _delay: None,
+        monitor_waiter=lambda stop, _timeout: stop.wait(),
+    )
+    token = ducker.begin()
+    assert token is not None
+
+    backend.route_signatures[1] = (44_100, 2)
+    backend.values[(1, virtual)] = 0.6
+    with ducker._lock:
+        # Same media class: an off-target value is still a user change and
+        # keeps the established abandonment contract.
+        assert not ducker._refresh_locked(
+            allow_reduck=False,
+            abandon_on_deviation=True,
+            force_mute=False,
+        )
+    assert "uid-1" in ducker._overridden_devices
+
+    assert ducker.end(token)
+    assert backend.values[(1, virtual)] == pytest.approx(0.6)
+
+
+def test_recovery_journal_round_trips_capture_route(tmp_path: Path) -> None:
+    journal_path = tmp_path / "system-volume.json"
+    virtual = system_volume._VIRTUAL_MAIN_ELEMENT
+    backend = FakeVolumeBackend()
+    backend.elements = {1: (virtual,)}
+    backend.values = {(1, virtual): 0.8}
+    ducker = SystemOutputDucker(
+        backend,
+        sleeper=lambda _delay: None,
+        monitor_waiter=lambda stop, _timeout: stop.wait(),
+        recovery_path=journal_path,
+    )
+    token = ducker.begin()
+    assert token is not None
+    data = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert data["devices"][0]["capture_route"] == [48_000, 2]
+
+    loaded = ducker._read_recovery_journal()
+    assert loaded is not None
+    _created_at, snapshots = loaded
+    assert snapshots[("uid-1", (virtual,))].capture_route == (48_000, 2)
+
+    # A journal written before capture routes existed keeps loading and
+    # falls back to route-agnostic behavior.
+    del data["devices"][0]["capture_route"]
+    journal_path.write_text(json.dumps(data), encoding="utf-8")
+    loaded = ducker._read_recovery_journal()
+    assert loaded is not None
+    _created_at, snapshots = loaded
+    assert snapshots[("uid-1", (virtual,))].capture_route is None
+
+    assert ducker.end(token)
 
 
 def test_immediate_manual_volume_change_is_not_reducked_or_restored() -> None:

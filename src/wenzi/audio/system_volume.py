@@ -117,6 +117,18 @@ def _is_media_route_signature(signature: tuple[int, int]) -> bool:
     )
 
 
+def _route_media_class(signature: tuple[int, int] | None) -> bool | None:
+    """Classify a route signature as media (True) or call/other (False).
+
+    Bluetooth headsets renegotiate the media sample rate (44.1k/48k), so
+    profile identity must compare by class, never by exact signature. None
+    means the route shape is unknown right now.
+    """
+    if signature is None or not _valid_route_signature(signature):
+        return None
+    return _is_media_route_signature(signature)
+
+
 class _PropertyAddress(ctypes.Structure):
     _fields_ = [
         ("mSelector", ctypes.c_uint32),
@@ -648,6 +660,13 @@ class _DeviceSnapshot:
     post_restore_ready: bool = False
     post_restore_pass: int = 0
     allow_inactive_controls: bool = False
+    # Route shape when *original* was read. A2DP and HFP expose independent
+    # volume scales (sometimes under identical element layouts), so a snapshot
+    # may only ever be compared, re-applied, or restored while the device is
+    # publishing the same media/call profile class it was captured on. None
+    # (unreadable route, or a pre-existing journal entry) keeps the legacy
+    # route-agnostic behavior.
+    capture_route: tuple[int, int] | None = None
 
 
 _SnapshotKey = tuple[str, tuple[int, ...]]
@@ -1224,6 +1243,52 @@ class SystemOutputDucker:
             raise ValueError(f"{name} must be a number from 0 to 1")
         return result
 
+    def _current_route_signature(
+        self,
+        device_id: int,
+    ) -> tuple[int, int] | None:
+        try:
+            return self._backend.output_route_signature(device_id)
+        except Exception:
+            logger.debug(
+                "Could not read the output route signature",
+                exc_info=True,
+            )
+            return None
+
+    def _snapshot_on_foreign_route(
+        self,
+        snapshot: _DeviceSnapshot,
+        current_signature: tuple[int, int] | None,
+    ) -> bool:
+        """True when *snapshot* was captured on a different profile class.
+
+        Untagged snapshots (legacy journals, unreadable capture route) never
+        report foreign; a tagged snapshot with an unreadable current route
+        does (fail closed: mid-transition topologies must not be touched).
+        """
+        captured = _route_media_class(snapshot.capture_route)
+        if captured is None:
+            return False
+        return _route_media_class(current_signature) != captured
+
+    def _uid_frozen_for_route(
+        self,
+        device_uid: str,
+        current_signature: tuple[int, int] | None,
+    ) -> bool:
+        """True while *device_uid* publishes a profile it was not captured on."""
+        for store in (self._snapshots, self._deferred_snapshots):
+            for snapshot in store.values():
+                if snapshot.device_uid != device_uid:
+                    continue
+                if self._snapshot_on_foreign_route(
+                    snapshot,
+                    current_signature,
+                ):
+                    return True
+        return False
+
     def _capture_snapshot(
         self,
         device_id: int,
@@ -1236,6 +1301,7 @@ class SystemOutputDucker:
             elements = self._backend.volume_elements(device_id)
         if not elements:
             return None
+        capture_route = self._current_route_signature(device_id)
         original = {element: self._backend.get_volume(device_id, element) for element in elements}
         original_mute = None
         if self._max_volume == 0.0:
@@ -1255,6 +1321,7 @@ class SystemOutputDucker:
             original=original,
             original_mute=original_mute,
             mute_target=True if original_mute is not None else None,
+            capture_route=capture_route,
         )
 
     def _configure_post_restore_sync(
@@ -1354,6 +1421,18 @@ class SystemOutputDucker:
         device_uid = self._backend.device_uid(device_id)
         if not device_uid:
             return False
+        if self._uid_frozen_for_route(
+            device_uid,
+            self._current_route_signature(device_id),
+        ):
+            # The device is publishing a different Bluetooth profile than the
+            # one its snapshot was captured on (opening the microphone flips
+            # AirPods from A2DP to HFP). Values on this profile live on an
+            # independent scale: comparing them would misread a route flip as
+            # a user change and abandon the owned original, and capturing the
+            # transient topology would strand an unrestorable snapshot. Own
+            # the duck quietly until the captured profile returns.
+            return True
         if device_uid in self._overridden_devices:
             if not allow_reduck:
                 return False
@@ -1754,6 +1833,21 @@ class SystemOutputDucker:
             if device_id is None:
                 return None
             if self._backend.device_uid(device_id) != snapshot.device_uid:
+                return None
+            if _route_media_class(
+                snapshot.capture_route
+            ) is False and self._snapshot_on_foreign_route(
+                snapshot,
+                self._backend.output_route_signature(device_id),
+            ):
+                # Call-profile values live on an independent volume scale;
+                # writing them to the media route would set the media gain
+                # to a call-scale original. Report the snapshot's own route
+                # as temporarily unavailable so the existing retry and
+                # deferred recovery paths resume once a call profile is up
+                # again. Media-captured snapshots intentionally keep the
+                # restore-anywhere flow: their post-restore machinery
+                # re-asserts the media gain once A2DP returns.
                 return None
             elements = tuple(
                 sorted(self._backend.volume_elements(device_id))
@@ -3872,6 +3966,7 @@ class SystemOutputDucker:
             post_restore_ready=snapshot.post_restore_ready,
             post_restore_pass=snapshot.post_restore_pass,
             allow_inactive_controls=snapshot.allow_inactive_controls,
+            capture_route=snapshot.capture_route,
         )
 
     def _read_recovery_journal(
@@ -4030,6 +4125,14 @@ class SystemOutputDucker:
                             stored_route_signature
                         )
                     )
+                capture_route = None
+                stored_capture_route = item.get("capture_route")
+                if stored_capture_route is not None:
+                    if version != _RECOVERY_VERSION:
+                        raise ValueError("invalid recovery capture route")
+                    capture_route = self._journal_route_signature(
+                        stored_capture_route
+                    )
                 stored_media_pending = item.get(
                     "post_restore_media_pending",
                     False,
@@ -4177,6 +4280,7 @@ class SystemOutputDucker:
                     post_restore_ready=post_restore_ready,
                     post_restore_pass=post_restore_pass,
                     allow_inactive_controls=allow_inactive_controls,
+                    capture_route=capture_route,
                 )
                 key = self._snapshot_key(snapshot)
                 if key in snapshots:
@@ -4392,6 +4496,7 @@ class SystemOutputDucker:
                     phase=_PHASE_RESTORING,
                     transition_started_at=snapshot.transition_started_at,
                     allow_inactive_controls=False,
+                    capture_route=route_signature,
                 )
                 if self._persist_legacy_snapshot_replacement(
                     key,
@@ -4442,6 +4547,7 @@ class SystemOutputDucker:
             post_restore_ready=soft_pending,
             post_restore_pass=0,
             allow_inactive_controls=False,
+            capture_route=route_signature,
         )
         if not self._persist_legacy_snapshot_replacement(
             key,
@@ -4460,6 +4566,24 @@ class SystemOutputDucker:
         """Adopt an unchanged old cap without an audible restore/re-duck pulse."""
         key = self._snapshot_key_for(device_uid, elements)
         snapshot = self._deferred_snapshots.get(key)
+        if (
+            snapshot is not None
+            and _route_media_class(snapshot.capture_route) is False
+            and self._snapshot_on_foreign_route(
+                snapshot,
+                self._current_route_signature(device_id),
+            )
+        ):
+            # A call-profile snapshot holds values from the independent
+            # HFP volume scale; adopting it on the media route would later
+            # restore the media gain to a call-scale original. Leave it
+            # deferred for the background worker (which restores it once
+            # the call profile returns) and start this session without a
+            # duck rather than capturing a same-key sibling the recovery
+            # journal could not represent. Media-captured snapshots keep
+            # the established adoption flow: their mute-guarded paths are
+            # designed to be re-armed from any profile.
+            return False, None
         if snapshot is None:
             if not self._resolve_legacy_controls_before_virtual_main(
                 device_id,
@@ -4896,6 +5020,8 @@ class SystemOutputDucker:
                 "phase": snapshot.phase,
                 "transition_started_at": (snapshot.transition_started_at or created_at),
             }
+            if snapshot.capture_route is not None:
+                item["capture_route"] = list(snapshot.capture_route)
             if snapshot.owned_values is not None:
                 item["owned"] = {str(element): list(candidates) for element, candidates in snapshot.owned_values.items()}
             if snapshot.post_restore_profile:

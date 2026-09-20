@@ -1289,6 +1289,34 @@ class SystemOutputDucker:
                     return True
         return False
 
+    def _reassert_frozen_route_mute(
+        self,
+        device_id: int,
+        device_uid: str,
+    ) -> None:
+        """Re-silence a hard-duck device while it sits on a foreign profile.
+
+        Only reasserts a mute this session already owns, and only touches the
+        device-wide mute switch — never a scalar volume, snapshot target, or
+        the recovery journal — so it cannot strand or abandon anything.
+        """
+        owns_mute = any(
+            snapshot.device_uid == device_uid and snapshot.mute_target is True
+            for store in (self._snapshots, self._deferred_snapshots)
+            for snapshot in store.values()
+        )
+        if not owns_mute:
+            return
+        try:
+            if self._backend.get_mute(device_id) is True:
+                return
+            self._backend.set_mute(device_id, True)
+        except Exception:
+            logger.debug(
+                "Could not reassert mute on a frozen Bluetooth route",
+                exc_info=True,
+            )
+
     def _capture_snapshot(
         self,
         device_id: int,
@@ -1432,6 +1460,15 @@ class SystemOutputDucker:
             # a user change and abandon the owned original, and capturing the
             # transient topology would strand an unrestorable snapshot. Own
             # the duck quietly until the captured profile returns.
+            #
+            # One thing must still cross the freeze: the device-wide mute.
+            # CoreAudio clears it as HFP comes up, and a hard-duck session
+            # (max_volume=0) relies on mute to keep background audio silent
+            # while recording. Mute carries no volume topology, so reasserting
+            # it cannot reintroduce cross-profile abandonment or stranded
+            # snapshots; the scalar values stay frozen.
+            if force_mute:
+                self._reassert_frozen_route_mute(device_id, device_uid)
             return True
         if device_uid in self._overridden_devices:
             if not allow_reduck:

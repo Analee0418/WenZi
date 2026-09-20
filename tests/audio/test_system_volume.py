@@ -4961,6 +4961,79 @@ def test_monitor_freezes_media_snapshot_during_call_profile() -> None:
     assert backend.values[(1, virtual)] == pytest.approx(0.8)
 
 
+def test_frozen_call_profile_still_reasserts_hard_mute() -> None:
+    """Hard-duck (max_volume=0) must keep silencing audio during HFP.
+
+    CoreAudio clears the device mute as HFP comes up. The route freeze must
+    still reassert the mute we own (so background music stays at 0 while
+    recording) without touching the frozen A2DP scalar snapshot.
+    """
+    virtual = system_volume._VIRTUAL_MAIN_ELEMENT
+    backend = FakeVolumeBackend()
+    backend.elements = {1: (virtual,)}
+    backend.values = {(1, virtual): 0.8}
+    backend.mutes = {1: False}
+    ducker = SystemOutputDucker(
+        backend,
+        sleeper=lambda _delay: None,
+        monitor_waiter=lambda stop, _timeout: stop.wait(),
+    )
+    token = ducker.begin(max_volume=0.0)
+    assert token is not None
+    assert backend.mutes[1] is True  # begin silenced A2DP
+
+    # Microphone opens: HFP comes up and CoreAudio clears the mute.
+    backend.route_signatures[1] = (24_000, 1)
+    backend.mutes[1] = False
+    writes_before = len(backend.writes)
+    with ducker._lock:
+        assert ducker._refresh_locked(
+            allow_reduck=False,
+            abandon_on_deviation=True,
+            force_mute=True,
+        )
+    # Re-silenced, snapshot preserved, and no scalar write on the HFP scale.
+    assert backend.mutes[1] is True
+    assert ("uid-1", (virtual,)) in ducker._snapshots
+    assert "uid-1" not in ducker._overridden_devices
+    assert len(backend.writes) == writes_before
+
+    # Media profile returns; end() restores both volume and mute.
+    backend.route_signatures[1] = (48_000, 2)
+    assert ducker.end(token)
+    assert backend.values[(1, virtual)] == pytest.approx(0.8)
+    assert backend.mutes[1] is False
+
+
+def test_frozen_call_profile_does_not_fight_user_after_fast_window() -> None:
+    """Past the fast window (force_mute=False) the freeze leaves mute alone."""
+    virtual = system_volume._VIRTUAL_MAIN_ELEMENT
+    backend = FakeVolumeBackend()
+    backend.elements = {1: (virtual,)}
+    backend.values = {(1, virtual): 0.8}
+    backend.mutes = {1: False}
+    ducker = SystemOutputDucker(
+        backend,
+        sleeper=lambda _delay: None,
+        monitor_waiter=lambda stop, _timeout: stop.wait(),
+    )
+    token = ducker.begin(max_volume=0.0)
+    assert token is not None
+
+    backend.route_signatures[1] = (24_000, 1)
+    backend.mutes[1] = False  # user unmuted to hear music mid-recording
+    with ducker._lock:
+        assert ducker._refresh_locked(
+            allow_reduck=False,
+            abandon_on_deviation=True,
+            force_mute=False,
+        )
+    assert backend.mutes[1] is False  # not fought
+
+    backend.route_signatures[1] = (48_000, 2)
+    assert ducker.end(token)
+
+
 def test_monitor_does_not_capture_transient_call_profile_topology() -> None:
     """The brief HFP-only element layout must not become an owned snapshot.
 

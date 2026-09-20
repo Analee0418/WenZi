@@ -259,6 +259,29 @@ class CoalescingBluetoothGainBackend(BluetoothGainBackend):
             self.effective_gain = value
 
 
+class IndependentProfileBluetoothBackend(FakeVolumeBackend):
+    """Model AirPods profiles that share vmvc and a published media signature."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.transports[1] = system_volume._fourcc("blue")
+        self.elements[1] = (system_volume._VIRTUAL_MAIN_ELEMENT,)
+        self.media_active = True
+        self.profile_volumes = {True: 0.8, False: 0.3996}
+        self.profile_writes: list[tuple[bool, float]] = []
+
+    def volume_profile(self, device_id: int) -> tuple[int, ...]:
+        return (1, 2) if self.media_active else (0,)
+
+    def get_volume(self, device_id: int, element: int) -> float:
+        return self.profile_volumes[self.media_active]
+
+    def set_volume(self, device_id: int, element: int, value: float) -> None:
+        super().set_volume(device_id, element, value)
+        self.profile_volumes[self.media_active] = value
+        self.profile_writes.append((self.media_active, value))
+
+
 class TemporalCoalescingBluetoothGainBackend(BluetoothGainBackend):
     """Model a driver that merges a quick scalar round trip into a no-op."""
 
@@ -1058,14 +1081,14 @@ def test_zero_max_volume_uses_mute_and_restores_in_safe_order() -> None:
 
 def test_live_zero_mute_rewrites_original_after_a2dp_activation() -> None:
     backend = BluetoothGainBackend()
-    elapsed_after_local_restore = 0.0
+    elapsed_after_stop = 0.0
 
     def _sleep(delay: float) -> None:
-        nonlocal elapsed_after_local_restore
-        if not backend.local_original_written:
+        nonlocal elapsed_after_stop
+        if not backend.restore_started:
             return
-        elapsed_after_local_restore += delay
-        if elapsed_after_local_restore >= 0.20:
+        elapsed_after_stop += delay
+        if elapsed_after_stop >= 0.20:
             backend.a2dp_active = True
 
     ducker = SystemOutputDucker(
@@ -1077,9 +1100,8 @@ def test_live_zero_mute_rewrites_original_after_a2dp_activation() -> None:
     assert token is not None
     assert backend.effective_gain == pytest.approx(0.05)
 
-    # HFP teardown accepts visible HAL writes while its hidden remote media
-    # gain remains at the quiet floor. A2DP becomes active only after the
-    # regular restore has already written the original scalar.
+    # HFP teardown leaves the media gain at the quiet floor. Publish A2DP
+    # independently of writes so restoration must wait for the media route.
     backend.a2dp_active = False
     backend.restore_started = True
 
@@ -1108,22 +1130,26 @@ def test_post_restore_tickle_updates_coalesced_airpods_gain() -> None:
             element: int,
             value: float,
         ) -> None:
-            if self.a2dp_active:
+            if self.a2dp_active and abs(value - self.tracked_original) > 1e-9:
                 self.media_write_mutes.append(self.mutes[device_id])
             super().set_volume(device_id, element, value)
 
     backend = MuteTrackingBackend()
-    elapsed_after_local_restore = 0.0
+    elapsed_after_stop = 0.0
     media_events: list[tuple] = []
 
     def _sleep(delay: float) -> None:
-        nonlocal elapsed_after_local_restore
-        if not backend.local_original_written:
+        nonlocal elapsed_after_stop
+        if not backend.restore_started:
             return
-        elapsed_after_local_restore += delay
-        if elapsed_after_local_restore >= 0.20 and not backend.a2dp_active:
+        elapsed_after_stop += delay
+        if elapsed_after_stop >= 0.20 and not backend.a2dp_active:
             backend.a2dp_active = True
+            # HAL may publish the original scalar before its remote gain
+            # follows. A non-equal, muted probe must repair that stale gain.
+            backend.values[(1, 0)] = backend.tracked_original
             backend.events.clear()
+            backend.media_write_mutes.clear()
 
     ducker = SystemOutputDucker(
         backend,
@@ -1245,14 +1271,14 @@ def test_post_restore_pass_survives_process_restart(tmp_path: Path) -> None:
 
 def test_post_restore_waits_for_media_profile_instead_of_fixed_delay() -> None:
     backend = BluetoothGainBackend()
-    elapsed_after_local_restore = 0.0
+    elapsed_after_stop = 0.0
 
     def _sleep(delay: float) -> None:
-        nonlocal elapsed_after_local_restore
-        if not backend.local_original_written:
+        nonlocal elapsed_after_stop
+        if not backend.restore_started:
             return
-        elapsed_after_local_restore += delay
-        if elapsed_after_local_restore >= 1.10:
+        elapsed_after_stop += delay
+        if elapsed_after_stop >= 1.10:
             backend.a2dp_active = True
 
     ducker = SystemOutputDucker(
@@ -1266,7 +1292,7 @@ def test_post_restore_waits_for_media_profile_instead_of_fixed_delay() -> None:
     backend.restore_started = True
 
     assert ducker.end(token)
-    assert elapsed_after_local_restore >= 1.10
+    assert elapsed_after_stop >= 1.10
     assert backend.original_writes_while_a2dp_active >= 1
     assert backend.effective_gain == pytest.approx(0.8)
 
@@ -1278,14 +1304,14 @@ def test_post_restore_waits_for_media_signature_when_raw_profile_is_same() -> No
             return (0,) if device_id == self.tracked_device else ()
 
     backend = SameRawProfileBackend()
-    elapsed_after_local_restore = 0.0
+    elapsed_after_stop = 0.0
 
     def _sleep(delay: float) -> None:
-        nonlocal elapsed_after_local_restore
-        if not backend.local_original_written:
+        nonlocal elapsed_after_stop
+        if not backend.restore_started:
             return
-        elapsed_after_local_restore += delay
-        if elapsed_after_local_restore >= 0.65:
+        elapsed_after_stop += delay
+        if elapsed_after_stop >= 0.65:
             backend.a2dp_active = True
 
     ducker = SystemOutputDucker(
@@ -1303,9 +1329,274 @@ def test_post_restore_waits_for_media_signature_when_raw_profile_is_same() -> No
     backend.restore_started = True
 
     assert ducker.end(token)
-    assert elapsed_after_local_restore >= 0.65
+    assert elapsed_after_stop >= 0.65
     assert backend.original_writes_while_a2dp_active >= 1
     assert backend.effective_gain == pytest.approx(0.8)
+
+
+@pytest.mark.parametrize("original_rate, restored_rate", [(44_100, 48_000), (48_000, 44_100)])
+@pytest.mark.parametrize("user_volume", [None, 0.37])
+def test_post_restore_handles_renegotiated_media_rate(
+    original_rate: int,
+    restored_rate: int,
+    user_volume: float | None,
+) -> None:
+    class RenegotiatedMediaBackend(CoalescingBluetoothGainBackend):
+        media_rate = original_rate
+
+        def output_route_signature(self, device_id: int) -> tuple[int, int] | None:
+            if device_id == self.tracked_device and self.a2dp_active:
+                return (self.media_rate, 2)
+            return super().output_route_signature(device_id)
+
+    backend = RenegotiatedMediaBackend()
+    elapsed_after_stop = 0.0
+
+    def _sleep(delay: float) -> None:
+        nonlocal elapsed_after_stop
+        if not backend.restore_started:
+            return
+        elapsed_after_stop += delay
+        if elapsed_after_stop >= 0.65 and not backend.a2dp_active:
+            backend.a2dp_active = True
+            backend.media_rate = restored_rate
+            backend.events.clear()
+            if user_volume is not None:
+                backend.values[(1, 0)] = user_volume
+                backend.effective_gain = user_volume
+
+    ducker = SystemOutputDucker(
+        backend,
+        sleeper=_sleep,
+        monitor_waiter=lambda stop, _timeout: stop.wait(),
+    )
+    token = ducker.begin(max_volume=0.0)
+    assert token is not None
+    backend.a2dp_active = False
+    backend.restore_started = True
+
+    assert ducker.end(token)
+    assert elapsed_after_stop >= 0.65
+    expected_volume = 0.8 if user_volume is None else user_volume
+    assert backend.values[(1, 0)] == pytest.approx(expected_volume)
+    assert backend.effective_gain == pytest.approx(expected_volume)
+    assert backend.mutes[1] is False
+    assert not ducker._deferred_snapshots
+    if user_volume is not None:
+        assert not any(event[0] == "volume" for event in backend.events)
+
+
+@pytest.mark.parametrize(
+    "signature",
+    [None, (24_000, 1), (24_000, 2), (48_000, 1), (48_000, 4), (0, 2), (800_000, 2)],
+)
+def test_post_restore_rejects_unknown_call_or_changed_channel_signature(
+    signature: tuple[int, int] | None,
+) -> None:
+    class ChangedSignatureBackend(CoalescingBluetoothGainBackend):
+        def output_route_signature(self, device_id: int) -> tuple[int, int] | None:
+            return signature
+
+    backend = ChangedSignatureBackend()
+    backend.effective_gain = 0.05
+    snapshot = system_volume._DeviceSnapshot(
+        device_uid="uid-1",
+        device_id_hint=1,
+        profile_elements=(0,),
+        original={0: 0.8},
+        duck_target={0: 0.05},
+        owned_values={0: (0.8,)},
+        post_restore_sync=True,
+        post_restore_expected_mute=False,
+        post_restore_profile=(1, 2),
+        post_restore_route_signature=(48_000, 2),
+        post_restore_values={0: 0.8},
+        post_restore_ready=True,
+    )
+    ducker = SystemOutputDucker(backend, sleeper=lambda _delay: None)
+
+    assert ducker._sync_post_restore_snapshot(snapshot) == (False, False, False)
+    assert backend.events == []
+    assert backend.effective_gain == pytest.approx(0.05)
+    assert snapshot.post_restore_sync
+
+
+@pytest.mark.parametrize("monitor_unmute", [False, True])
+def test_media_snapshot_survives_call_scalar_with_same_route_signature(
+    tmp_path: Path,
+    monitor_unmute: bool,
+) -> None:
+    backend = IndependentProfileBluetoothBackend()
+    journal_path = tmp_path / "system-volume.json"
+    restoring = False
+    elapsed = 0.0
+
+    def _sleep(delay: float) -> None:
+        nonlocal elapsed
+        if restoring:
+            elapsed += delay
+            if elapsed >= 0.13:
+                backend.media_active = True
+
+    ducker = SystemOutputDucker(
+        backend,
+        sleeper=_sleep,
+        monitor_waiter=lambda stop, _timeout: stop.wait(),
+        recovery_path=journal_path,
+    )
+    token = ducker.begin(max_volume=0.0)
+    assert token is not None
+    backend.media_active = False
+    if monitor_unmute:
+        backend.mutes[1] = False
+        with ducker._lock:
+            ducker._refresh_locked(
+                allow_reduck=False,
+                abandon_on_deviation=True,
+                force_mute=False,
+            )
+        assert ducker._snapshots
+    restoring = True
+
+    assert ducker.end(token)
+
+    assert elapsed >= 0.13
+    assert backend.profile_volumes[True] == pytest.approx(0.8)
+    assert backend.profile_volumes[False] == pytest.approx(0.3996)
+    assert all(media for media, _value in backend.profile_writes)
+    assert backend.mutes[1] is False
+    assert not journal_path.exists()
+
+
+def test_media_snapshot_defers_until_call_profile_returns_to_media(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = IndependentProfileBluetoothBackend()
+    journal_path = tmp_path / "system-volume.json"
+    monkeypatch.setattr(system_volume, "_DEFERRED_SYNC_INTERVAL", 0.01)
+    ducker = SystemOutputDucker(
+        backend,
+        sleeper=lambda _delay: None,
+        monitor_waiter=lambda stop, _timeout: stop.wait(),
+        recovery_path=journal_path,
+    )
+    try:
+        token = ducker.begin(max_volume=0.0)
+        assert token is not None
+        backend.media_active = False
+
+        assert ducker.end(token)
+        pending = json.loads(journal_path.read_text(encoding="utf-8"))
+        assert pending["devices"][0]["original"] == {"-1": pytest.approx(0.8)}
+        assert backend.profile_volumes[False] == pytest.approx(0.3996)
+        worker = ducker._deferred_sync_thread
+        assert worker is not None
+
+        backend.media_active = True
+        worker.join(timeout=1.0)
+
+        assert not worker.is_alive()
+        assert backend.profile_volumes[True] == pytest.approx(0.8)
+        assert all(media for media, _value in backend.profile_writes)
+        assert backend.mutes[1] is False
+        assert not journal_path.exists()
+    finally:
+        ducker.stop_background_workers()
+
+
+@pytest.mark.parametrize("post_restore_ready", [False, True])
+def test_rearm_does_not_adopt_call_scalar_as_media_original(
+    post_restore_ready: bool,
+) -> None:
+    backend = IndependentProfileBluetoothBackend()
+    backend.media_active = False
+    backend.mutes[1] = True
+    virtual = system_volume._VIRTUAL_MAIN_ELEMENT
+    snapshot = system_volume._DeviceSnapshot(
+        device_uid="uid-1",
+        device_id_hint=1,
+        profile_elements=(virtual,),
+        original={virtual: 0.8},
+        duck_target={virtual: 0.05},
+        owned_values={virtual: (0.05,)},
+        original_mute=False,
+        mute_target=True,
+        mute_owned=True,
+        post_restore_sync=True,
+        post_restore_profile=(1, 2),
+        post_restore_route_signature=(48_000, 2),
+        post_restore_values={virtual: 0.8} if post_restore_ready else {},
+        post_restore_ready=post_restore_ready,
+    )
+    ducker = SystemOutputDucker(backend)
+    prepare = (
+        ducker._prepare_post_restore_snapshot_for_rearm
+        if post_restore_ready
+        else ducker._rebase_muted_deferred_scalar_overrides
+    )
+
+    assert not prepare(snapshot, 1, "uid-1", (virtual,))
+    assert snapshot.original == {virtual: pytest.approx(0.8)}
+    assert backend.events == []
+
+
+def test_call_profile_still_reasserts_owned_mute() -> None:
+    backend = IndependentProfileBluetoothBackend()
+    ducker = SystemOutputDucker(
+        backend,
+        sleeper=lambda _delay: None,
+        monitor_waiter=lambda stop, _timeout: stop.wait(),
+    )
+    token = ducker.begin(max_volume=0.0)
+    assert token is not None
+    backend.media_active = False
+    backend.mutes[1] = False
+
+    assert ducker.refresh(token)
+
+    assert backend.mutes[1] is True
+    assert next(iter(ducker._snapshots.values())).original == {
+        system_volume._VIRTUAL_MAIN_ELEMENT: pytest.approx(0.8)
+    }
+    backend.media_active = True
+    assert ducker.end(token)
+    assert backend.profile_volumes[True] == pytest.approx(0.8)
+    assert backend.mutes[1] is False
+
+
+@pytest.mark.parametrize("metadata", ["profile", "signature", "call_signature"])
+def test_media_ownership_waits_for_trustworthy_profile_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    metadata: str,
+) -> None:
+    backend = IndependentProfileBluetoothBackend()
+    virtual = system_volume._VIRTUAL_MAIN_ELEMENT
+    snapshot = system_volume._DeviceSnapshot(
+        device_uid="uid-1",
+        device_id_hint=1,
+        profile_elements=(virtual,),
+        original={virtual: 0.8},
+        duck_target={virtual: 0.05},
+        owned_values={virtual: (0.05,)},
+        post_restore_profile=(1, 2),
+        post_restore_route_signature=(48_000, 2),
+    )
+    if metadata == "profile":
+        monkeypatch.setattr(backend, "volume_profile", lambda _device: ())
+    else:
+        signature = None if metadata == "signature" else (24_000, 1)
+        monkeypatch.setattr(backend, "output_route_signature", lambda _device: signature)
+    ducker = SystemOutputDucker(backend)
+    key = ducker._snapshot_key(snapshot)
+    ducker._snapshots[key] = snapshot
+
+    assert ducker._classify_owned_elements(snapshot) == ([], [virtual], [], False, {})
+    ducker._abandon_changed_elements(snapshot, 1)
+
+    assert ducker._snapshots[key] is snapshot
+    assert snapshot.original == {virtual: pytest.approx(0.8)}
+    assert backend.events == []
 
 
 def test_restore_retries_route_signature_that_was_unreadable_at_begin() -> None:
@@ -1618,7 +1909,7 @@ def test_pending_bluetooth_gain_refresh_survives_process_restart(
     tmp_path: Path,
 ) -> None:
     journal_path = tmp_path / "system-volume.json"
-    backend = BluetoothGainBackend()
+    backend = CoalescingBluetoothGainBackend()
     virtual = system_volume._VIRTUAL_MAIN_ELEMENT
     backend.elements[1] = (virtual,)
     backend.values[(1, virtual)] = 0.8
@@ -1636,7 +1927,7 @@ def test_pending_bluetooth_gain_refresh_survives_process_restart(
     assert first._monitor_thread is not None
     first._monitor_thread.join(timeout=1.0)
 
-    backend.a2dp_active = False
+    backend.values[(1, virtual)] = 0.8
     backend.restore_started = True
     with first._lock:
         restored, _unavailable, _failed, delay = (
@@ -1658,8 +1949,8 @@ def test_pending_bluetooth_gain_refresh_survives_process_restart(
     assert pending["route_signature"] == [48_000, 2]
     assert pending["values"] == {str(virtual): pytest.approx(0.8)}
 
-    # Simulate a process exit after the local scalar restore but before A2DP
-    # became active. The next process must retain and finish the remote refresh.
+    # Simulate a process exit after the visible scalar is original but
+    # before the coalescing driver accepts the remote gain refresh.
     with first._lock:
         first._active_token = None
         first._snapshots.clear()
@@ -1679,7 +1970,7 @@ def test_pending_bluetooth_gain_refresh_survives_process_restart(
 def test_hard_exit_after_local_restore_keeps_remote_refresh_durable(
     tmp_path: Path,
 ) -> None:
-    class CrashAfterLocalRestore(BluetoothGainBackend):
+    class CrashAfterLocalRestore(CoalescingBluetoothGainBackend):
         crash_on_original = False
 
         def set_volume(
@@ -1715,7 +2006,7 @@ def test_hard_exit_after_local_restore_keeps_remote_refresh_durable(
     first._monitor_stop.set()
     assert first._monitor_thread is not None
     first._monitor_thread.join(timeout=1.0)
-    backend.a2dp_active = False
+    backend.values[(1, virtual)] = 0.8
     backend.restore_started = True
     backend.crash_on_original = True
 
@@ -1994,9 +2285,8 @@ def test_next_begin_never_restores_full_gain_before_rearming(
     second = ducker.begin(max_volume=second_max_volume)
 
     assert second is not None
-    assert backend.events[0] == ("mute", 1, True)
-    assert backend.audible_gains
-    assert max(backend.audible_gains) <= 0.05 + 1e-9
+    # A scalar already at the cap needs no HAL write in soft-duck mode.
+    assert all(gain <= 0.05 + 1e-9 for gain in backend.audible_gains)
     assert backend.mutes[1] is (second_max_volume == 0.0)
     assert ducker.end(second)
     assert backend.effective_gain == pytest.approx(0.8)
@@ -2172,6 +2462,7 @@ def test_pending_refresh_adopts_user_override_for_next_session(
     backend.restore_started = True
     assert ducker.end(first)
 
+    backend.a2dp_active = True
     if override == "volume":
         backend.values[(1, virtual)] = 0.6
     else:
@@ -2531,7 +2822,7 @@ def test_abandoning_inactive_sibling_profile_releases_owned_mute(
     assert not ducker._deferred_snapshots
 
 
-def test_hfp_clamped_during_restore_keeps_a2dp_refresh_owned(
+def test_hfp_clamped_profile_waits_for_media_before_restore(
     tmp_path: Path,
 ) -> None:
     class HfpClampingBackend(BluetoothGainBackend):
@@ -2584,13 +2875,22 @@ def test_hfp_clamped_during_restore_keeps_a2dp_refresh_owned(
         )
     )
 
-    assert unresolved is None
-    assert reachable
-    assert snapshot.post_restore_values == {virtual: pytest.approx(0.8)}
-    assert snapshot.mute_owned
+    assert unresolved is not None
+    assert not reachable
+    assert not snapshot.post_restore_values
+    assert backend.writes == []
+    assert backend.mutes[1] is False
     assert backend.values[(1, virtual)] == pytest.approx(0.05)
 
     backend.a2dp_active = True
+    snapshot = unresolved
+    ducker._snapshots[ducker._snapshot_key(snapshot)] = snapshot
+    unresolved, _changed, reachable, _metadata_dirty = (
+        ducker._restore_owned_snapshot(snapshot, ensure_original_write=True)
+    )
+    assert unresolved is None
+    assert reachable
+    assert snapshot.post_restore_values == {virtual: pytest.approx(0.8)}
     snapshot.post_restore_ready = True
     snapshot.post_restore_pass = len(system_volume._POST_RESTORE_SYNC_DELAYS) - 1
     completed, reachable, failed = ducker._sync_post_restore_snapshot(snapshot)
@@ -2829,7 +3129,7 @@ def test_deferred_worker_polls_indefinitely_without_rewriting_unchanged_journal(
 
 def test_output_switch_defers_airpods_refresh_until_they_are_default() -> None:
     virtual = system_volume._VIRTUAL_MAIN_ELEMENT
-    backend = BluetoothGainBackend()
+    backend = CoalescingBluetoothGainBackend()
     backend.elements[1] = (virtual,)
     backend.values[(1, virtual)] = 0.8
     backend.elements[2] = (0,)
@@ -2844,7 +3144,7 @@ def test_output_switch_defers_airpods_refresh_until_they_are_default() -> None:
     )
     token = ducker.begin(max_volume=0.0)
     assert token is not None
-    backend.a2dp_active = False
+    backend.values[(1, virtual)] = 0.8
     backend.restore_started = True
     backend.default_device = 2
 
@@ -2899,7 +3199,7 @@ def test_post_a2dp_sync_tolerates_one_transient_default_uid() -> None:
             return
         if (
             not backend.local_original_written
-            or backend.a2dp_active
+            or post_waits >= 1
             or delay != pytest.approx(
                 system_volume._POST_RESTORE_SYNC_DELAYS[0]
             )
@@ -2916,7 +3216,6 @@ def test_post_a2dp_sync_tolerates_one_transient_default_uid() -> None:
     )
     token = ducker.begin(max_volume=0.0)
     assert token is not None
-    backend.a2dp_active = False
     backend.restore_started = True
 
     assert ducker.end(token)
@@ -2960,7 +3259,6 @@ def test_post_a2dp_sync_abandons_a_persistent_default_uid_change() -> None:
     )
     token = ducker.begin(max_volume=0.0)
     assert token is not None
-    backend.a2dp_active = False
     backend.restore_started = True
 
     assert ducker.end(token)
@@ -3025,14 +3323,14 @@ def test_post_a2dp_sync_revalidates_device_identity_before_write() -> None:
 def test_new_bluetooth_route_captured_during_session_gets_post_sync() -> None:
     backend = BluetoothGainBackend()
     backend.transports[1] = system_volume._fourcc("bltn")
-    elapsed_after_local_restore = 0.0
+    elapsed_after_stop = 0.0
 
     def _sleep(delay: float) -> None:
-        nonlocal elapsed_after_local_restore
-        if not backend.local_original_written:
+        nonlocal elapsed_after_stop
+        if not backend.restore_started:
             return
-        elapsed_after_local_restore += delay
-        if elapsed_after_local_restore >= 0.20:
+        elapsed_after_stop += delay
+        if elapsed_after_stop >= 0.20:
             backend.a2dp_active = True
 
     ducker = SystemOutputDucker(
@@ -3107,14 +3405,14 @@ def test_adopted_bluetooth_recovery_gets_post_sync(tmp_path: Path) -> None:
     backend.mutes[1] = True
     backend.effective_gain = 0.05
     backend.a2dp_active = False
-    elapsed_after_local_restore = 0.0
+    elapsed_after_stop = 0.0
 
     def _sleep(delay: float) -> None:
-        nonlocal elapsed_after_local_restore
-        if not backend.local_original_written:
+        nonlocal elapsed_after_stop
+        if not backend.restore_started:
             return
-        elapsed_after_local_restore += delay
-        if elapsed_after_local_restore >= 0.20:
+        elapsed_after_stop += delay
+        if elapsed_after_stop >= 0.20:
             backend.a2dp_active = True
 
     ducker = SystemOutputDucker(
@@ -4092,7 +4390,7 @@ def test_post_a2dp_sync_retries_a_temporarily_unavailable_route(
             return
         if (
             backend.local_original_written
-            and not backend.a2dp_active
+            and post_waits == 0
             and delay
             == pytest.approx(system_volume._POST_RESTORE_SYNC_DELAYS[0])
         ):
@@ -4111,7 +4409,6 @@ def test_post_a2dp_sync_retries_a_temporarily_unavailable_route(
     )
     token = ducker.begin(max_volume=0.0)
     assert token is not None
-    backend.a2dp_active = False
     backend.restore_started = True
 
     assert ducker.end(token)
@@ -4153,14 +4450,13 @@ def test_post_a2dp_sync_write_failure_keeps_ownership_for_retry(
     )
     token = ducker.begin(max_volume=0.0)
     assert token is not None
-    backend.a2dp_active = False
     backend.restore_started = True
 
     assert not ducker.end(token)
     assert failures_injected
     assert ducker._active_token is token
     assert journal_path.exists()
-    assert backend.effective_gain == pytest.approx(0.05)
+    assert backend.effective_gain == pytest.approx(0.8)
 
     assert ducker.restore_all()
     assert backend.effective_gain == pytest.approx(0.8)
@@ -4197,7 +4493,6 @@ def test_post_a2dp_sync_unmute_failure_keeps_ownership_for_retry(
     )
     token = ducker.begin(max_volume=0.0)
     assert token is not None
-    backend.a2dp_active = False
     backend.restore_started = True
 
     assert not ducker.end(token)
@@ -7479,8 +7774,8 @@ def test_hard_rearm_enables_airpods_remote_gain_refresh(
 
     def _sleep(delay: float) -> None:
         if (
-            backend.local_original_written
-            and delay in system_volume._POST_RESTORE_SYNC_DELAYS
+            backend.restore_started
+            and delay == pytest.approx(system_volume._RESTORE_RETRY_DELAY)
         ):
             backend.a2dp_active = True
 

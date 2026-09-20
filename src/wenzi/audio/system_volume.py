@@ -1622,6 +1622,8 @@ class SystemOutputDucker:
         device_id: int,
     ) -> None:
         """Release only channels changed outside this ducking session."""
+        if not self._snapshot_media_profile_is_current(snapshot, device_id):
+            return
         mute_abandoned = False
         if snapshot.mute_target is not None:
             try:
@@ -2248,6 +2250,8 @@ class SystemOutputDucker:
         elements: tuple[int, ...],
     ) -> bool:
         """Adopt the route's latest visible user state without restoring first."""
+        if not self._snapshot_media_profile_is_current(snapshot, device_id):
+            return False
         try:
             if self._backend.default_output_device() != device_id:
                 return False
@@ -2784,11 +2788,15 @@ class SystemOutputDucker:
             return None, False
         if (
             expected_route_signature is not None
-            and route_signature != expected_route_signature
+            and (
+                route_signature is None
+                or not _is_media_route_signature(route_signature)
+                or route_signature[1] != expected_route_signature[1]
+            )
         ):
-            # Raw controls may be identical across HFP and A2DP. The public
-            # sample-rate/channel layout prevents a call route from consuming
-            # the pending media-gain refresh.
+            # A2DP can return at a different media sample rate after microphone
+            # use. Keep the channel layout and media-route checks without
+            # stranding recovery solely on a 44.1/48 kHz renegotiation.
             snapshot.post_restore_pass = 0
             return None, False
         snapshot.device_id_hint = device_id
@@ -3737,6 +3745,35 @@ class SystemOutputDucker:
             snapshot.owned_values = {element: value for element, value in snapshot.owned_values.items() if element in retained}
         snapshot.legacy_owned_elements.intersection_update(retained)
 
+    def _snapshot_media_profile_is_current(
+        self,
+        snapshot: _DeviceSnapshot,
+        device_id: int,
+    ) -> bool:
+        expected_profile = snapshot.post_restore_profile
+        if expected_profile is None:
+            return True
+        try:
+            if self._backend.device_uid(device_id) != snapshot.device_uid:
+                return False
+            profile = tuple(sorted(self._backend.volume_profile(device_id)))
+            route_signature = self._backend.output_route_signature(device_id)
+        except Exception:
+            return False
+        expected_signature = snapshot.post_restore_route_signature
+        # AirPods can keep the same UID, vmvc control, and sample rate while
+        # HFP exposes a different scalar. That value cannot prove a user edit
+        # to the media volume saved by this snapshot.
+        return (
+            profile == expected_profile
+            and route_signature is not None
+            and _is_media_route_signature(route_signature)
+            and (
+                expected_signature is None
+                or route_signature[1] == expected_signature[1]
+            )
+        )
+
     def _classify_owned_elements(
         self,
         snapshot: _DeviceSnapshot,
@@ -3759,7 +3796,9 @@ class SystemOutputDucker:
         }
 
         device_id = self._resolve_snapshot_device(snapshot)
-        if device_id is None:
+        if device_id is None or not self._snapshot_media_profile_is_current(
+            snapshot, device_id
+        ):
             return (
                 restore_elements,
                 list(snapshot.original),
@@ -4548,6 +4587,8 @@ class SystemOutputDucker:
     ) -> bool:
         """Adopt scalar changes made while a hard snapshot remains muted."""
 
+        if not self._snapshot_media_profile_is_current(snapshot, device_id):
+            return False
         owned_values = snapshot.owned_values
         if (
             snapshot.mute_target is not True
